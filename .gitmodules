@@ -1,0 +1,3 @@
+[submodule "lerobot"]
+	url = https://github.com/Jianshu-Hu/lerobot.git
+	path = lerobot

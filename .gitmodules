@@ -1,3 +1,6 @@
 [submodule "lerobot"]
 	url = https://github.com/Jianshu-Hu/lerobot.git
 	path = lerobot
+[submodule "gello_software"]
+	path = gello_software
+	url = https://github.com/Jianshu-Hu/gello_software.git

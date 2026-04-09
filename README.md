@@ -17,6 +17,11 @@ Quick links:
 - [FR3 ROS 2 docs](gello_software/ros2/README.md)
 - [LeRobot docs](lerobot/README.md)
 
+Environment split used in this repo:
+
+- Use `/usr/bin/python3` (Python 3.10 on this machine) for ROS 2 Humble, GELLO helper scripts, `colcon build`, and direct `pylibfranka` replay.
+- Use the `lerobot` Conda environment for LeRobot dataset and training. 
+
 
 ## Before launching
 
@@ -34,7 +39,6 @@ compare the results with the joint angles from ```172.16.0.2/desk/api/robot/robo
 - Set the offset if necessary.
 ```bash
 cd ~/real-exp/gello_software
-source .venv/bin/activate
 python3 scripts/setup_offset.py --start-joints 0 0 0 -1.57 0 1.57 0 --joint-signs 1 -1 1 1 1 -1 1 --port /dev/ttyUSB_left
 python3 scripts/setup_offset.py --start-joints 0 0 0 -1.57 0 1.57 0 --joint-signs 1 -1 1 1 1 -1 1 --port /dev/ttyUSB_right
 ```
@@ -46,7 +50,6 @@ python3 scripts/setup_offset.py --start-joints 0 0 0 -1.57 0 1.57 0 --joint-sign
 Skip this if nothing under `gello_software/ros2/` changed since the last build.
 
 ```bash
-source .venv/bin/activate
 cd gello_software/ros2
 colcon build
 source install/setup.bash

@@ -116,13 +116,13 @@ The recording path is split into two pieces:
 The dataset currently records:
 
 - `observation.state`: actual robot joint positions, plus gripper width if enabled
-- `action`: teleoperation joint targets from GELLO, plus gripper command if enabled
+- `action`: commanded Franka joint targets (`q_goal`), plus gripper command if enabled
 - `observation.images.cam_left`, `observation.images.cam_front`, `observation.images.cam_right`: RGB video streams
 
 The bridge expects:
 
 - Robot joint states on a topic like `/left/franka/joint_states`
-- Teleoperation joint targets on a topic like `/left/gello/joint_states`
+- Commanded Franka joint targets on a topic like `/left/franka/commanded_joint_states`
 - Robot gripper joint states on a topic like `/left/franka_gripper/joint_states`
 - Gripper commands on a topic like `/left/gripper/gripper_client/target_gripper_width_percent`
 - RGB image topics for three cameras

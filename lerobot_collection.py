@@ -18,6 +18,7 @@ if str(LOCAL_LEROBOT_SRC) not in sys.path:
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 LEROBOT_INFO_PATH = Path("meta/info.json")
+SYSTEM_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,17 +76,8 @@ def is_lerobot_dataset_root(root: Path) -> bool:
     return (root / LEROBOT_INFO_PATH).exists()
 
 
-def make_dataset(
-    first_packet: dict[str, Any], repo_id: str, fps: int, dataset_root: Path
-) -> tuple[LeRobotDataset, list[str], bool]:
+def build_features(first_packet: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], list[str]]:
     camera_names: list[str] = list(first_packet["camera_names"])
-    if is_lerobot_dataset_root(dataset_root):
-        dataset = LeRobotDataset.resume(
-            repo_id=repo_id,
-            root=dataset_root,
-        )
-        return dataset, camera_names, True
-
     features: dict[str, dict[str, Any]] = {
         "observation.state": {
             "dtype": "float32",
@@ -111,6 +103,55 @@ def make_dataset(
             "shape": (3, int(height), int(width)),
             "names": ["c", "h", "w"],
         }
+
+    return features, camera_names
+
+
+def normalize_feature_specs(features: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
+    for name, feature in features.items():
+        if name in SYSTEM_FEATURES:
+            continue
+        normalized[name] = {
+            "dtype": feature["dtype"],
+            "shape": tuple(feature["shape"]),
+            "names": None if feature.get("names") is None else tuple(feature["names"]),
+        }
+    return normalized
+
+
+def derive_compatible_dataset_root(dataset_root: Path, camera_names: list[str]) -> Path:
+    suffix = "_".join(camera_names)
+    candidate = dataset_root.parent / f"{dataset_root.name}_{suffix}"
+    index = 1
+    while candidate.exists():
+        candidate = dataset_root.parent / f"{dataset_root.name}_{suffix}_{index}"
+        index += 1
+    return candidate
+
+
+def make_dataset(
+    first_packet: dict[str, Any], repo_id: str, fps: int, dataset_root: Path
+) -> tuple[LeRobotDataset, list[str], bool]:
+    features, camera_names = build_features(first_packet)
+    if is_lerobot_dataset_root(dataset_root):
+        dataset = LeRobotDataset.resume(
+            repo_id=repo_id,
+            root=dataset_root,
+        )
+        if normalize_feature_specs(dataset.features) == normalize_feature_specs(features):
+            return dataset, camera_names, True
+
+        existing_features = sorted(normalize_feature_specs(dataset.features))
+        incoming_features = sorted(normalize_feature_specs(features))
+        compatible_root = derive_compatible_dataset_root(dataset_root, camera_names)
+        print(
+            "Existing dataset schema does not match the current ROS 2 stream. "
+            f"Creating a new dataset at {compatible_root} instead of appending to {dataset_root}."
+        )
+        print(f"  existing features: {', '.join(existing_features)}")
+        print(f"  incoming features: {', '.join(incoming_features)}")
+        dataset_root = compatible_root
 
     dataset = LeRobotDataset.create(
         repo_id=repo_id,

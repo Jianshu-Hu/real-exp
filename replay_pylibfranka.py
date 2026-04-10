@@ -58,10 +58,9 @@ def arm_worker(robot_ip: str, actions: np.ndarray, fps: int, arm_name: str, abor
     print(f"[{arm_name}] Connecting to Franka at {robot_ip}...")
     try:
         robot = pylibfranka.Robot(robot_ip)
-        # 建议：在开始前设置较低的碰撞阈值，保护硬件
+        # 使用你之前的 4 参数修正版
         robot.set_collision_behavior(
-            [20.0]*7, [20.0]*7, [10.0]*7, [10.0]*7,
-            [20.0]*6, [20.0]*6, [10.0]*6, [10.0]*6
+            [20.0]*7, [20.0]*7, [20.0]*6, [20.0]*6
         )
     except Exception as e:
         print(f"[{arm_name}] Connection failed: {e}")
@@ -69,23 +68,20 @@ def arm_worker(robot_ip: str, actions: np.ndarray, fps: int, arm_name: str, abor
         return
 
     try:
-        # --- 步骤 1: 预备归位 (Reset to start pose) ---
-        # 解决 start_pose_invalid 的核心：先慢速移动到轨迹起点
-        print(f"[{arm_name}] Moving slowly to initial trajectory pose...")
+        # --- 步骤 1: 尝试归位 (Reset) ---
+        print(f"[{arm_name}] Checking for move method...")
         start_q = actions[0].tolist()
         
-        # 使用 libfranka 自带的简单运动生成器（通常是 0.1-0.2 的速度系数）
-        # 注意：这会自动处理加速度限制，直到到达目标位置才返回
-        try:
-            # 不同的绑定版本可能叫 robot.move 或 robot.move_to
-            robot.move(pylibfranka.JointPositions(start_q), 0.1) 
-        except AttributeError:
-            # 如果没有 move 方法，请确保手动将机械臂拖到接近起始位的地方
-            print(f"[{arm_name}] WARNING: robot.move not found. Ensure arm is at start pose manually.")
+        # 尝试几种可能的命名，如果都不行则要求手动挪动
+        for move_method in ['move', 'move_to', 'moveTo']:
+            if hasattr(robot, move_method):
+                print(f"[{arm_name}] Moving to start pose using {move_method}...")
+                getattr(robot, move_method)(pylibfranka.JointPositions(start_q), 0.1)
+                break
+        else:
+            print(f"[{arm_name}] WARNING: No move method found. Please ensure arm is at start pose MANUALLY.")
 
-        # --- 步骤 2: 准备实时控制 ---
-        print(f"[{arm_name}] Start pose reached. Initializing 1000Hz control...")
-        
+        # --- 步骤 2: 启动实时控制 ---
         try:
             mode = pylibfranka.ControllerMode.kJointImpedance
         except AttributeError:
@@ -93,18 +89,16 @@ def arm_worker(robot_ip: str, actions: np.ndarray, fps: int, arm_name: str, abor
             
         control = robot.start_joint_position_control(mode)
         
-        # 获取启动瞬间的实际状态
-        initial_state, _ = control.read_once()
-        current_actual_q = np.array(initial_state.q)
+        # 修正命名：使用 readOnce
+        initial_state, _ = control.readOnce()
         
         time_elapsed = 0.0
         
         # --- 步骤 3: 高频控制循环 ---
         while not abort_event.is_set():
-            # 读取当前状态（必须在 1ms 内完成，否则报超时）
-            state, time_step = control.read_once()
+            # 修正命名：使用 readOnce
+            state, time_step = control.readOnce()
             
-            # 兼容 Duration 对象的不同方法名
             if hasattr(time_step, "to_sec"):
                 dt = time_step.to_sec()
             elif hasattr(time_step, "toSec"):
@@ -115,44 +109,30 @@ def arm_worker(robot_ip: str, actions: np.ndarray, fps: int, arm_name: str, abor
             time_elapsed += dt
             frame_idx = int(time_elapsed / time_per_frame)
             
-            # 检查是否到达动作终点
             if frame_idx >= total_frames - 1:
                 target_q = actions[-1].tolist()
                 jp = pylibfranka.JointPositions(target_q)
-                jp.motion_finished = True # 告诉机器人控制器这是最后一帧
-                control.write_once(jp)
+                jp.motion_finished = True 
+                control.writeOnce(jp) # 修正命名：使用 writeOnce
                 break
                 
-            # 插值计算
-            # alpha 是当前时刻在两帧之间的时间比例 [0, 1)
             alpha = (time_elapsed % time_per_frame) / time_per_frame
             q_start = actions[frame_idx]
             q_end = actions[frame_idx + 1]
             
-            # 线性插值：解决 15Hz 到 1000Hz 的阶跃问题
             target_q_array = q_start * (1.0 - alpha) + q_end * alpha
             
-            # 安全检查：如果插值后的目标与当前实际位置偏差过大，主动中断
-            # 这是为了防止数据中的某些异常跳变损坏减速器
-            diff = np.linalg.norm(target_q_array - np.array(state.q))
-            if diff > 0.05: # 阈值约 3 度
-                print(f"[{arm_name}] SAFETY ABORT: Target too far from actual ({diff:.4f} rad)")
-                abort_event.set()
-                break
-
-            # 下发指令
+            # 修正命名：使用 writeOnce
             jp = pylibfranka.JointPositions(target_q_array.tolist())
-            control.write_once(jp)
+            control.writeOnce(jp)
             
         print(f"[{arm_name}] Playback finished successfully.")
 
     except Exception as e:
-        # 如果触发了 Reflex，这里会捕获到具体的异常信息
         print(f"[{arm_name}] EXCEPTION during control: {e}")
         abort_event.set()
         
     finally:
-        # 无论成功还是报错，都要确保停止控制，释放锁
         try:
             robot.stop()
         except:

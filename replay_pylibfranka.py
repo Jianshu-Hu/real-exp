@@ -64,34 +64,66 @@ def arm_worker(robot_ip: str, actions: np.ndarray, fps: int, arm_name: str, abor
         return
 
     print(f"[{arm_name}] Starting trajectory playback...")
-    time_elapsed = [0.0]
-
-    def control_callback(robot_state: pylibfranka.RobotState, time_step: pylibfranka.Duration):
-        if abort_event.is_set():
-            return pylibfranka.MotionFinished(pylibfranka.JointPositions(robot_state.q))
-
-        time_elapsed[0] += time_step.to_sec()
-        t = time_elapsed[0]
-        
-        frame_idx = int(t / time_per_frame)
-        
-        if frame_idx >= total_frames - 1:
-            target_q = actions[-1].tolist()
-            return pylibfranka.MotionFinished(pylibfranka.JointPositions(target_q))
-            
-        alpha = (t % time_per_frame) / time_per_frame
-        q_start = actions[frame_idx]
-        q_end = actions[frame_idx + 1]
-        
-        target_q = q_start * (1.0 - alpha) + q_end * alpha
-        return pylibfranka.JointPositions(target_q.tolist())
 
     try:
-        robot.control(control_callback)
+        # 不同版本的 pylibfranka 绑定的枚举前缀可能不同，这里做一下兼容
+        try:
+            mode = pylibfranka.ControllerMode.kJointImpedance
+        except AttributeError:
+            mode = pylibfranka.ControllerMode.JointImpedance
+            
+        control = robot.start_joint_position_control(mode)
+        time_elapsed = 0.0
+        
+        # 获取初始状态并开始控制循环
+        state, time_step = control.readOnce()
+        
+        while not abort_event.is_set():
+            state, time_step = control.readOnce()
+            
+            # 兼容 Duration 对象的不同方法名绑定
+            if hasattr(time_step, "to_sec"):
+                dt = time_step.to_sec()
+            elif hasattr(time_step, "toSec"):
+                dt = time_step.toSec()
+            else:
+                dt = float(time_step)
+                
+            time_elapsed += dt
+            frame_idx = int(time_elapsed / time_per_frame)
+            
+            # 如果到达动作终点，则发送 motion_finished 标志位结束控制
+            if frame_idx >= total_frames - 1:
+                target_q = actions[-1].tolist()
+                jp = pylibfranka.JointPositions(target_q)
+                jp.motion_finished = True
+                control.writeOnce(jp)
+                break
+                
+            # 帧之间平滑插值
+            alpha = (time_elapsed % time_per_frame) / time_per_frame
+            q_start = actions[frame_idx]
+            q_end = actions[frame_idx + 1]
+            
+            target_q = q_start * (1.0 - alpha) + q_end * alpha
+            jp = pylibfranka.JointPositions(target_q.tolist())
+            control.writeOnce(jp)
+            
+        # 遇到报错需要中断时，将机械臂保持在当前状态结束
+        if abort_event.is_set():
+            jp = pylibfranka.JointPositions(list(state.q))
+            jp.motion_finished = True
+            control.writeOnce(jp)
+            
         print(f"[{arm_name}] Playback finished successfully.")
     except Exception as e:
         print(f"[{arm_name}] Error during playback: {e}")
         abort_event.set()
+    finally:
+        try:
+            robot.stop()
+        except Exception:
+            pass
 
 
 def gripper_worker(robot_ip: str, actions: np.ndarray, fps: int, arm_name: str, abort_event: threading.Event) -> None:

@@ -18,7 +18,7 @@ POSITION_TOLERANCE_RAD = 0.01
 VELOCITY_TOLERANCE_RAD_PER_S = 0.05
 REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S = np.array([0.35, 0.35, 0.35, 0.35, 0.50, 0.50, 0.50], dtype=float)
 REPLAY_MAX_JOINT_ACCELERATIONS_RAD_PER_S2 = np.array([0.80, 0.80, 0.80, 0.80, 1.20, 1.20, 1.20], dtype=float)
-REPLAY_VELOCITY_FILTER_TAU_S = 0.05
+DEFAULT_REPLAY_VELOCITY_FILTER_TAU_S = 0.02
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +34,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ip-right", default="172.16.0.2", help="IP address of the Right Franka robot.")
     parser.add_argument("--episode", type=int, default=0, help="Index of the episode to replay.")
     parser.add_argument("--fps", type=int, default=15, help="FPS at which the data was recorded.")
+    parser.add_argument(
+        "--velocity-filter-tau",
+        type=float,
+        default=DEFAULT_REPLAY_VELOCITY_FILTER_TAU_S,
+        help=(
+            "Low-pass filter time constant for replay velocity commands in seconds. "
+            "Set to 0.0 to disable the filter."
+        ),
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -133,6 +142,14 @@ def require_delta_arm_actions(action_config: dict[str, Any] | None) -> None:
         )
 
     arm_action_representation = str(action_config.get("arm_action_representation", "")).strip().lower()
+    arm_action_definition = str(action_config.get("arm_action_definition", "")).strip().lower()
+    if arm_action_representation == "absolute_joint_position" and arm_action_definition == "q[t+1]-q[t]":
+        print(
+            "Dataset metadata says arm=absolute_joint_position, but arm_action_definition=q[t+1]-q[t]. "
+            "Treating this dataset as delta_joint_position."
+        )
+        action_config["arm_action_representation"] = "delta_joint_position"
+        return
     if arm_action_representation != "delta_joint_position":
         raise ValueError(
             f"Unsupported arm action representation '{arm_action_representation}'. "
@@ -203,6 +220,30 @@ def dry_run_summary(
             "Right gripper target initial state (observation.state[0])",
             np.asarray([data["right_gripper_state"][0]], dtype=float),
         )
+
+
+def build_gripper_replay_actions(
+    gripper_states: np.ndarray | None,
+    gripper_actions: np.ndarray | None,
+    gripper_action_representation: str,
+) -> np.ndarray | None:
+    if gripper_actions is None:
+        return None
+
+    representation = gripper_action_representation.strip().lower()
+    actions = np.asarray(gripper_actions, dtype=float)
+    if representation == "absolute_width":
+        return actions
+
+    if representation == "binary_open_close":
+        if gripper_states is None:
+            raise ValueError("Binary gripper replay requires observation.state gripper widths.")
+        state_values = np.asarray(gripper_states, dtype=float)
+        open_width = float(np.max(state_values))
+        closed_width = float(np.min(state_values))
+        return np.where(actions >= 0.5, open_width, closed_width)
+
+    raise ValueError(f"Unsupported gripper action representation '{gripper_action_representation}'.")
 
 
 def abort_playback(abort_event: threading.Event) -> None:
@@ -345,6 +386,7 @@ def replay_arm_deltas_as_velocities(
     fps: int,
     arm_name: str,
     abort_event: threading.Event,
+    velocity_filter_tau_s: float,
 ) -> None:
     sample_dt = 1.0 / fps
     total_frames = len(arm_deltas)
@@ -373,7 +415,7 @@ def replay_arm_deltas_as_velocities(
         v_end = velocity_samples[min(frame_idx + 1, total_frames - 1)]
         reference_velocity = v_start * (1.0 - phase) + v_end * phase
 
-        filter_alpha = dt / max(REPLAY_VELOCITY_FILTER_TAU_S + dt, 1e-6)
+        filter_alpha = dt / max(velocity_filter_tau_s + dt, 1e-6)
         filtered_velocity = commanded_velocity + filter_alpha * (reference_velocity - commanded_velocity)
 
         max_delta_velocity = REPLAY_MAX_JOINT_ACCELERATIONS_RAD_PER_S2 * dt
@@ -414,6 +456,7 @@ def arm_worker(
     arm_deltas: np.ndarray,
     fps: int,
     arm_name: str,
+    velocity_filter_tau_s: float,
     abort_event: Any,
     ready_event: Any,
     start_event: Any,
@@ -440,7 +483,14 @@ def arm_worker(
         hold_position_until_start(position_control, start_q, arm_name, abort_event, start_event)
         finish_joint_position_control(position_control, start_q)
         velocity_control = start_sync_joint_velocity_control(robot)
-        replay_arm_deltas_as_velocities(velocity_control, arm_deltas, fps, arm_name, abort_event)
+        replay_arm_deltas_as_velocities(
+            velocity_control,
+            arm_deltas,
+            fps,
+            arm_name,
+            abort_event,
+            velocity_filter_tau_s,
+        )
     except Exception as exc:
         print(f"[{arm_name}] EXCEPTION during control: {exc}")
         abort_playback(abort_event)
@@ -455,6 +505,7 @@ def arm_worker(
 
 def gripper_worker(
     robot_ip: str,
+    start_width: float,
     actions: np.ndarray,
     fps: int,
     arm_name: str,
@@ -474,7 +525,7 @@ def gripper_worker(
 
     try:
         gripper = pylibfranka.Gripper(robot_ip)
-        current_w = float(actions[0])
+        current_w = float(start_width)
         print(f"[{arm_name} Gripper] Moving to the initial width recorded in the episode...")
         gripper.move(current_w, 0.1)
 
@@ -586,16 +637,33 @@ def replay_dual_trajectory(
     states: np.ndarray,
     actions: np.ndarray,
     fps: int,
+    velocity_filter_tau_s: float,
+    action_config: dict[str, Any] | None,
 ) -> None:
     data = split_dual_arm_data(states, actions)
     left_start_q = np.asarray(data["left_arm_state"][0], dtype=float)
     right_start_q = np.asarray(data["right_arm_state"][0], dtype=float)
     left_arm_deltas = np.asarray(data["left_arm_action"], dtype=float)
     right_arm_deltas = np.asarray(data["right_arm_action"], dtype=float)
+    gripper_action_representation = str(
+        (action_config or {}).get("gripper_action_representation", "absolute_width")
+    )
     print("Arm action mode: delta_joint_position")
+    if data["left_gripper_action"] is not None or data["right_gripper_action"] is not None:
+        print(f"Gripper action mode: {gripper_action_representation}")
 
-    left_gripper_actions = data["left_gripper_action"]
-    right_gripper_actions = data["right_gripper_action"]
+    left_gripper_actions = build_gripper_replay_actions(
+        np.asarray(data["left_gripper_state"], dtype=float) if data["left_gripper_state"] is not None else None,
+        np.asarray(data["left_gripper_action"], dtype=float) if data["left_gripper_action"] is not None else None,
+        gripper_action_representation,
+    )
+    right_gripper_actions = build_gripper_replay_actions(
+        np.asarray(data["right_gripper_state"], dtype=float) if data["right_gripper_state"] is not None else None,
+        np.asarray(data["right_gripper_action"], dtype=float) if data["right_gripper_action"] is not None else None,
+        gripper_action_representation,
+    )
+    left_start_width = float(data["left_gripper_state"][0]) if data["left_gripper_state"] is not None else 0.0
+    right_start_width = float(data["right_gripper_state"][0]) if data["right_gripper_state"] is not None else 0.0
 
     abort_event = mp.Event()
     ready_event = mp.Event()
@@ -618,6 +686,7 @@ def replay_dual_trajectory(
                 left_arm_deltas,
                 fps,
                 "Left Arm",
+                velocity_filter_tau_s,
                 abort_event,
                 ready_event,
                 start_event,
@@ -635,6 +704,7 @@ def replay_dual_trajectory(
                 right_arm_deltas,
                 fps,
                 "Right Arm",
+                velocity_filter_tau_s,
                 abort_event,
                 ready_event,
                 start_event,
@@ -653,6 +723,7 @@ def replay_dual_trajectory(
                 target=gripper_worker,
                 args=(
                     ip_left,
+                    left_start_width,
                     np.asarray(left_gripper_actions, dtype=float),
                     fps,
                     "Left",
@@ -671,6 +742,7 @@ def replay_dual_trajectory(
                 target=gripper_worker,
                 args=(
                     ip_right,
+                    right_start_width,
                     np.asarray(right_gripper_actions, dtype=float),
                     fps,
                     "Right",
@@ -720,6 +792,8 @@ def main() -> None:
         states,
         actions,
         args.fps,
+        args.velocity_filter_tau,
+        action_config,
     )
 
 

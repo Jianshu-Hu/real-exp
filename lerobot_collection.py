@@ -79,10 +79,18 @@ def is_lerobot_dataset_root(root: Path) -> bool:
 
 
 def action_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    arm_action_representation = "delta_joint_position"
+    gripper_action_representation = str(packet.get("gripper_action_representation", "absolute_width"))
+    arm_action_definition = "q[t+1]-q[t]"
+    gripper_action_definition = {
+        "absolute_width": "open_width_percent",
+        "binary_open_close": "latched_binary_command (0=close, 1=open)",
+    }.get(gripper_action_representation, gripper_action_representation)
     return {
-        "arm_action_representation": "delta_joint_position",
-        "arm_action_definition": "target_q[t+1]-target_q[t]",
-        "gripper_action_representation": "absolute_width",
+        "arm_action_representation": arm_action_representation,
+        "arm_action_definition": arm_action_definition,
+        "gripper_action_representation": gripper_action_representation,
+        "gripper_action_definition": gripper_action_definition,
         "include_right_arm": bool(packet.get("include_right_arm", True)),
         "include_gripper": bool(packet.get("include_gripper", True)),
         "action_dim": int(packet["action_dim"]),
@@ -106,6 +114,7 @@ def assumed_legacy_action_config(packet: dict[str, Any]) -> dict[str, Any]:
     return {
         "arm_action_representation": "absolute_joint_position",
         "gripper_action_representation": "absolute_width",
+        "gripper_action_definition": "open_width_percent",
         "include_right_arm": bool(packet.get("include_right_arm", True)),
         "include_gripper": bool(packet.get("include_gripper", True)),
         "action_dim": int(packet["action_dim"]),
@@ -366,8 +375,9 @@ def main() -> None:
                 print(f"  action dim: {packet['action_dim']}")
                 print(
                     "  action config: "
-                    "arm=delta_joint_position (target_q[t+1]-target_q[t]), "
-                    "gripper=absolute_width"
+                    f"arm={action_config_from_packet(packet)['arm_action_representation']} "
+                    f"({action_config_from_packet(packet)['arm_action_definition']}), "
+                    f"gripper={action_config_from_packet(packet)['gripper_action_representation']}"
                 )
                 print(f"  cameras: {', '.join(camera_names)}")
 

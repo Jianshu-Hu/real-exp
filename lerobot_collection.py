@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import threading
 from pathlib import Path
@@ -18,6 +19,7 @@ if str(LOCAL_LEROBOT_SRC) not in sys.path:
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 LEROBOT_INFO_PATH = Path("meta/info.json")
+ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 SYSTEM_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
 
 
@@ -76,6 +78,40 @@ def is_lerobot_dataset_root(root: Path) -> bool:
     return (root / LEROBOT_INFO_PATH).exists()
 
 
+def action_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "arm_action_representation": "delta_joint_position",
+        "arm_action_definition": "target_q[t+1]-target_q[t]",
+        "gripper_action_representation": "absolute_width",
+        "include_right_arm": bool(packet.get("include_right_arm", True)),
+        "include_gripper": bool(packet.get("include_gripper", True)),
+        "action_dim": int(packet["action_dim"]),
+    }
+
+
+def load_action_config(dataset_root: Path) -> dict[str, Any] | None:
+    action_config_path = dataset_root / ACTION_CONFIG_PATH
+    if not action_config_path.exists():
+        return None
+    return json.loads(action_config_path.read_text())
+
+
+def write_action_config(dataset_root: Path, action_config: dict[str, Any]) -> None:
+    action_config_path = dataset_root / ACTION_CONFIG_PATH
+    action_config_path.parent.mkdir(parents=True, exist_ok=True)
+    action_config_path.write_text(json.dumps(action_config, indent=2, sort_keys=True) + "\n")
+
+
+def assumed_legacy_action_config(packet: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "arm_action_representation": "absolute_joint_position",
+        "gripper_action_representation": "absolute_width",
+        "include_right_arm": bool(packet.get("include_right_arm", True)),
+        "include_gripper": bool(packet.get("include_gripper", True)),
+        "action_dim": int(packet["action_dim"]),
+    }
+
+
 def build_features(first_packet: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], list[str]]:
     camera_names: list[str] = list(first_packet["camera_names"])
     features: dict[str, dict[str, Any]] = {
@@ -120,8 +156,8 @@ def normalize_feature_specs(features: dict[str, dict[str, Any]]) -> dict[str, di
     return normalized
 
 
-def derive_compatible_dataset_root(dataset_root: Path, camera_names: list[str]) -> Path:
-    suffix = "_".join(camera_names)
+def derive_compatible_dataset_root(dataset_root: Path, suffix_parts: list[str]) -> Path:
+    suffix = "_".join(suffix_parts)
     candidate = dataset_root.parent / f"{dataset_root.name}_{suffix}"
     index = 1
     while candidate.exists():
@@ -134,23 +170,40 @@ def make_dataset(
     first_packet: dict[str, Any], repo_id: str, fps: int, dataset_root: Path
 ) -> tuple[LeRobotDataset, list[str], bool]:
     features, camera_names = build_features(first_packet)
+    action_config = action_config_from_packet(first_packet)
     if is_lerobot_dataset_root(dataset_root):
         dataset = LeRobotDataset.resume(
             repo_id=repo_id,
             root=dataset_root,
         )
-        if normalize_feature_specs(dataset.features) == normalize_feature_specs(features):
+        existing_action_config = load_action_config(dataset_root)
+        resolved_existing_action_config = (
+            existing_action_config if existing_action_config is not None else assumed_legacy_action_config(first_packet)
+        )
+        if (
+            normalize_feature_specs(dataset.features) == normalize_feature_specs(features)
+            and resolved_existing_action_config == action_config
+        ):
+            write_action_config(dataset_root, action_config)
             return dataset, camera_names, True
 
         existing_features = sorted(normalize_feature_specs(dataset.features))
         incoming_features = sorted(normalize_feature_specs(features))
-        compatible_root = derive_compatible_dataset_root(dataset_root, camera_names)
+        compatible_root = derive_compatible_dataset_root(
+            dataset_root,
+            camera_names + [action_config["arm_action_representation"]],
+        )
         print(
-            "Existing dataset schema does not match the current ROS 2 stream. "
+            "Existing dataset metadata does not match the current ROS 2 stream. "
             f"Creating a new dataset at {compatible_root} instead of appending to {dataset_root}."
         )
         print(f"  existing features: {', '.join(existing_features)}")
         print(f"  incoming features: {', '.join(incoming_features)}")
+        if existing_action_config is not None:
+            print(f"  existing action config: {existing_action_config}")
+        else:
+            print(f"  existing action config: assumed legacy {resolved_existing_action_config}")
+        print(f"  incoming action config: {action_config}")
         dataset_root = compatible_root
 
     dataset = LeRobotDataset.create(
@@ -160,6 +213,7 @@ def make_dataset(
         use_videos=True,
         root=dataset_root,
     )
+    write_action_config(dataset_root, action_config)
     return dataset, camera_names, False
 
 
@@ -171,6 +225,48 @@ def packet_to_frame(packet: dict[str, Any], camera_names: list[str], task_name: 
     }
     for camera_name in camera_names:
         rgb = np.asarray(packet["cameras"][camera_name]["rgb"], dtype=np.uint8)
+        frame[f"observation.images.{camera_name}"] = np.transpose(rgb, (2, 0, 1))
+    return frame
+
+
+def compute_recorded_action(
+    current_packet: dict[str, Any],
+    next_packet: dict[str, Any],
+) -> np.ndarray:
+    current_action = np.asarray(current_packet["action"], dtype=np.float32)
+    next_action = np.asarray(next_packet["action"], dtype=np.float32)
+    action_dim = int(current_packet["action_dim"])
+
+    if action_dim == 16:
+        recorded_action = np.empty(16, dtype=np.float32)
+        recorded_action[0:7] = next_action[0:7] - current_action[0:7]
+        recorded_action[7] = current_action[7]
+        recorded_action[8:15] = next_action[8:15] - current_action[8:15]
+        recorded_action[15] = current_action[15]
+        return recorded_action
+
+    if action_dim == 14:
+        recorded_action = np.empty(14, dtype=np.float32)
+        recorded_action[0:7] = next_action[0:7] - current_action[0:7]
+        recorded_action[7:14] = next_action[7:14] - current_action[7:14]
+        return recorded_action
+
+    raise ValueError(f"Unsupported action dimension for recorder transform: {action_dim}")
+
+
+def packet_pair_to_frame(
+    current_packet: dict[str, Any],
+    next_packet: dict[str, Any],
+    camera_names: list[str],
+    task_name: str,
+) -> dict[str, Any]:
+    frame: dict[str, Any] = {
+        "observation.state": np.asarray(current_packet["state"], dtype=np.float32),
+        "action": compute_recorded_action(current_packet, next_packet),
+        "task": task_name,
+    }
+    for camera_name in camera_names:
+        rgb = np.asarray(current_packet["cameras"][camera_name]["rgb"], dtype=np.uint8)
         frame[f"observation.images.{camera_name}"] = np.transpose(rgb, (2, 0, 1))
     return frame
 
@@ -199,6 +295,7 @@ def main() -> None:
     task_name = args.task
     recording_active = False
     episode_count = 0
+    pending_packet: dict[str, Any] | None = None
     commands = start_command_listener()
 
     print(f"Listening for ROS 2 bridge samples on tcp://{args.host}:{args.port}")
@@ -219,19 +316,23 @@ def main() -> None:
                             continue
                         if dataset is not None and dataset.has_pending_frames():
                             dataset.clear_episode_buffer()
+                        pending_packet = None
                         recording_active = True
                         print("Recording started.")
                     elif command == "e":
                         if dataset is None or not dataset.has_pending_frames():
                             recording_active = False
+                            pending_packet = None
                             print("No recorded frames to save.")
                             continue
                         dataset.save_episode()
                         episode_count += 1
                         recording_active = False
+                        pending_packet = None
                         print(f"Episode {episode_count} saved to {dataset.root}")
                     elif command == "d":
                         recording_active = False
+                        pending_packet = None
                         if dataset is not None and dataset.has_pending_frames():
                             dataset.clear_episode_buffer()
                             print("Current episode discarded.")
@@ -263,6 +364,11 @@ def main() -> None:
                 print(f"  root: {dataset.root}")
                 print(f"  robot state dim: {packet['robot_state_dim']}")
                 print(f"  action dim: {packet['action_dim']}")
+                print(
+                    "  action config: "
+                    "arm=delta_joint_position (target_q[t+1]-target_q[t]), "
+                    "gripper=absolute_width"
+                )
                 print(f"  cameras: {', '.join(camera_names)}")
 
             if camera_names is None:
@@ -270,8 +376,12 @@ def main() -> None:
 
             if recording_active:
                 active_task_name = task_name or str(packet.get("task", "franka_gello_teleop"))
-                frame = packet_to_frame(packet, camera_names, active_task_name)
-                dataset.add_frame(frame)
+                if pending_packet is None:
+                    pending_packet = packet
+                else:
+                    frame = packet_pair_to_frame(pending_packet, packet, camera_names, active_task_name)
+                    dataset.add_frame(frame)
+                    pending_packet = packet
 
     except KeyboardInterrupt:
         print("\nStopping collection...")

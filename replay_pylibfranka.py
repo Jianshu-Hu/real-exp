@@ -1,218 +1,704 @@
 from __future__ import annotations
 
 import argparse
-import sys
-import time
+import json
+import multiprocessing as mp
 import threading
+import time
 from pathlib import Path
+from queue import Empty, Queue
+from typing import Any
 
 import numpy as np
 import pylibfranka
+import pyarrow.parquet as pq
 
-# 确保能够引入本地的 lerobot 库
-REPO_ROOT = Path(__file__).resolve().parent
-LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
-if str(LOCAL_LEROBOT_SRC) not in sys.path:
-    sys.path.insert(0, str(LOCAL_LEROBOT_SRC))
-
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
+POSITION_TOLERANCE_RAD = 0.01
+VELOCITY_TOLERANCE_RAD_PER_S = 0.05
+REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S = np.array([0.35, 0.35, 0.35, 0.35, 0.50, 0.50, 0.50], dtype=float)
+REPLAY_MAX_JOINT_ACCELERATIONS_RAD_PER_S2 = np.array([0.80, 0.80, 0.80, 0.80, 1.20, 1.20, 1.20], dtype=float)
+REPLAY_VELOCITY_FILTER_TAU_S = 0.05
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Replay dual-arm recorded LeRobot dataset using pylibfranka.")
-    parser.add_argument("dataset_dir", type=str, help="Directory where the LeRobot dataset is stored (e.g., ./lerobot_data_cam1_cam2).")
-    parser.add_argument("--ip-left", default="172.16.03", help="IP address of the Left Franka robot.")
-    parser.add_argument("--ip-right", default="172.16.02", help="IP address of the Right Franka robot.")
-    parser.add_argument("--repo-id", default="local/franka_gello_teleop", help="Dataset repo id.")
+    parser = argparse.ArgumentParser(
+        description="Replay a local dual-arm LeRobot dataset using a synchronous joint-position controller."
+    )
+    parser.add_argument(
+        "dataset_dir",
+        type=str,
+        help="Directory where the LeRobot dataset is stored (e.g., ./lerobot_data).",
+    )
+    parser.add_argument("--ip-left", default="172.16.0.3", help="IP address of the Left Franka robot.")
+    parser.add_argument("--ip-right", default="172.16.0.2", help="IP address of the Right Franka robot.")
     parser.add_argument("--episode", type=int, default=0, help="Index of the episode to replay.")
     parser.add_argument("--fps", type=int, default=15, help="FPS at which the data was recorded.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the current robot qpos, initial episode state, and stored action sequence without moving the robots.",
+    )
     return parser.parse_args()
 
 
-def get_episode_actions(dataset_root: Path, repo_id: str, episode_index: int) -> np.ndarray:
+def start_command_listener() -> Queue[str]:
+    commands: Queue[str] = Queue()
+
+    def _read_commands() -> None:
+        while True:
+            try:
+                command = input().strip().lower()
+            except EOFError:
+                commands.put("q")
+                return
+
+            if command:
+                commands.put(command)
+            if command == "q":
+                return
+
+    listener = threading.Thread(target=_read_commands, daemon=True)
+    listener.start()
+    return commands
+
+
+def load_action_config(dataset_root: Path) -> dict[str, Any] | None:
+    action_config_path = dataset_root / ACTION_CONFIG_PATH
+    if not action_config_path.exists():
+        return None
+    return json.loads(action_config_path.read_text())
+
+
+def get_episode_data(dataset_root: Path, episode_index: int) -> tuple[np.ndarray, np.ndarray, dict[str, Any] | None]:
     """
-    加载数据集并提取指定 Episode 的 Action 序列。
-    支持自适应维度（通过解析 lerobot dataset features 自动获取实际长度）。
+    Load local parquet files and extract the observation.state and action sequences
+    for the requested episode.
     """
-    print(f"Loading dataset from {dataset_root}...")
-    dataset = LeRobotDataset(
-        repo_id=repo_id,
-        root=dataset_root,
-    )
-    
-    # 过滤出指定的 episode
-    episode_data = dataset.hf_dataset.filter(lambda x: x["episode_index"] == episode_index)
-    actions = np.array(episode_data["action"])
-    
-    if len(actions) == 0:
+    print(f"Loading local dataset from {dataset_root}...")
+
+    if not dataset_root.exists():
+        raise FileNotFoundError(f"Dataset directory not found: {dataset_root}")
+
+    info_path = dataset_root / "meta" / "info.json"
+    if info_path.exists():
+        info = json.loads(info_path.read_text())
+        state_shape = info.get("features", {}).get("observation.state", {}).get("shape")
+        action_shape = info.get("features", {}).get("action", {}).get("shape")
+        if state_shape:
+            print(f"Dataset state shape from metadata: {state_shape}")
+        if action_shape:
+            print(f"Dataset action shape from metadata: {action_shape}")
+
+    parquet_files = sorted((dataset_root / "data").glob("chunk-*/*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet data files found under {dataset_root / 'data'}")
+
+    episode_states: list[list[float]] = []
+    episode_actions: list[list[float]] = []
+    for parquet_file in parquet_files:
+        table = pq.read_table(parquet_file, columns=["episode_index", "observation.state", "action"])
+        data = table.to_pydict()
+        for row_episode_index, row_state, row_action in zip(
+            data["episode_index"], data["observation.state"], data["action"], strict=True
+        ):
+            if row_episode_index != episode_index:
+                continue
+            episode_states.append(row_state)
+            episode_actions.append(row_action)
+
+    if not episode_actions:
         raise ValueError(f"Episode {episode_index} not found or has no data.")
-    
+
+    states = np.asarray(episode_states, dtype=float)
+    actions = np.asarray(episode_actions, dtype=float)
     print(f"Loaded {len(actions)} frames for episode {episode_index}.")
-    return actions
+
+    action_config = load_action_config(dataset_root)
+    if action_config is not None:
+        print(
+            "Dataset action config: "
+            f"arm={action_config.get('arm_action_representation', 'unknown')}, "
+            f"gripper={action_config.get('gripper_action_representation', 'unknown')}"
+        )
+
+    return states, actions, action_config
 
 
-def arm_worker(robot_ip: str, actions: np.ndarray, fps: int, arm_name: str, abort_event: threading.Event) -> None:
-    time_per_frame = 1.0 / fps
-    total_frames = len(actions)
-    
+def require_delta_arm_actions(action_config: dict[str, Any] | None) -> None:
+    if action_config is None:
+        raise ValueError(
+            "Dataset action metadata is missing. Replay now requires a delta-joint dataset "
+            "recorded with meta/real_exp_action_config.json."
+        )
+
+    arm_action_representation = str(action_config.get("arm_action_representation", "")).strip().lower()
+    if arm_action_representation != "delta_joint_position":
+        raise ValueError(
+            f"Unsupported arm action representation '{arm_action_representation}'. "
+            "Replay now only supports delta_joint_position datasets."
+        )
+
+
+def read_current_joint_positions(robot_ip: str, arm_name: str) -> np.ndarray | None:
+    try:
+        robot = pylibfranka.Robot(robot_ip)
+        state = robot.read_once()
+        return np.asarray(state.q, dtype=float)
+    except Exception as exc:
+        print(f"[{arm_name}] Failed to read current qpos: {exc}")
+        return None
+
+
+def read_current_gripper_width(robot_ip: str, arm_name: str) -> np.ndarray | None:
+    try:
+        gripper = pylibfranka.Gripper(robot_ip)
+        state = gripper.read_once()
+        return np.asarray([float(state.width)], dtype=float)
+    except Exception as exc:
+        print(f"[{arm_name} Gripper] Failed to read current width: {exc}")
+        return None
+
+
+def print_array(name: str, value: np.ndarray) -> None:
+    with np.printoptions(precision=6, suppress=True, threshold=np.inf, linewidth=200):
+        print(f"{name}:")
+        print(value)
+
+
+def dry_run_summary(
+    ip_left: str,
+    ip_right: str,
+    states: np.ndarray,
+    actions: np.ndarray,
+) -> None:
+    data = split_dual_arm_data(states, actions)
+
+    print("Dry run summary")
+    print("----------------")
+
+    left_current_q = read_current_joint_positions(ip_left, "Left Arm")
+    right_current_q = read_current_joint_positions(ip_right, "Right Arm")
+    left_current_gripper = read_current_gripper_width(ip_left, "Left")
+    right_current_gripper = read_current_gripper_width(ip_right, "Right")
+    if left_current_q is not None:
+        print_array("Left arm current qpos", left_current_q)
+    if right_current_q is not None:
+        print_array("Right arm current qpos", right_current_q)
+    if left_current_gripper is not None:
+        print_array("Left gripper current state", left_current_gripper)
+    if right_current_gripper is not None:
+        print_array("Right gripper current state", right_current_gripper)
+
+    print_array("Left arm target initial state (observation.state[0])", np.asarray(data["left_arm_state"][0], dtype=float))
+    print_array("Right arm target initial state (observation.state[0])", np.asarray(data["right_arm_state"][0], dtype=float))
+
+    if data["left_gripper_state"] is not None:
+        print_array(
+            "Left gripper target initial state (observation.state[0])",
+            np.asarray([data["left_gripper_state"][0]], dtype=float),
+        )
+    if data["right_gripper_state"] is not None:
+        print_array(
+            "Right gripper target initial state (observation.state[0])",
+            np.asarray([data["right_gripper_state"][0]], dtype=float),
+        )
+
+
+def abort_playback(abort_event: threading.Event) -> None:
+    abort_event.set()
+
+
+def duration_to_seconds(time_step: object) -> float:
+    if hasattr(time_step, "to_sec"):
+        return time_step.to_sec()
+    if hasattr(time_step, "toSec"):
+        return time_step.toSec()
+    return float(time_step)
+
+
+def smoothstep(alpha: float) -> float:
+    alpha = min(max(alpha, 0.0), 1.0)
+    return alpha * alpha * alpha * (10.0 + alpha * (-15.0 + 6.0 * alpha))
+
+
+def robot_at_target(state: object, target_q: np.ndarray) -> bool:
+    position_error = float(np.max(np.abs(np.array(state.q, dtype=float) - target_q)))
+    joint_speed = float(np.max(np.abs(np.array(state.dq, dtype=float))))
+    return (
+        position_error <= POSITION_TOLERANCE_RAD
+        and joint_speed <= VELOCITY_TOLERANCE_RAD_PER_S
+    )
+
+
+def controller_mode() -> object:
+    try:
+        return pylibfranka.ControllerMode.kJointImpedance
+    except AttributeError:
+        return pylibfranka.ControllerMode.JointImpedance
+
+
+def start_sync_joint_position_control(robot: pylibfranka.Robot) -> pylibfranka.ActiveControlBase:
+    return robot.start_joint_position_control(controller_mode())
+
+
+def start_sync_joint_velocity_control(robot: pylibfranka.Robot) -> pylibfranka.ActiveControlBase:
+    return robot.start_joint_velocity_control(controller_mode())
+
+
+def warm_up_controller(control: pylibfranka.ActiveControlBase, hold_q: np.ndarray, cycles: int = 200) -> object:
+    state: object | None = None
+    for _ in range(cycles):
+        state, _ = control.readOnce()
+        control.writeOnce(pylibfranka.JointPositions(hold_q.tolist()))
+    if state is None:
+        raise RuntimeError("Failed to read controller state during warmup.")
+    return state
+
+
+def move_arm_to_initial_pose(
+    control: pylibfranka.ActiveControlBase,
+    start_q: np.ndarray,
+    arm_name: str,
+    abort_event: threading.Event,
+) -> np.ndarray:
+    state, _ = control.readOnce()
+    start_command_q = np.array(getattr(state, "q_d", state.q), dtype=float)
+    max_delta = float(np.max(np.abs(start_q - start_command_q)))
+
+    if max_delta < 1e-4:
+        print(f"[{arm_name}] Already at the initial pose recorded in the episode.")
+        return start_q.copy()
+
+    print(
+        f"[{arm_name}] Moving to the initial pose recorded in the episode "
+        f"(max joint delta={max_delta:.3f} rad)..."
+    )
+
+    duration_s = max(2.0, min(8.0, max_delta / 0.15 + 0.5))
+    elapsed = 0.0
+    commanded_q = start_command_q.copy()
+
+    warm_up_controller(control, start_command_q)
+
+    while not abort_event.is_set():
+        state, time_step = control.readOnce()
+        elapsed += duration_to_seconds(time_step)
+        alpha = smoothstep(elapsed / duration_s)
+        commanded_q = start_command_q * (1.0 - alpha) + start_q * alpha
+        control.writeOnce(pylibfranka.JointPositions(commanded_q.tolist()))
+
+        if alpha >= 1.0 and robot_at_target(state, start_q):
+            return start_q.copy()
+
+    raise RuntimeError("Playback aborted while moving to the initial pose.")
+
+
+def hold_position_until_start(
+    control: pylibfranka.ActiveControlBase,
+    hold_q: np.ndarray,
+    arm_name: str,
+    abort_event: threading.Event,
+    start_event: threading.Event,
+) -> None:
+    print(f"[{arm_name}] Initial pose reached. Waiting for synchronized playback start...")
+    while not start_event.is_set():
+        if abort_event.is_set():
+            raise RuntimeError("Playback aborted while waiting for synchronized start.")
+        control.readOnce()
+        control.writeOnce(pylibfranka.JointPositions(hold_q.tolist()))
+
+
+def finish_joint_position_control(
+    control: pylibfranka.ActiveControlBase,
+    hold_q: np.ndarray,
+) -> None:
+    jp = pylibfranka.JointPositions(hold_q.tolist())
+    jp.motion_finished = True
+    control.writeOnce(jp)
+
+
+def ramp_joint_velocity_to_zero(
+    control: pylibfranka.ActiveControlBase,
+    current_velocity: np.ndarray,
+    abort_event: threading.Event,
+    settle_time_s: float = 0.25,
+) -> None:
+    elapsed = 0.0
+    start_velocity = current_velocity.copy()
+    while elapsed < settle_time_s and not abort_event.is_set():
+        _, time_step = control.readOnce()
+        dt = duration_to_seconds(time_step)
+        elapsed += dt
+        alpha = min(elapsed / settle_time_s, 1.0)
+        target_velocity = start_velocity * (1.0 - alpha)
+        control.writeOnce(pylibfranka.JointVelocities(target_velocity.tolist()))
+
+    zero_velocity = pylibfranka.JointVelocities([0.0] * 7)
+    zero_velocity.motion_finished = True
+    control.writeOnce(zero_velocity)
+
+
+def replay_arm_deltas_as_velocities(
+    control: pylibfranka.ActiveControlBase,
+    arm_deltas: np.ndarray,
+    fps: int,
+    arm_name: str,
+    abort_event: threading.Event,
+) -> None:
+    sample_dt = 1.0 / fps
+    total_frames = len(arm_deltas)
+    velocity_samples = np.asarray(arm_deltas, dtype=float) / sample_dt
+    velocity_samples = np.clip(
+        velocity_samples,
+        -REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S,
+        REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S,
+    )
+    time_elapsed = 0.0
+    commanded_velocity = np.zeros(7, dtype=float)
+
+    while not abort_event.is_set():
+        _, time_step = control.readOnce()
+        dt = duration_to_seconds(time_step)
+        time_elapsed += dt
+        frame_idx = int(time_elapsed / sample_dt)
+
+        if frame_idx >= total_frames:
+            ramp_joint_velocity_to_zero(control, commanded_velocity, abort_event)
+            print(f"[{arm_name}] Playback finished successfully.")
+            return
+
+        phase = (time_elapsed - frame_idx * sample_dt) / sample_dt
+        v_start = velocity_samples[frame_idx]
+        v_end = velocity_samples[min(frame_idx + 1, total_frames - 1)]
+        reference_velocity = v_start * (1.0 - phase) + v_end * phase
+
+        filter_alpha = dt / max(REPLAY_VELOCITY_FILTER_TAU_S + dt, 1e-6)
+        filtered_velocity = commanded_velocity + filter_alpha * (reference_velocity - commanded_velocity)
+
+        max_delta_velocity = REPLAY_MAX_JOINT_ACCELERATIONS_RAD_PER_S2 * dt
+        velocity_step = np.clip(
+            filtered_velocity - commanded_velocity,
+            -max_delta_velocity,
+            max_delta_velocity,
+        )
+        commanded_velocity = np.clip(
+            commanded_velocity + velocity_step,
+            -REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S,
+            REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S,
+        )
+        control.writeOnce(pylibfranka.JointVelocities(commanded_velocity.tolist()))
+
+    raise RuntimeError("Playback aborted while replaying arm actions.")
+
+
+def register_worker_ready(
+    worker_name: str,
+    ready_count: Any,
+    ready_lock: Any,
+    worker_count: int,
+    ready_event: Any,
+) -> None:
+    with ready_lock:
+        ready_count.value += 1
+        is_last = ready_count.value >= worker_count
+    if is_last:
+        ready_event.set()
+    else:
+        print(f"[{worker_name}] Waiting for other workers to reach their initial state...")
+
+
+def arm_worker(
+    robot_ip: str,
+    start_q: np.ndarray,
+    arm_deltas: np.ndarray,
+    fps: int,
+    arm_name: str,
+    abort_event: Any,
+    ready_event: Any,
+    start_event: Any,
+    ready_count: Any,
+    ready_lock: Any,
+    worker_count: int,
+) -> None:
     print(f"[{arm_name}] Connecting to Franka at {robot_ip}...")
     try:
         robot = pylibfranka.Robot(robot_ip)
-        # 使用你之前的 4 参数修正版
         robot.set_collision_behavior(
-            [20.0]*7, [20.0]*7, [20.0]*6, [20.0]*6
+            [20.0] * 7, [20.0] * 7, [20.0] * 6, [20.0] * 6
         )
-    except Exception as e:
-        print(f"[{arm_name}] Connection failed: {e}")
-        abort_event.set()
+    except Exception as exc:
+        print(f"[{arm_name}] Connection failed: {exc}")
+        abort_playback(abort_event)
+        start_event.set()
         return
 
     try:
-        # --- 步骤 1: 尝试归位 (Reset) ---
-        print(f"[{arm_name}] Checking for move method...")
-        start_q = actions[0].tolist()
-        
-        # 尝试几种可能的命名，如果都不行则要求手动挪动
-        for move_method in ['move', 'move_to', 'moveTo']:
-            if hasattr(robot, move_method):
-                print(f"[{arm_name}] Moving to start pose using {move_method}...")
-                getattr(robot, move_method)(pylibfranka.JointPositions(start_q), 0.1)
-                break
-        else:
-            print(f"[{arm_name}] WARNING: No move method found. Please ensure arm is at start pose MANUALLY.")
-
-        # --- 步骤 2: 启动实时控制 ---
-        try:
-            mode = pylibfranka.ControllerMode.kJointImpedance
-        except AttributeError:
-            mode = pylibfranka.ControllerMode.JointImpedance
-            
-        control = robot.start_joint_position_control(mode)
-        
-        # 修正命名：使用 readOnce
-        initial_state, _ = control.readOnce()
-        
-        time_elapsed = 0.0
-        
-        # --- 步骤 3: 高频控制循环 ---
-        while not abort_event.is_set():
-            # 修正命名：使用 readOnce
-            state, time_step = control.readOnce()
-            
-            if hasattr(time_step, "to_sec"):
-                dt = time_step.to_sec()
-            elif hasattr(time_step, "toSec"):
-                dt = time_step.toSec()
-            else:
-                dt = float(time_step)
-                
-            time_elapsed += dt
-            frame_idx = int(time_elapsed / time_per_frame)
-            
-            if frame_idx >= total_frames - 1:
-                target_q = actions[-1].tolist()
-                jp = pylibfranka.JointPositions(target_q)
-                jp.motion_finished = True 
-                control.writeOnce(jp) # 修正命名：使用 writeOnce
-                break
-                
-            alpha = (time_elapsed % time_per_frame) / time_per_frame
-            q_start = actions[frame_idx]
-            q_end = actions[frame_idx + 1]
-            
-            target_q_array = q_start * (1.0 - alpha) + q_end * alpha
-            
-            # 修正命名：使用 writeOnce
-            jp = pylibfranka.JointPositions(target_q_array.tolist())
-            control.writeOnce(jp)
-            
-        print(f"[{arm_name}] Playback finished successfully.")
-
-    except Exception as e:
-        print(f"[{arm_name}] EXCEPTION during control: {e}")
-        abort_event.set()
-        
+        position_control = start_sync_joint_position_control(robot)
+        move_arm_to_initial_pose(position_control, start_q, arm_name, abort_event)
+        register_worker_ready(arm_name, ready_count, ready_lock, worker_count, ready_event)
+        hold_position_until_start(position_control, start_q, arm_name, abort_event, start_event)
+        finish_joint_position_control(position_control, start_q)
+        velocity_control = start_sync_joint_velocity_control(robot)
+        replay_arm_deltas_as_velocities(velocity_control, arm_deltas, fps, arm_name, abort_event)
+    except Exception as exc:
+        print(f"[{arm_name}] EXCEPTION during control: {exc}")
+        abort_playback(abort_event)
+        ready_event.set()
+        start_event.set()
     finally:
         try:
             robot.stop()
-        except:
+        except Exception:
             pass
 
-def gripper_worker(robot_ip: str, actions: np.ndarray, fps: int, arm_name: str, abort_event: threading.Event) -> None:
+
+def gripper_worker(
+    robot_ip: str,
+    actions: np.ndarray,
+    fps: int,
+    arm_name: str,
+    abort_event: Any,
+    ready_event: Any,
+    start_event: Any,
+    ready_count: Any,
+    ready_lock: Any,
+    worker_count: int,
+) -> None:
     if actions is None:
         return
-        
+
     time_per_frame = 1.0 / fps
     total_frames = len(actions)
     total_duration = total_frames * time_per_frame
-    
+
     try:
         gripper = pylibfranka.Gripper(robot_ip)
-        current_w = actions[0]
+        current_w = float(actions[0])
+        print(f"[{arm_name} Gripper] Moving to the initial width recorded in the episode...")
         gripper.move(current_w, 0.1)
-        
+
+        register_worker_ready(f"{arm_name} Gripper", ready_count, ready_lock, worker_count, ready_event)
+        print(f"[{arm_name} Gripper] Initial pose reached. Waiting for synchronized playback start...")
+        while not start_event.is_set():
+            if abort_event.is_set():
+                return
+            time.sleep(0.01)
+
         start_time = time.time()
         last_frame_idx = 0
-        
         while not abort_event.is_set():
-            t = time.time() - start_time
-            if t > total_duration:
+            elapsed = time.time() - start_time
+            if elapsed > total_duration:
                 break
-                
-            current_frame_idx = int(t / time_per_frame)
+
+            current_frame_idx = int(elapsed / time_per_frame)
             if current_frame_idx > last_frame_idx and current_frame_idx < total_frames:
-                target_w = actions[current_frame_idx]
+                target_w = float(actions[current_frame_idx])
                 if abs(target_w - current_w) > 0.002:
                     gripper.move(target_w, 0.1)
                     current_w = target_w
                 last_frame_idx = current_frame_idx
-                
+
             time.sleep(0.01)
-    except Exception as e:
-        print(f"[{arm_name} Gripper] Error: {e}")
-        abort_event.set()
+    except Exception as exc:
+        print(f"[{arm_name} Gripper] Error: {exc}")
+        abort_playback(abort_event)
+        ready_event.set()
+        start_event.set()
 
 
-def replay_dual_trajectory(ip_left: str, ip_right: str, actions: np.ndarray, fps: int) -> None:
-    """
-    使用多线程和 pylibfranka 同步回放双臂动作。
-    """
+def wait_for_manual_start(
+    commands: Queue[str],
+    abort_event: Any,
+    ready_event: Any,
+    start_event: Any,
+) -> None:
+    print("Waiting for all arms and grippers to reach the initial state...")
+    while not ready_event.is_set():
+        if abort_event.is_set():
+            return
+        time.sleep(0.05)
+
+    if abort_event.is_set():
+        return
+
+    print("All workers are holding the initial state.")
+    print("Type `s` + Enter to start replay, or `q` + Enter to abort.")
+
+    while not abort_event.is_set():
+        try:
+            command = commands.get(timeout=0.1)
+        except Empty:
+            continue
+
+        if command == "s":
+            start_event.set()
+            return
+        if command == "q":
+            abort_playback(abort_event)
+            start_event.set()
+            return
+        print("Unknown command. Use: s or q")
+
+
+def split_dual_arm_data(states: np.ndarray, actions: np.ndarray) -> dict[str, Any]:
+    state_dim = states.shape[1]
     action_dim = actions.shape[1]
-    
-    # 动作维度拆分假设
+
+    if state_dim != action_dim:
+        raise ValueError(
+            f"State/action dimension mismatch: state_dim={state_dim}, action_dim={action_dim}."
+        )
+
     if action_dim == 16:
-        print("Detected 16-dim action space: Assuming [Left Arm(7), Left Grip(1), Right Arm(7), Right Grip(1)]")
-        left_arm_actions = actions[:, 0:7]
-        left_grip_actions = actions[:, 7]
-        right_arm_actions = actions[:, 8:15]
-        right_grip_actions = actions[:, 15]
-    elif action_dim == 14:
-        print("Detected 14-dim action space: Assuming [Left Arm(7), Right Arm(7)] (No Grippers)")
-        left_arm_actions = actions[:, 0:7]
-        left_grip_actions = None
-        right_arm_actions = actions[:, 7:14]
-        right_grip_actions = None
-    else:
-        raise ValueError(f"Unsupported action dimension: {action_dim}. Expected 14 or 16 for dual-arm.")
+        print("Detected 16-dim action/state space: [Left Arm(7), Left Grip(1), Right Arm(7), Right Grip(1)]")
+        return {
+            "left_arm_state": states[:, 0:7],
+            "left_gripper_state": states[:, 7],
+            "right_arm_state": states[:, 8:15],
+            "right_gripper_state": states[:, 15],
+            "left_arm_action": actions[:, 0:7],
+            "left_gripper_action": actions[:, 7],
+            "right_arm_action": actions[:, 8:15],
+            "right_gripper_action": actions[:, 15],
+        }
 
-    abort_event = threading.Event()
-    threads = []
+    if action_dim == 14:
+        print("Detected 14-dim action/state space: [Left Arm(7), Right Arm(7)] (No Grippers)")
+        return {
+            "left_arm_state": states[:, 0:7],
+            "left_gripper_state": None,
+            "right_arm_state": states[:, 7:14],
+            "right_gripper_state": None,
+            "left_arm_action": actions[:, 0:7],
+            "left_gripper_action": None,
+            "right_arm_action": actions[:, 7:14],
+            "right_gripper_action": None,
+        }
 
-    # 启动机械臂控制线程
-    threads.append(threading.Thread(target=arm_worker, args=(ip_left, left_arm_actions, fps, "Left Arm", abort_event)))
-    threads.append(threading.Thread(target=arm_worker, args=(ip_right, right_arm_actions, fps, "Right Arm", abort_event)))
-    
-    # 启动夹爪控制线程
-    if left_grip_actions is not None:
-        threads.append(threading.Thread(target=gripper_worker, args=(ip_left, left_grip_actions, fps, "Left", abort_event)))
-    if right_grip_actions is not None:
-        threads.append(threading.Thread(target=gripper_worker, args=(ip_right, right_grip_actions, fps, "Right", abort_event)))
+    raise ValueError(f"Unsupported state/action dimension: {action_dim}. Expected 14 or 16.")
 
-    for t in threads:
-        t.start()
-        
-    for t in threads:
-        t.join()
+
+def replay_dual_trajectory(
+    ip_left: str,
+    ip_right: str,
+    states: np.ndarray,
+    actions: np.ndarray,
+    fps: int,
+) -> None:
+    data = split_dual_arm_data(states, actions)
+    left_start_q = np.asarray(data["left_arm_state"][0], dtype=float)
+    right_start_q = np.asarray(data["right_arm_state"][0], dtype=float)
+    left_arm_deltas = np.asarray(data["left_arm_action"], dtype=float)
+    right_arm_deltas = np.asarray(data["right_arm_action"], dtype=float)
+    print("Arm action mode: delta_joint_position")
+
+    left_gripper_actions = data["left_gripper_action"]
+    right_gripper_actions = data["right_gripper_action"]
+
+    abort_event = mp.Event()
+    ready_event = mp.Event()
+    start_event = mp.Event()
+    ready_count = mp.Value("i", 0)
+    ready_lock = mp.Lock()
+    commands = start_command_listener()
+    worker_count = 2
+    if left_gripper_actions is not None:
+        worker_count += 1
+    if right_gripper_actions is not None:
+        worker_count += 1
+
+    arm_processes = [
+        mp.Process(
+            target=arm_worker,
+            args=(
+                ip_left,
+                left_start_q,
+                left_arm_deltas,
+                fps,
+                "Left Arm",
+                abort_event,
+                ready_event,
+                start_event,
+                ready_count,
+                ready_lock,
+                worker_count,
+            ),
+            name="left_arm_replay",
+        ),
+        mp.Process(
+            target=arm_worker,
+            args=(
+                ip_right,
+                right_start_q,
+                right_arm_deltas,
+                fps,
+                "Right Arm",
+                abort_event,
+                ready_event,
+                start_event,
+                ready_count,
+                ready_lock,
+                worker_count,
+            ),
+            name="right_arm_replay",
+        ),
+    ]
+
+    gripper_threads: list[threading.Thread] = []
+    if left_gripper_actions is not None:
+        gripper_threads.append(
+            threading.Thread(
+                target=gripper_worker,
+                args=(
+                    ip_left,
+                    np.asarray(left_gripper_actions, dtype=float),
+                    fps,
+                    "Left",
+                    abort_event,
+                    ready_event,
+                    start_event,
+                    ready_count,
+                    ready_lock,
+                    worker_count,
+                ),
+            )
+        )
+    if right_gripper_actions is not None:
+        gripper_threads.append(
+            threading.Thread(
+                target=gripper_worker,
+                args=(
+                    ip_right,
+                    np.asarray(right_gripper_actions, dtype=float),
+                    fps,
+                    "Right",
+                    abort_event,
+                    ready_event,
+                    start_event,
+                    ready_count,
+                    ready_lock,
+                    worker_count,
+                ),
+            )
+        )
+
+    for process in arm_processes:
+        process.start()
+    for thread in gripper_threads:
+        thread.start()
+
+    wait_for_manual_start(commands, abort_event, ready_event, start_event)
+
+    for process in arm_processes:
+        process.join()
+        if process.exitcode not in (0, None):
+            abort_playback(abort_event)
+            ready_event.set()
+            start_event.set()
+    for thread in gripper_threads:
+        thread.join()
 
     if abort_event.is_set():
         print("Dual-arm replay aborted due to an error.")
@@ -223,8 +709,19 @@ def replay_dual_trajectory(ip_left: str, ip_right: str, actions: np.ndarray, fps
 def main() -> None:
     args = parse_args()
     dataset_root = Path(args.dataset_dir).expanduser()
-    actions = get_episode_actions(dataset_root, args.repo_id, args.episode)
-    replay_dual_trajectory(args.ip_left, args.ip_right, actions, args.fps)
+    states, actions, action_config = get_episode_data(dataset_root, args.episode)
+    require_delta_arm_actions(action_config)
+    if args.dry_run:
+        dry_run_summary(args.ip_left, args.ip_right, states, actions)
+        return
+    replay_dual_trajectory(
+        args.ip_left,
+        args.ip_right,
+        states,
+        actions,
+        args.fps,
+    )
+
 
 if __name__ == "__main__":
     main()

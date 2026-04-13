@@ -119,7 +119,7 @@ The recording path is split into two pieces:
 The dataset currently records:
 
 - `observation.state`: actual robot joint positions, plus gripper width if enabled
-- `action`: commanded Franka joint targets (`q_goal`), plus gripper command if enabled
+- `action`: arm command deltas computed as `target_q[t+1] - target_q[t]`, plus gripper command if enabled
 - `observation.images.cam_left`, `observation.images.cam_front`, `observation.images.cam_right`: RGB video streams
 
 The bridge expects:
@@ -129,6 +129,8 @@ The bridge expects:
 - Robot gripper joint states on a topic like `/left/franka_gripper/joint_states`
 - Gripper commands on a topic like `/left/gripper/gripper_client/target_gripper_width_percent`
 - RGB image topics for three cameras
+
+By default the bridge now publishes the current commanded joint targets (`topic`). The recorder converts adjacent arm targets into dataset actions using `target_q[t+1] - target_q[t]`.
 
 Launch the camera publisher from the ROS 2 workspace:
 

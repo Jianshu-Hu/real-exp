@@ -18,7 +18,8 @@ POSITION_TOLERANCE_RAD = 0.01
 VELOCITY_TOLERANCE_RAD_PER_S = 0.05
 REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S = np.array([0.35, 0.35, 0.35, 0.35, 0.50, 0.50, 0.50], dtype=float)
 REPLAY_MAX_JOINT_ACCELERATIONS_RAD_PER_S2 = np.array([0.80, 0.80, 0.80, 0.80, 1.20, 1.20, 1.20], dtype=float)
-DEFAULT_REPLAY_VELOCITY_FILTER_TAU_S = 0.02
+DEFAULT_REPLAY_VELOCITY_FILTER_TAU_S = 0.005
+DEFAULT_REPLAY_POSITION_TRACKING_GAIN_PER_S = 2.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +42,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Low-pass filter time constant for replay velocity commands in seconds. "
             "Set to 0.0 to disable the filter."
+        ),
+    )
+    parser.add_argument(
+        "--position-tracking-gain",
+        type=float,
+        default=DEFAULT_REPLAY_POSITION_TRACKING_GAIN_PER_S,
+        help=(
+            "Position feedback gain in 1/s added on top of delta-velocity replay. "
+            "Set to 0.0 for pure open-loop replay."
         ),
     )
     parser.add_argument(
@@ -382,12 +392,14 @@ def ramp_joint_velocity_to_zero(
 
 def replay_arm_deltas_as_velocities(
     control: pylibfranka.ActiveControlBase,
+    arm_states: np.ndarray,
     arm_deltas: np.ndarray,
     fps: int,
     arm_name: str,
     abort_event: threading.Event,
     velocity_filter_tau_s: float,
-) -> None:
+    position_tracking_gain_per_s: float,
+) -> dict[str, float]:
     sample_dt = 1.0 / fps
     total_frames = len(arm_deltas)
     velocity_samples = np.asarray(arm_deltas, dtype=float) / sample_dt
@@ -398,9 +410,11 @@ def replay_arm_deltas_as_velocities(
     )
     time_elapsed = 0.0
     commanded_velocity = np.zeros(7, dtype=float)
+    summed_abs_error = 0.0
+    sample_count = 0
 
     while not abort_event.is_set():
-        _, time_step = control.readOnce()
+        state, time_step = control.readOnce()
         dt = duration_to_seconds(time_step)
         time_elapsed += dt
         frame_idx = int(time_elapsed / sample_dt)
@@ -408,15 +422,26 @@ def replay_arm_deltas_as_velocities(
         if frame_idx >= total_frames:
             ramp_joint_velocity_to_zero(control, commanded_velocity, abort_event)
             print(f"[{arm_name}] Playback finished successfully.")
-            return
+            return {
+                "sum_abs_error": summed_abs_error,
+                "num_error_samples": float(sample_count),
+            }
 
         phase = (time_elapsed - frame_idx * sample_dt) / sample_dt
         v_start = velocity_samples[frame_idx]
         v_end = velocity_samples[min(frame_idx + 1, total_frames - 1)]
         reference_velocity = v_start * (1.0 - phase) + v_end * phase
+        q_start = np.asarray(arm_states[frame_idx], dtype=float)
+        q_end = np.asarray(arm_states[min(frame_idx + 1, total_frames - 1)], dtype=float)
+        reference_state = q_start * (1.0 - phase) + q_end * phase
+        executed_state = np.asarray(state.q, dtype=float)
+        summed_abs_error += float(np.sum(np.abs(executed_state - reference_state)))
+        sample_count += 1
+        position_error = reference_state - executed_state
+        tracking_velocity = reference_velocity + (position_tracking_gain_per_s * position_error)
 
         filter_alpha = dt / max(velocity_filter_tau_s + dt, 1e-6)
-        filtered_velocity = commanded_velocity + filter_alpha * (reference_velocity - commanded_velocity)
+        filtered_velocity = commanded_velocity + filter_alpha * (tracking_velocity - commanded_velocity)
 
         max_delta_velocity = REPLAY_MAX_JOINT_ACCELERATIONS_RAD_PER_S2 * dt
         velocity_step = np.clip(
@@ -453,16 +478,19 @@ def register_worker_ready(
 def arm_worker(
     robot_ip: str,
     start_q: np.ndarray,
+    arm_states: np.ndarray,
     arm_deltas: np.ndarray,
     fps: int,
     arm_name: str,
     velocity_filter_tau_s: float,
+    position_tracking_gain_per_s: float,
     abort_event: Any,
     ready_event: Any,
     start_event: Any,
     ready_count: Any,
     ready_lock: Any,
     worker_count: int,
+    result_queue: Any,
 ) -> None:
     print(f"[{arm_name}] Connecting to Franka at {robot_ip}...")
     try:
@@ -483,13 +511,22 @@ def arm_worker(
         hold_position_until_start(position_control, start_q, arm_name, abort_event, start_event)
         finish_joint_position_control(position_control, start_q)
         velocity_control = start_sync_joint_velocity_control(robot)
-        replay_arm_deltas_as_velocities(
+        replay_summary = replay_arm_deltas_as_velocities(
             velocity_control,
+            arm_states,
             arm_deltas,
             fps,
             arm_name,
             abort_event,
             velocity_filter_tau_s,
+            position_tracking_gain_per_s,
+        )
+        result_queue.put(
+            {
+                "arm_name": arm_name,
+                "sum_abs_error": replay_summary["sum_abs_error"],
+                "num_error_samples": replay_summary["num_error_samples"],
+            }
         )
     except Exception as exc:
         print(f"[{arm_name}] EXCEPTION during control: {exc}")
@@ -638,11 +675,14 @@ def replay_dual_trajectory(
     actions: np.ndarray,
     fps: int,
     velocity_filter_tau_s: float,
+    position_tracking_gain_per_s: float,
     action_config: dict[str, Any] | None,
 ) -> None:
     data = split_dual_arm_data(states, actions)
     left_start_q = np.asarray(data["left_arm_state"][0], dtype=float)
     right_start_q = np.asarray(data["right_arm_state"][0], dtype=float)
+    left_arm_states = np.asarray(data["left_arm_state"], dtype=float)
+    right_arm_states = np.asarray(data["right_arm_state"], dtype=float)
     left_arm_deltas = np.asarray(data["left_arm_action"], dtype=float)
     right_arm_deltas = np.asarray(data["right_arm_action"], dtype=float)
     gripper_action_representation = str(
@@ -670,6 +710,7 @@ def replay_dual_trajectory(
     start_event = mp.Event()
     ready_count = mp.Value("i", 0)
     ready_lock = mp.Lock()
+    result_queue = mp.Queue()
     commands = start_command_listener()
     worker_count = 2
     if left_gripper_actions is not None:
@@ -683,16 +724,19 @@ def replay_dual_trajectory(
             args=(
                 ip_left,
                 left_start_q,
+                left_arm_states,
                 left_arm_deltas,
                 fps,
                 "Left Arm",
                 velocity_filter_tau_s,
+                position_tracking_gain_per_s,
                 abort_event,
                 ready_event,
                 start_event,
                 ready_count,
                 ready_lock,
                 worker_count,
+                result_queue,
             ),
             name="left_arm_replay",
         ),
@@ -701,16 +745,19 @@ def replay_dual_trajectory(
             args=(
                 ip_right,
                 right_start_q,
+                right_arm_states,
                 right_arm_deltas,
                 fps,
                 "Right Arm",
                 velocity_filter_tau_s,
+                position_tracking_gain_per_s,
                 abort_event,
                 ready_event,
                 start_event,
                 ready_count,
                 ready_lock,
                 worker_count,
+                result_queue,
             ),
             name="right_arm_replay",
         ),
@@ -772,6 +819,20 @@ def replay_dual_trajectory(
     for thread in gripper_threads:
         thread.join()
 
+    replay_error_summaries: list[dict[str, float | str]] = []
+    while not result_queue.empty():
+        replay_error_summaries.append(result_queue.get())
+
+    for replay_error_summary in sorted(replay_error_summaries, key=lambda item: str(item["arm_name"])):
+        sample_count = int(float(replay_error_summary["num_error_samples"]))
+        sum_abs_error = float(replay_error_summary["sum_abs_error"])
+        mean_abs_error_per_timestep = sum_abs_error / max(sample_count, 1)
+        print(
+            f"[{replay_error_summary['arm_name']}] Mean absolute state error per timestep: "
+            f"{mean_abs_error_per_timestep:.6f} rad "
+            f"(sum={sum_abs_error:.6f} rad over {sample_count} control samples)."
+        )
+
     if abort_event.is_set():
         print("Dual-arm replay aborted due to an error.")
     else:
@@ -793,6 +854,7 @@ def main() -> None:
         actions,
         args.fps,
         args.velocity_filter_tau,
+        args.position_tracking_gain,
         action_config,
     )
 

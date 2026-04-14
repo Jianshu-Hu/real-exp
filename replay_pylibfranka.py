@@ -20,6 +20,9 @@ REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S = np.array([0.35, 0.35, 0.35, 0.35, 0.50, 
 REPLAY_MAX_JOINT_ACCELERATIONS_RAD_PER_S2 = np.array([0.80, 0.80, 0.80, 0.80, 1.20, 1.20, 1.20], dtype=float)
 DEFAULT_REPLAY_VELOCITY_FILTER_TAU_S = 0.005
 DEFAULT_REPLAY_POSITION_TRACKING_GAIN_PER_S = 2.0
+INITIAL_POSE_TRACKING_GAIN_PER_S = 1.5
+HOLD_POSE_TRACKING_GAIN_PER_S = 1.5
+REPLAY_START_BLEND_TIME_S = 0.20
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,19 +118,26 @@ def get_episode_data(dataset_root: Path, episode_index: int) -> tuple[np.ndarray
 
     episode_states: list[list[float]] = []
     episode_actions: list[list[float]] = []
+    available_episode_indices: set[int] = set()
     for parquet_file in parquet_files:
         table = pq.read_table(parquet_file, columns=["episode_index", "observation.state", "action"])
         data = table.to_pydict()
         for row_episode_index, row_state, row_action in zip(
             data["episode_index"], data["observation.state"], data["action"], strict=True
         ):
+            available_episode_indices.add(int(row_episode_index))
             if row_episode_index != episode_index:
                 continue
             episode_states.append(row_state)
             episode_actions.append(row_action)
 
     if not episode_actions:
-        raise ValueError(f"Episode {episode_index} not found or has no data.")
+        available_sorted = sorted(available_episode_indices)
+        raise ValueError(
+            f"Episode {episode_index} not found in frame parquet data. "
+            f"Available episode indices: {available_sorted}. "
+            "This usually means the dataset metadata and frame data are inconsistent."
+        )
 
     states = np.asarray(episode_states, dtype=float)
     actions = np.asarray(episode_actions, dtype=float)
@@ -289,22 +299,52 @@ def controller_mode() -> object:
         return pylibfranka.ControllerMode.JointImpedance
 
 
-def start_sync_joint_position_control(robot: pylibfranka.Robot) -> pylibfranka.ActiveControlBase:
-    return robot.start_joint_position_control(controller_mode())
-
-
 def start_sync_joint_velocity_control(robot: pylibfranka.Robot) -> pylibfranka.ActiveControlBase:
     return robot.start_joint_velocity_control(controller_mode())
 
 
-def warm_up_controller(control: pylibfranka.ActiveControlBase, hold_q: np.ndarray, cycles: int = 200) -> object:
+def recover_robot_if_needed(robot: pylibfranka.Robot, arm_name: str) -> None:
+    try:
+        robot.automatic_error_recovery()
+        print(f"[{arm_name}] Automatic error recovery completed.")
+    except Exception as exc:
+        message = str(exc)
+        if "no error" in message.lower():
+            return
+        raise RuntimeError(f"Automatic error recovery failed: {exc}") from exc
+
+
+def warm_up_velocity_controller(control: pylibfranka.ActiveControlBase, cycles: int = 200) -> object:
     state: object | None = None
     for _ in range(cycles):
         state, _ = control.readOnce()
-        control.writeOnce(pylibfranka.JointPositions(hold_q.tolist()))
+        control.writeOnce(pylibfranka.JointVelocities([0.0] * 7))
     if state is None:
         raise RuntimeError("Failed to read controller state during warmup.")
     return state
+
+
+def limit_velocity_command(
+    current_velocity: np.ndarray,
+    target_velocity: np.ndarray,
+    dt: float,
+) -> np.ndarray:
+    clipped_target_velocity = np.clip(
+        np.asarray(target_velocity, dtype=float),
+        -REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S,
+        REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S,
+    )
+    max_delta_velocity = REPLAY_MAX_JOINT_ACCELERATIONS_RAD_PER_S2 * max(dt, 1e-6)
+    velocity_step = np.clip(
+        clipped_target_velocity - current_velocity,
+        -max_delta_velocity,
+        max_delta_velocity,
+    )
+    return np.clip(
+        current_velocity + velocity_step,
+        -REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S,
+        REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S,
+    )
 
 
 def move_arm_to_initial_pose(
@@ -314,33 +354,31 @@ def move_arm_to_initial_pose(
     abort_event: threading.Event,
 ) -> np.ndarray:
     state, _ = control.readOnce()
-    start_command_q = np.array(getattr(state, "q_d", state.q), dtype=float)
-    max_delta = float(np.max(np.abs(start_q - start_command_q)))
+    current_q = np.array(state.q, dtype=float)
+    max_delta = float(np.max(np.abs(start_q - current_q)))
+    commanded_velocity = np.zeros(7, dtype=float)
 
     if max_delta < 1e-4:
         print(f"[{arm_name}] Already at the initial pose recorded in the episode.")
-        return start_q.copy()
+        return commanded_velocity
 
     print(
         f"[{arm_name}] Moving to the initial pose recorded in the episode "
         f"(max joint delta={max_delta:.3f} rad)..."
     )
 
-    duration_s = max(2.0, min(8.0, max_delta / 0.15 + 0.5))
-    elapsed = 0.0
-    commanded_q = start_command_q.copy()
-
-    warm_up_controller(control, start_command_q)
+    warm_up_velocity_controller(control)
 
     while not abort_event.is_set():
         state, time_step = control.readOnce()
-        elapsed += duration_to_seconds(time_step)
-        alpha = smoothstep(elapsed / duration_s)
-        commanded_q = start_command_q * (1.0 - alpha) + start_q * alpha
-        control.writeOnce(pylibfranka.JointPositions(commanded_q.tolist()))
+        dt = duration_to_seconds(time_step)
+        current_q = np.asarray(state.q, dtype=float)
+        if robot_at_target(state, start_q):
+            return commanded_velocity
 
-        if alpha >= 1.0 and robot_at_target(state, start_q):
-            return start_q.copy()
+        target_velocity = INITIAL_POSE_TRACKING_GAIN_PER_S * (start_q - current_q)
+        commanded_velocity = limit_velocity_command(commanded_velocity, target_velocity, dt)
+        control.writeOnce(pylibfranka.JointVelocities(commanded_velocity.tolist()))
 
     raise RuntimeError("Playback aborted while moving to the initial pose.")
 
@@ -351,22 +389,19 @@ def hold_position_until_start(
     arm_name: str,
     abort_event: threading.Event,
     start_event: threading.Event,
-) -> None:
+    commanded_velocity: np.ndarray,
+) -> np.ndarray:
     print(f"[{arm_name}] Initial pose reached. Waiting for synchronized playback start...")
     while not start_event.is_set():
         if abort_event.is_set():
             raise RuntimeError("Playback aborted while waiting for synchronized start.")
-        control.readOnce()
-        control.writeOnce(pylibfranka.JointPositions(hold_q.tolist()))
-
-
-def finish_joint_position_control(
-    control: pylibfranka.ActiveControlBase,
-    hold_q: np.ndarray,
-) -> None:
-    jp = pylibfranka.JointPositions(hold_q.tolist())
-    jp.motion_finished = True
-    control.writeOnce(jp)
+        state, time_step = control.readOnce()
+        dt = duration_to_seconds(time_step)
+        current_q = np.asarray(state.q, dtype=float)
+        target_velocity = HOLD_POSE_TRACKING_GAIN_PER_S * (hold_q - current_q)
+        commanded_velocity = limit_velocity_command(commanded_velocity, target_velocity, dt)
+        control.writeOnce(pylibfranka.JointVelocities(commanded_velocity.tolist()))
+    return commanded_velocity
 
 
 def ramp_joint_velocity_to_zero(
@@ -399,6 +434,7 @@ def replay_arm_deltas_as_velocities(
     abort_event: threading.Event,
     velocity_filter_tau_s: float,
     position_tracking_gain_per_s: float,
+    initial_commanded_velocity: np.ndarray,
 ) -> dict[str, float]:
     sample_dt = 1.0 / fps
     total_frames = len(arm_deltas)
@@ -409,52 +445,56 @@ def replay_arm_deltas_as_velocities(
         REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S,
     )
     time_elapsed = 0.0
-    commanded_velocity = np.zeros(7, dtype=float)
+    commanded_velocity = np.asarray(initial_commanded_velocity, dtype=float).copy()
     summed_abs_error = 0.0
     sample_count = 0
+    current_frame_idx = 0
+    current_position_error = np.zeros(7, dtype=float)
 
     while not abort_event.is_set():
-        state, time_step = control.readOnce()
-        dt = duration_to_seconds(time_step)
-        time_elapsed += dt
-        frame_idx = int(time_elapsed / sample_dt)
+        try:
+            state, time_step = control.readOnce()
+            dt = duration_to_seconds(time_step)
+            time_elapsed += dt
+            current_frame_idx = int(time_elapsed / sample_dt)
 
-        if frame_idx >= total_frames:
-            ramp_joint_velocity_to_zero(control, commanded_velocity, abort_event)
-            print(f"[{arm_name}] Playback finished successfully.")
-            return {
-                "sum_abs_error": summed_abs_error,
-                "num_error_samples": float(sample_count),
-            }
+            if current_frame_idx >= total_frames:
+                ramp_joint_velocity_to_zero(control, commanded_velocity, abort_event)
+                print(f"[{arm_name}] Playback finished successfully.")
+                return {
+                    "sum_abs_error": summed_abs_error,
+                    "num_error_samples": float(sample_count),
+                }
 
-        phase = (time_elapsed - frame_idx * sample_dt) / sample_dt
-        v_start = velocity_samples[frame_idx]
-        v_end = velocity_samples[min(frame_idx + 1, total_frames - 1)]
-        reference_velocity = v_start * (1.0 - phase) + v_end * phase
-        q_start = np.asarray(arm_states[frame_idx], dtype=float)
-        q_end = np.asarray(arm_states[min(frame_idx + 1, total_frames - 1)], dtype=float)
-        reference_state = q_start * (1.0 - phase) + q_end * phase
-        executed_state = np.asarray(state.q, dtype=float)
-        summed_abs_error += float(np.sum(np.abs(executed_state - reference_state)))
-        sample_count += 1
-        position_error = reference_state - executed_state
-        tracking_velocity = reference_velocity + (position_tracking_gain_per_s * position_error)
+            phase = (time_elapsed - current_frame_idx * sample_dt) / sample_dt
+            v_start = velocity_samples[current_frame_idx]
+            v_end = velocity_samples[min(current_frame_idx + 1, total_frames - 1)]
+            reference_velocity = v_start * (1.0 - phase) + v_end * phase
+            q_start = np.asarray(arm_states[current_frame_idx], dtype=float)
+            q_end = np.asarray(arm_states[min(current_frame_idx + 1, total_frames - 1)], dtype=float)
+            reference_state = q_start * (1.0 - phase) + q_end * phase
+            executed_state = np.asarray(state.q, dtype=float)
+            summed_abs_error += float(np.sum(np.abs(executed_state - reference_state)))
+            sample_count += 1
+            current_position_error = reference_state - executed_state
+            replay_velocity = reference_velocity + (position_tracking_gain_per_s * current_position_error)
+            hold_velocity = HOLD_POSE_TRACKING_GAIN_PER_S * current_position_error
+            start_blend = min(time_elapsed / REPLAY_START_BLEND_TIME_S, 1.0)
+            tracking_velocity = hold_velocity * (1.0 - start_blend) + replay_velocity * start_blend
 
-        filter_alpha = dt / max(velocity_filter_tau_s + dt, 1e-6)
-        filtered_velocity = commanded_velocity + filter_alpha * (tracking_velocity - commanded_velocity)
-
-        max_delta_velocity = REPLAY_MAX_JOINT_ACCELERATIONS_RAD_PER_S2 * dt
-        velocity_step = np.clip(
-            filtered_velocity - commanded_velocity,
-            -max_delta_velocity,
-            max_delta_velocity,
-        )
-        commanded_velocity = np.clip(
-            commanded_velocity + velocity_step,
-            -REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S,
-            REPLAY_MAX_JOINT_VELOCITIES_RAD_PER_S,
-        )
-        control.writeOnce(pylibfranka.JointVelocities(commanded_velocity.tolist()))
+            filter_alpha = dt / max(velocity_filter_tau_s + dt, 1e-6)
+            filtered_velocity = commanded_velocity + filter_alpha * (tracking_velocity - commanded_velocity)
+            commanded_velocity = limit_velocity_command(commanded_velocity, filtered_velocity, dt)
+            control.writeOnce(pylibfranka.JointVelocities(commanded_velocity.tolist()))
+        except Exception as exc:
+            mean_abs_error = summed_abs_error / max(sample_count, 1)
+            max_abs_joint_error = float(np.max(np.abs(current_position_error)))
+            raise RuntimeError(
+                f"Replay failed at episode frame {current_frame_idx}/{total_frames - 1} "
+                f"(t={time_elapsed:.3f}s, control_sample={sample_count}, "
+                f"mean_abs_error_so_far={mean_abs_error:.6f} rad, "
+                f"max_abs_joint_error={max_abs_joint_error:.6f} rad): {exc}"
+            ) from exc
 
     raise RuntimeError("Playback aborted while replaying arm actions.")
 
@@ -495,6 +535,7 @@ def arm_worker(
     print(f"[{arm_name}] Connecting to Franka at {robot_ip}...")
     try:
         robot = pylibfranka.Robot(robot_ip)
+        recover_robot_if_needed(robot, arm_name)
         robot.set_collision_behavior(
             [20.0] * 7, [20.0] * 7, [20.0] * 6, [20.0] * 6
         )
@@ -505,12 +546,17 @@ def arm_worker(
         return
 
     try:
-        position_control = start_sync_joint_position_control(robot)
-        move_arm_to_initial_pose(position_control, start_q, arm_name, abort_event)
-        register_worker_ready(arm_name, ready_count, ready_lock, worker_count, ready_event)
-        hold_position_until_start(position_control, start_q, arm_name, abort_event, start_event)
-        finish_joint_position_control(position_control, start_q)
         velocity_control = start_sync_joint_velocity_control(robot)
+        commanded_velocity = move_arm_to_initial_pose(velocity_control, start_q, arm_name, abort_event)
+        register_worker_ready(arm_name, ready_count, ready_lock, worker_count, ready_event)
+        commanded_velocity = hold_position_until_start(
+            velocity_control,
+            start_q,
+            arm_name,
+            abort_event,
+            start_event,
+            commanded_velocity,
+        )
         replay_summary = replay_arm_deltas_as_velocities(
             velocity_control,
             arm_states,
@@ -520,6 +566,7 @@ def arm_worker(
             abort_event,
             velocity_filter_tau_s,
             position_tracking_gain_per_s,
+            commanded_velocity,
         )
         result_queue.put(
             {

@@ -1,15 +1,10 @@
-# Real Experiments
-
-Repository for real-world robot experiments centered on GELLO teleoperation, Franka FR3 control, and LeRobot data collection.
+# DATA COLLECTION
 
 
 ## Overview
-
-This repo combines three pieces of the workflow:
-
-- `gello_software/`: GELLO teleoperation code, robot integrations, and ROS 2 support.
-- `lerobot/`: LeRobot codebase used for datasets, training, and policy work.
 - `lerobot_collection.py`: Minimal script for recording synchronized RealSense images and robot state/action data into a LeRobot dataset.
+- `replay_pylibfranka.py`: Replay a recorded LeRobot episode on the real Franka arms using `pylibfranka`, with optional `--dry-run` inspection before motion.
+- `delete_lerobot_episode.py`: Remove one or more episodes from a local LeRobot dataset while preserving the remaining metadata, videos, and parquet data.
 
 Quick links:
 

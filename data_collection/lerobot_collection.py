@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import zmq
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
 if str(LOCAL_LEROBOT_SRC) not in sys.path:
     sys.path.insert(0, str(LOCAL_LEROBOT_SRC))

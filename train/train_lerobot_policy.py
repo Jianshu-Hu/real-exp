@@ -37,6 +37,14 @@ DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"
 
+
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a LeRobot imitation-learning policy on a local dataset."
@@ -67,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=50_000, help="Number of optimizer steps.")
     parser.add_argument("--batch-size", type=int, default=8, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader worker count.")
-    parser.add_argument("--save-freq", type=int, default=5_000, help="Checkpoint save frequency.")
+    parser.add_argument("--save-freq", type=int, default=2_500, help="Checkpoint save frequency.")
     parser.add_argument("--log-freq", type=int, default=100, help="Logging frequency in steps.")
     parser.add_argument("--seed", type=int, default=1000, help="Random seed.")
     parser.add_argument(
@@ -422,6 +430,8 @@ def main() -> None:
 
     train_iter = iter(train_dataloader)
     policy.train()
+    loop_start_time = time.perf_counter()
+    start_step = step
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
@@ -451,11 +461,20 @@ def main() -> None:
         is_val_step = val_freq > 0 and step % val_freq == 0 and val_dataloader is not None
 
         if is_log_step:
-            print(train_tracker)
+            elapsed_s = time.perf_counter() - loop_start_time
+            completed_steps = max(1, step - start_step)
+            seconds_per_step = elapsed_s / completed_steps
+            remaining_steps = max(0, cfg.steps - step)
+            eta_s = seconds_per_step * remaining_steps
+            print(
+                f"{train_tracker} elapsed:{format_duration(elapsed_s)} eta:{format_duration(eta_s)}"
+            )
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
                     wandb_log_dict.update(output_dict)
+                wandb_log_dict["elapsed_s"] = elapsed_s
+                wandb_log_dict["eta_s"] = eta_s
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 

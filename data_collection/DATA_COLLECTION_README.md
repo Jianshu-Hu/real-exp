@@ -158,3 +158,25 @@ python lerobot_collection.py
 - General GELLO docs: [gello_software/README.md](gello_software/README.md)
 - Franka FR3 ROS 2 docs: [gello_software/ros2/README.md](gello_software/ros2/README.md)
 - LeRobot docs: [lerobot/README.md](lerobot/README.md)
+
+## Dataset Hub Helpers
+
+Two small helpers are available under `data_collection/` for moving LeRobot datasets to and from Hugging Face.
+
+Push a local dataset:
+
+```bash
+python data_collection/push_lerobot_dataset.py \
+  --dataset-root data/pick_and_place_test \
+  --repo-id Jianshu1/pick_and_place_test \
+  --private
+```
+
+Fetch a dataset from Hugging Face:
+
+```bash
+python data_collection/fetch_lerobot_dataset.py \
+  --repo-id Jianshu1/pick_and_place_test
+```
+
+By default, `fetch_lerobot_dataset.py` downloads into `data/<repo-name>`.

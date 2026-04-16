@@ -5,6 +5,8 @@ This directory contains the repo-local training entrypoint for imitation learnin
 - `train/train_lerobot_policy.py`
 - `train/deploy_lerobot_policy.py`
 - `train/franka_policy_executor.py`
+- `train/push_lerobot_policy.py`
+- `train/fetch_lerobot_policy.py`
 
 ## Environment
 
@@ -152,3 +154,23 @@ python train/train_lerobot_policy.py \
 ```
 
 Use the same output directory as the prior run.
+
+## Policy Hub Helpers
+
+Push a saved local policy to Hugging Face:
+
+```bash
+python train/push_lerobot_policy.py \
+  --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
+  --repo-id Jianshu1/pick_and_place_test_act \
+  --private
+```
+
+Fetch a policy from Hugging Face:
+
+```bash
+python train/fetch_lerobot_policy.py \
+  --repo-id Jianshu1/pick_and_place_test_act
+```
+
+By default, fetched policies are stored under `outputs/fetched_policies/<repo-name>`.

@@ -507,11 +507,7 @@ class FrankaPolicyExecutor:
         raise ValueError(f"Unsupported gripper action representation '{representation}' for bridge execution.")
 
     def _set_bridge_active(self, active: bool) -> None:
-        if (
-            not self.args.execute
-            or self.args.execute_backend != "bridge"
-            or self.args.no_auto_activate_bridge
-        ):
+        if self.args.no_auto_activate_bridge:
             return
         if self.bridge_active == active:
             return

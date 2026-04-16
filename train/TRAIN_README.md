@@ -161,7 +161,7 @@ Push a saved local policy to Hugging Face:
 
 ```bash
 python train/push_lerobot_policy.py \
-  --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
+  --policy-path outputs/pick_and_place_test_act/checkpoints/last\
   --repo-id Jianshu1/pick_and_place_test_act \
   --private
 ```

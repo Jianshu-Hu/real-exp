@@ -59,7 +59,11 @@ def parse_args() -> argparse.Namespace:
         "--policy-path",
         type=Path,
         required=True,
-        help="Path to the trained LeRobot checkpoint directory.",
+        help=(
+            "Path to the trained LeRobot checkpoint directory. "
+            "This path is forwarded to the policy server and must be valid on the server machine. "
+            "It does not need to exist locally if --policy-type and --actions-per-chunk are provided."
+        ),
     )
     parser.add_argument(
         "--dataset-root",
@@ -135,7 +139,7 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
-def infer_policy_type(policy_path: Path) -> str:
+def infer_policy_type(policy_path: Path) -> str | None:
     config = load_json(policy_path / "config.json")
     policy_type = config.get("type")
     if not isinstance(policy_type, str) or not policy_type:
@@ -152,6 +156,13 @@ def infer_actions_per_chunk(policy_path: Path, policy_type: str) -> int:
     if policy_type == "vqbet":
         return int(config.get("n_action_pred_token", 1))
     return 1
+
+
+def maybe_load_policy_config(policy_path: Path) -> dict[str, Any] | None:
+    config_path = policy_path / "config.json"
+    if not config_path.exists():
+        return None
+    return load_json(config_path)
 
 
 def build_live_lerobot_features(first_packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -242,12 +253,30 @@ def read_once(control: Any) -> float:
 class FrankaPolicyExecutor:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.policy_path = args.policy_path.resolve()
+        self.policy_path = args.policy_path.expanduser()
         self.dataset_root = args.dataset_root.resolve()
-        self.policy_type = args.policy_type or infer_policy_type(self.policy_path)
-        self.actions_per_chunk = args.actions_per_chunk or infer_actions_per_chunk(
-            self.policy_path, self.policy_type
-        )
+        local_policy_config = maybe_load_policy_config(self.policy_path)
+        if args.policy_type is not None:
+            self.policy_type = args.policy_type
+        elif local_policy_config is not None:
+            self.policy_type = infer_policy_type(self.policy_path)
+        else:
+            raise FileNotFoundError(
+                "Could not find a local policy config.json for --policy-path. "
+                "When the checkpoint exists only on the policy server machine, pass "
+                "--policy-type explicitly."
+            )
+
+        if args.actions_per_chunk is not None:
+            self.actions_per_chunk = args.actions_per_chunk
+        elif local_policy_config is not None:
+            self.actions_per_chunk = infer_actions_per_chunk(self.policy_path, self.policy_type)
+        else:
+            raise FileNotFoundError(
+                "Could not find a local policy config.json for --policy-path. "
+                "When the checkpoint exists only on the policy server machine, pass "
+                "--actions-per-chunk explicitly."
+            )
         self.dataset_info = load_json(self.dataset_root / INFO_REL_PATH)
         action_config_path = self.dataset_root / ACTION_CONFIG_REL_PATH
         self.action_config = load_json(action_config_path) if action_config_path.exists() else {}
@@ -315,7 +344,7 @@ class FrankaPolicyExecutor:
 
     def send_observation(self, observation: TimedObservation) -> None:
         observation_bytes = pickle.dumps(observation)  # nosec
-        request_iterator = send_bytes_in_chunks(
+        request_iterator = self.send_bytes_in_chunks(
             observation_bytes,
             self.services_pb2.Observation,
             log_prefix="[FRANKA_EXECUTOR] Observation",
@@ -479,7 +508,14 @@ class FrankaPolicyExecutor:
         try:
             while not self.shutdown_event.is_set():
                 loop_start = time.perf_counter()
-                current_packet = first_packet if timestep == 0 else socket.recv_pyobj()
+                if timestep == 0:
+                    current_packet = first_packet
+                else:
+                    try:
+                        current_packet = socket.recv_pyobj()
+                    except zmq.Again:
+                        time.sleep(0.001)
+                        continue
                 raw_observation = packet_to_raw_observation(current_packet, self.args.task)
                 must_go = False
                 with self.action_lock:
@@ -488,7 +524,7 @@ class FrankaPolicyExecutor:
                 observation = TimedObservation(
                     timestamp=time.time(),
                     observation=raw_observation,
-                    timestep=max(self.latest_executed_timestep, 0),
+                    timestep=timestep,
                     must_go=must_go,
                 )
                 self.send_observation(observation)

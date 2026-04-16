@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import pickle  # nosec
+import time
+from concurrent import futures
+from dataclasses import asdict
 from pathlib import Path
+from pprint import pformat
+from queue import Empty
 from typing import Any
+
+import grpc
+import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -99,6 +109,163 @@ def describe_action_layout(action_dim: int) -> str:
     return f"Unsupported or custom action layout with dim={action_dim}"
 
 
+def make_deployment_policy_server():
+    from lerobot.async_inference.constants import SUPPORTED_POLICIES
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+    from lerobot.async_inference.policy_server import PolicyServer
+    from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+    from lerobot.policies.utils import populate_queues
+    from lerobot.transport import services_pb2
+    from lerobot.utils.constants import OBS_IMAGES
+
+    class DeploymentPolicyServer(PolicyServer):
+        def SendPolicyInstructions(self, request, context):  # noqa: N802
+            if not self.running:
+                self.logger.warning("Server is not running. Ignoring policy instructions.")
+                return services_pb2.Empty()
+
+            client_id = context.peer()
+            policy_specs = pickle.loads(request.data)  # nosec
+
+            if not isinstance(policy_specs, RemotePolicyConfig):
+                raise TypeError(f"Policy specs must be a RemotePolicyConfig. Got {type(policy_specs)}")
+
+            if policy_specs.policy_type not in SUPPORTED_POLICIES:
+                raise ValueError(
+                    f"Policy type {policy_specs.policy_type} not supported. "
+                    f"Supported policies: {SUPPORTED_POLICIES}"
+                )
+
+            self.logger.info(
+                f"Receiving policy instructions from {client_id} | "
+                f"Policy type: {policy_specs.policy_type} | "
+                f"Pretrained name or path: {policy_specs.pretrained_name_or_path} | "
+                f"Actions per chunk: {policy_specs.actions_per_chunk} | "
+                f"Device: {policy_specs.device}"
+            )
+
+            self.device = policy_specs.device
+            self.policy_type = policy_specs.policy_type
+            self.lerobot_features = policy_specs.lerobot_features
+            self.actions_per_chunk = policy_specs.actions_per_chunk
+
+            policy_class = get_policy_class(self.policy_type)
+
+            start = time.perf_counter()
+            self.policy = policy_class.from_pretrained(
+                policy_specs.pretrained_name_or_path,
+                cli_overrides=[f"--device={self.device}"],
+            )
+            self.policy.to(self.device)
+
+            device_override = {"device": self.device}
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                self.policy.config,
+                pretrained_path=policy_specs.pretrained_name_or_path,
+                preprocessor_overrides={
+                    "device_processor": device_override,
+                    "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+                },
+                postprocessor_overrides={"device_processor": device_override},
+            )
+
+            end = time.perf_counter()
+            self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
+
+            return services_pb2.Empty()
+
+        def GetActions(self, request, context):  # noqa: N802
+            try:
+                getactions_starts = time.perf_counter()
+                obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
+                self.logger.info(
+                    f"Running inference for observation #{obs.get_timestep()} (must_go: {obs.must_go})"
+                )
+
+                with self._predicted_timesteps_lock:
+                    self._predicted_timesteps.add(obs.get_timestep())
+
+                start_time = time.perf_counter()
+                action_chunk = self._predict_action_chunk(obs)
+                inference_time = time.perf_counter() - start_time
+
+                start_time = time.perf_counter()
+                actions_bytes = pickle.dumps(action_chunk)  # nosec
+                serialize_time = time.perf_counter() - start_time
+
+                actions = services_pb2.Actions(data=actions_bytes)
+
+                self.logger.info(
+                    f"Action chunk #{obs.get_timestep()} generated | "
+                    f"Total time: {(inference_time + serialize_time) * 1000:.2f}ms"
+                )
+
+                self.logger.debug(
+                    f"Action chunk #{obs.get_timestep()} generated | "
+                    f"Inference time: {inference_time:.2f}s |"
+                    f"Serialize time: {serialize_time:.2f}s |"
+                    f"Total time: {inference_time + serialize_time:.2f}s"
+                )
+
+                time.sleep(
+                    max(0, self.config.inference_latency - max(0, time.perf_counter() - getactions_starts))
+                )
+
+                return actions
+
+            except Empty:
+                return services_pb2.Empty()
+            except Exception:
+                self.logger.exception("Error in StreamActions")
+                return services_pb2.Empty()
+
+        def _prepare_policy_batch(self, observation: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            batch = dict(observation)
+
+            expected_image_keys = list(self.policy_image_features)
+            if expected_image_keys:
+                missing_image_keys = [key for key in expected_image_keys if key not in batch]
+                if missing_image_keys:
+                    raise KeyError(
+                        "Observation is missing image features expected by the policy. "
+                        f"Missing: {missing_image_keys}. Available keys: {sorted(batch.keys())}"
+                    )
+                batch[OBS_IMAGES] = torch.stack([batch[key] for key in expected_image_keys], dim=-4)
+
+            if hasattr(self.policy, "_queues"):
+                self.policy._queues = populate_queues(self.policy._queues, batch)
+
+            return batch
+
+        def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
+            observation = self._prepare_policy_batch(observation)
+            chunk = self.policy.predict_action_chunk(observation)
+            if chunk.ndim != 3:
+                chunk = chunk.unsqueeze(0)
+
+            return chunk[:, : self.actions_per_chunk, :]
+
+    return DeploymentPolicyServer
+
+
+def serve_deployment_policy_server(cfg) -> None:
+    from lerobot.transport import services_pb2_grpc
+
+    DeploymentPolicyServer = make_deployment_policy_server()
+
+    logging.info(pformat(asdict(cfg)))
+
+    policy_server = DeploymentPolicyServer(cfg)
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    services_pb2_grpc.add_AsyncInferenceServicer_to_server(policy_server, server)
+    server.add_insecure_port(f"{cfg.host}:{cfg.port}")
+
+    policy_server.logger.info(f"PolicyServer started on {cfg.host}:{cfg.port}")
+    server.start()
+    server.wait_for_termination()
+    policy_server.logger.info("Server terminated")
+
+
 def inspect_policy(policy_path: Path, dataset_root: Path) -> None:
     from lerobot.policies.factory import get_policy_class
 
@@ -182,7 +349,6 @@ def inspect_policy(policy_path: Path, dataset_root: Path) -> None:
 
 def run_server(args: argparse.Namespace) -> None:
     from lerobot.async_inference.configs import PolicyServerConfig
-    from lerobot.async_inference.policy_server import serve
 
     inference_latency = args.inference_latency
     if inference_latency is None:
@@ -195,7 +361,7 @@ def run_server(args: argparse.Namespace) -> None:
         inference_latency=inference_latency,
         obs_queue_timeout=args.obs_queue_timeout,
     )
-    serve(cfg)
+    serve_deployment_policy_server(cfg)
 
 
 def main() -> None:

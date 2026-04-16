@@ -6,6 +6,7 @@ import logging
 import os
 import pickle  # nosec
 import time
+import traceback
 from concurrent import futures
 from dataclasses import asdict
 from pathlib import Path
@@ -116,7 +117,7 @@ def make_deployment_policy_server():
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
     from lerobot.policies.utils import populate_queues
     from lerobot.transport import services_pb2
-    from lerobot.utils.constants import OBS_IMAGES
+    from lerobot.utils.constants import ACTION, OBS_IMAGES
 
     class DeploymentPolicyServer(PolicyServer):
         def SendPolicyInstructions(self, request, context):  # noqa: N802
@@ -215,12 +216,14 @@ def make_deployment_policy_server():
 
             except Empty:
                 return services_pb2.Empty()
-            except Exception:
-                self.logger.exception("Error in StreamActions")
+            except Exception as exc:
+                self.logger.error(f"Error in StreamActions: {exc}")
+                self.logger.error(traceback.format_exc())
                 return services_pb2.Empty()
 
         def _prepare_policy_batch(self, observation: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
             batch = dict(observation)
+            batch.pop(ACTION, None)
 
             expected_image_keys = list(self.policy_image_features)
             if expected_image_keys:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import pickle  # nosec
+import subprocess  # nosec
 import threading
 import time
 from collections import deque
@@ -107,12 +108,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--execute",
         action="store_true",
-        help="Actually send commands to the Franka robots. Without this flag the script runs in dry-run mode.",
+        help="Execute policy commands. By default this forwards targets to the ROS2 deployment bridge.",
+    )
+    parser.add_argument(
+        "--execute-backend",
+        choices=("bridge", "pylibfranka"),
+        default="bridge",
+        help="Execution backend to use when --execute is set.",
+    )
+    parser.add_argument(
+        "--command-zmq-host",
+        default="127.0.0.1",
+        help="Host of the bridge command socket used by the bridge execution backend.",
+    )
+    parser.add_argument(
+        "--command-zmq-port",
+        type=int,
+        default=5556,
+        help="Port of the bridge command socket used by the bridge execution backend.",
+    )
+    parser.add_argument(
+        "--bridge-activation-service",
+        default="/set_deployment_active",
+        help="ROS 2 SetBool service used to activate/deactivate the deployment bridge.",
+    )
+    parser.add_argument(
+        "--no-auto-activate-bridge",
+        action="store_true",
+        help="Do not automatically activate the deployment bridge before sending the first bridge command.",
     )
     parser.add_argument(
         "--enable-gripper",
+        dest="enable_gripper",
         action="store_true",
-        help="Enable best-effort gripper commands when gripper actions are present.",
+        default=True,
+        help="Enable best-effort gripper commands when gripper actions are present (default).",
+    )
+    parser.add_argument(
+        "--disable-gripper",
+        dest="enable_gripper",
+        action="store_false",
+        help="Disable best-effort gripper commands even when gripper actions are present.",
     )
     parser.add_argument(
         "--gripper-open-width",
@@ -301,6 +337,8 @@ class FrankaPolicyExecutor:
         self.right_commanded_velocity = np.zeros(7, dtype=float)
         self.last_left_gripper_command: float | None = None
         self.last_right_gripper_command: float | None = None
+        self.command_socket = None
+        self.bridge_active = False
 
     def connect_policy_server(self, first_packet: dict[str, Any]) -> None:
         lerobot_features = build_live_lerobot_features(first_packet)
@@ -363,6 +401,8 @@ class FrankaPolicyExecutor:
     def setup_robot_controls(self) -> None:
         if not self.args.execute:
             return
+        if self.args.execute_backend != "pylibfranka":
+            return
         if pylibfranka is None:
             raise RuntimeError("pylibfranka is not installed in this environment.")
 
@@ -376,7 +416,11 @@ class FrankaPolicyExecutor:
             self.right_gripper = pylibfranka.Gripper(self.args.ip_right)
 
     def stop_robot_controls(self) -> None:
-        if not self.args.execute or pylibfranka is None:
+        if (
+            not self.args.execute
+            or self.args.execute_backend != "pylibfranka"
+            or pylibfranka is None
+        ):
             return
         zero_velocity = pylibfranka.JointVelocities([0.0] * 7)
         zero_velocity.motion_finished = True
@@ -413,7 +457,118 @@ class FrankaPolicyExecutor:
         print(f"Unsupported gripper representation '{representation}', skipping gripper command.")
         return last_value
 
-    def apply_action(self, action_tensor: Any) -> None:
+    def setup_command_bridge(self, zmq_context: Any) -> None:
+        if not self.args.execute or self.args.execute_backend != "bridge":
+            return
+        self.command_socket = zmq_context.socket(import_zmq_runtime().PUSH)
+        self.command_socket.setsockopt(import_zmq_runtime().SNDHWM, 1)
+        self.command_socket.connect(f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}")
+        print(
+            "Bridge command backend:",
+            f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}",
+        )
+
+    def _arm_action_representation(self) -> str:
+        return str(
+            self.action_config.get("arm_action_representation", "delta_joint_position")
+        ).strip().lower()
+
+    def _gripper_action_representation(self) -> str:
+        return str(
+            self.action_config.get("gripper_action_representation", "binary_open_close")
+        ).strip().lower()
+
+    def _joint_targets_from_action(self, current_state: np.ndarray, split: dict[str, Any]) -> dict[str, list[float]]:
+        current_split = split_action(current_state)
+        representation = self._arm_action_representation()
+        if representation == "delta_joint_position":
+            left_target = (
+                np.asarray(current_split["left_arm"], dtype=float) + np.asarray(split["left_arm"], dtype=float)
+            ).tolist()
+            right_target = (
+                np.asarray(current_split["right_arm"], dtype=float) + np.asarray(split["right_arm"], dtype=float)
+            ).tolist()
+            return {"left": left_target, "right": right_target}
+        if representation == "absolute_joint_position":
+            return {
+                "left": np.asarray(split["left_arm"], dtype=float).tolist(),
+                "right": np.asarray(split["right_arm"], dtype=float).tolist(),
+            }
+        raise ValueError(f"Unsupported arm action representation '{representation}' for bridge execution.")
+
+    def _gripper_command_from_action(self, value: float | None) -> float | None:
+        if value is None:
+            return None
+        representation = self._gripper_action_representation()
+        if representation == "binary_open_close":
+            return 1.0 if float(value) >= 0.5 else 0.0
+        if representation == "absolute_width":
+            return max(0.0, min(1.0, float(value)))
+        raise ValueError(f"Unsupported gripper action representation '{representation}' for bridge execution.")
+
+    def _set_bridge_active(self, active: bool) -> None:
+        if (
+            not self.args.execute
+            or self.args.execute_backend != "bridge"
+            or self.args.no_auto_activate_bridge
+        ):
+            return
+        if self.bridge_active == active:
+            return
+
+        state = "true" if active else "false"
+        command = [
+            "ros2",
+            "service",
+            "call",
+            self.args.bridge_activation_service,
+            "std_srvs/srv/SetBool",
+            f"{{data: {state}}}",
+        ]
+        try:
+            result = subprocess.run(  # nosec B603
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "Could not find the 'ros2' CLI. Source the ROS 2 environment before running "
+                "the executor, or pass --no-auto-activate-bridge and activate manually."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Timed out calling bridge activation service {self.args.bridge_activation_service}."
+            ) from exc
+
+        if result.returncode != 0 or "success=True" not in result.stdout:
+            raise RuntimeError(
+                f"Failed to {'activate' if active else 'deactivate'} bridge via "
+                f"{self.args.bridge_activation_service}.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+
+        self.bridge_active = active
+        print(f"Deployment bridge {'activated' if active else 'deactivated'} via {self.args.bridge_activation_service}.")
+
+    def _send_bridge_command(self, split: dict[str, Any], current_packet: dict[str, Any]) -> None:
+        if self.command_socket is None:
+            raise RuntimeError("Bridge command socket is not initialized.")
+
+        current_state = np.asarray(current_packet["state"], dtype=float)
+        joint_targets = self._joint_targets_from_action(current_state, split)
+        payload = {
+            "timestamp": time.time(),
+            "left_joint_target": joint_targets["left"],
+            "right_joint_target": joint_targets["right"],
+            "left_gripper_command": self._gripper_command_from_action(split["left_gripper"]),
+            "right_gripper_command": self._gripper_command_from_action(split["right_gripper"]),
+        }
+        self._set_bridge_active(True)
+        self.command_socket.send_pyobj(payload)
+
+    def apply_action(self, action_tensor: Any, current_packet: dict[str, Any]) -> None:
         action = np.asarray(action_tensor, dtype=float)
         split = split_action(action)
 
@@ -427,6 +582,10 @@ class FrankaPolicyExecutor:
                     "right_gripper": split["right_gripper"],
                 },
             )
+            return
+
+        if self.args.execute_backend == "bridge":
+            self._send_bridge_command(split, current_packet)
             return
 
         dt = 1.0 / self.args.fps
@@ -475,9 +634,11 @@ class FrankaPolicyExecutor:
         print(f"server_address: {self.args.server_address}")
         print(f"dataset_action_dim: {dataset_action_dim}")
         print(f"execute: {self.args.execute}")
-        print("Waiting for the first ZMQ packet to infer live observation features...")
 
         context = zmq.Context()
+        self._set_bridge_active(True)
+        print("Waiting for the first ZMQ packet to infer live observation features...")
+
         socket = context.socket(zmq.SUB)
         socket.connect(f"tcp://{self.args.zmq_host}:{self.args.zmq_port}")
         socket.setsockopt_string(zmq.SUBSCRIBE, "")
@@ -503,6 +664,7 @@ class FrankaPolicyExecutor:
         self.connect_policy_server(first_packet)
         receiver_thread = self.start_action_receiver()
         self.setup_robot_controls()
+        self.setup_command_bridge(context)
 
         timestep = 0
         try:
@@ -531,7 +693,7 @@ class FrankaPolicyExecutor:
 
                 action = self.maybe_pop_action()
                 if action is not None:
-                    self.apply_action(action.get_action())
+                    self.apply_action(action.get_action(), current_packet)
 
                 timestep += 1
                 sleep_time = max(0.0, (1.0 / self.args.fps) - (time.perf_counter() - loop_start))
@@ -543,6 +705,9 @@ class FrankaPolicyExecutor:
             self.shutdown_event.set()
             receiver_thread.join(timeout=1.0)
             self.stop_robot_controls()
+            self._set_bridge_active(False)
+            if self.command_socket is not None:
+                self.command_socket.close(0)
             socket.close(0)
             context.term()
             self.channel.close()

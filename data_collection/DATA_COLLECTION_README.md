@@ -4,6 +4,7 @@
 ## Overview
 - `lerobot_collection.py`: Minimal script for recording synchronized RealSense images and robot state/action data into a LeRobot dataset.
 - `replay_pylibfranka.py`: Replay a recorded LeRobot episode on the real Franka arms using `pylibfranka`, with optional `--dry-run` inspection before motion.
+- `reset_pylibfranka.py`: Reset both Franka arms to the hardcoded initial state copied from `data/pick_and_place_test` episode 0, without reading dataset parquet files at runtime.
 - `delete_lerobot_episode.py`: Remove one or more episodes from a local LeRobot dataset while preserving the remaining metadata, videos, and parquet data.
 
 Quick links:
@@ -51,6 +52,29 @@ source install/setup.bash
 ```
 
 If you open a new shell after building, run `source install/setup.bash` again before using `ros2 launch`.
+
+## Robot Reset And Replay
+
+Use the direct `pylibfranka` reset script when you want to return both robots to the fixed initial pose used for the `pick_and_place_test` setup.
+
+The reset target is stored as a constant inside `data_collection/reset_pylibfranka.py`:
+
+- left arm joint positions
+- left gripper width
+- right arm joint positions
+- right gripper width
+
+Preview the target state without moving the robots:
+
+```bash
+python data_collection/reset_pylibfranka.py --dry-run
+```
+
+Reset both arms and grippers:
+
+```bash
+python data_collection/reset_pylibfranka.py
+```
 
 ## Teleoperation Quick Start
 

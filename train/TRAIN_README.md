@@ -22,7 +22,7 @@ It currently:
 
 - Uses the local dataset at `data/pick_and_place_test` by default
 - Redirects Hugging Face cache writes into `./.hf-cache`
-- Supports `act` and `diffusion` policy types
+- Supports `act`, `diffusion`, and `state_diffusion` policy types
 - Writes checkpoints and logs into `./outputs/`
 - Can split episodes into training and validation subsets
 - Can run periodic validation loss evaluation with `--val-freq`
@@ -69,6 +69,24 @@ python train/train_lerobot_policy.py \
   --disable-wandb
 ```
 
+## State-Only Diffusion Example
+
+Use `state_diffusion` to train a repo-local state-only diffusion policy that reuses the LeRobot dataset
+format, normalization processors, checkpoint layout, and deployment tooling while conditioning only on
+`observation.state`. This ignores camera features in `data/pick_and_place_test` and avoids decoding video
+frames during training without requiring changes inside the `lerobot` submodule.
+
+```bash
+python train/train_lerobot_policy.py \
+  --policy-type state_diffusion \
+  --steps 50000 \
+  --batch-size 8 \
+  --diffusion-horizon 16 \
+  --diffusion-n-obs-steps 2 \
+  --diffusion-n-action-steps 8 \
+  --disable-wandb
+```
+
 ## Useful Flags
 
 ```bash
@@ -79,7 +97,7 @@ Important options:
 
 - `--dataset-root`: override the local dataset path
 - `--dataset-repo-id`: override the LeRobot dataset repo id
-- `--policy-type {act,diffusion}`: choose the imitation-learning policy
+- `--policy-type {act,diffusion,state_diffusion}`: choose the imitation-learning policy
 - `--output-dir`: choose a custom checkpoint/log directory
 - `--steps`: total number of optimizer steps
 - `--batch-size`: training batch size
@@ -140,6 +158,8 @@ Diffusion-specific options:
 - `act` is the safest default here because your dataset contains three image streams:
   `observation.images.cam_left`, `observation.images.cam_front`, and `observation.images.cam_right`.
 - `diffusion` is also supported by the wrapper.
+- `state_diffusion` uses the diffusion policy with only `observation.state` and `action`, which is useful
+  for fast state-only tests on `data/pick_and_place_test`.
 - `vqbet` is not exposed in this script because the installed LeRobot config expects exactly one image input, while this dataset has three cameras.
 
 ## Resume Training

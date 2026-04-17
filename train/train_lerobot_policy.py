@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -14,8 +15,10 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
 from lerobot.configs.default import DatasetConfig, WandBConfig
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_policy_config, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -30,9 +33,16 @@ from lerobot.utils.train_utils import (
     update_last_checkpoint,
 )
 from lerobot.utils.utils import init_logging
-
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+TRAIN_DIR = Path(__file__).resolve().parent
+if str(TRAIN_DIR) not in sys.path:
+    sys.path.insert(0, str(TRAIN_DIR))
+
+from state_diffusion_policy import StateDiffusionConfig, StateDiffusionPolicy
+from state_only_dataset import StateOnlyLeRobotDataset
+
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"
@@ -62,9 +72,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--policy-type",
-        choices=("act", "diffusion"),
+        choices=("act", "diffusion", "state_diffusion"),
         default="act",
-        help="Imitation-learning policy family to train.",
+        help="Imitation-learning policy family to train. state_diffusion is a diffusion policy using only observation.state.",
     )
     parser.add_argument(
         "--output-dir",
@@ -190,7 +200,32 @@ def build_policy_config(args: argparse.Namespace):
             **common_kwargs,
         )
 
+    if args.policy_type == "state_diffusion":
+        return StateDiffusionConfig(
+            horizon=args.diffusion_horizon,
+            n_obs_steps=args.diffusion_n_obs_steps,
+            n_action_steps=args.diffusion_n_action_steps,
+            **common_kwargs,
+        )
+
     raise ValueError(f"Unsupported policy type: {args.policy_type}")
+
+
+def restrict_policy_config_to_state_only(policy_cfg, dataset_features: dict[str, Any]) -> None:
+    features_with_tuple_shapes = {
+        key: {**feature, "shape": tuple(feature["shape"])}
+        for key, feature in dataset_features.items()
+    }
+    policy_features = dataset_to_policy_features(features_with_tuple_shapes)
+    missing_features = [key for key in (OBS_STATE, ACTION) if key not in policy_features]
+    if missing_features:
+        raise ValueError(
+            "State-only diffusion requires dataset features "
+            f"{OBS_STATE!r} and {ACTION!r}. Missing: {missing_features}"
+        )
+
+    policy_cfg.input_features = {OBS_STATE: policy_features[OBS_STATE]}
+    policy_cfg.output_features = {ACTION: policy_features[ACTION]}
 
 
 def resolve_output_dir(args: argparse.Namespace) -> Path:
@@ -222,6 +257,45 @@ def resolve_episode_split(args: argparse.Namespace, total_episodes: int) -> tupl
 
 def make_local_dataset_cfg(repo_id: str, root: Path, episodes: list[int]) -> DatasetConfig:
     return DatasetConfig(repo_id=repo_id, root=str(root), episodes=episodes)
+
+
+def resolve_state_only_delta_timestamps(policy_cfg: StateDiffusionConfig, ds_meta: LeRobotDatasetMetadata) -> dict[str, list]:
+    delta_timestamps: dict[str, list] = {}
+    if policy_cfg.action_delta_indices is not None:
+        delta_timestamps[ACTION] = [i / ds_meta.fps for i in policy_cfg.action_delta_indices]
+    if policy_cfg.observation_delta_indices is not None:
+        delta_timestamps[OBS_STATE] = [i / ds_meta.fps for i in policy_cfg.observation_delta_indices]
+    return delta_timestamps
+
+
+def make_training_dataset(cfg: TrainPipelineConfig):
+    if cfg.policy.type != "state_diffusion":
+        return make_dataset(cfg)
+
+    ds_meta = LeRobotDatasetMetadata(cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision)
+    delta_timestamps = resolve_state_only_delta_timestamps(cfg.policy, ds_meta)
+    return StateOnlyLeRobotDataset(
+        cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+        episodes=cfg.dataset.episodes,
+        delta_timestamps=delta_timestamps,
+        revision=cfg.dataset.revision,
+        tolerance_s=cfg.tolerance_s,
+    )
+
+
+def make_training_policy(policy_cfg, dataset_meta):
+    if policy_cfg.type == "state_diffusion":
+        if policy_cfg.pretrained_path:
+            policy = StateDiffusionPolicy.from_pretrained(
+                policy_cfg.pretrained_path,
+                config=policy_cfg,
+            )
+        else:
+            policy = StateDiffusionPolicy(policy_cfg)
+        policy.to(policy_cfg.device)
+        return policy
+    return make_policy(cfg=policy_cfg, ds_meta=dataset_meta, rename_map=None)
 
 
 def build_dataloader(
@@ -298,6 +372,9 @@ def main() -> None:
 
     output_dir = resolve_output_dir(args)
     policy_cfg = build_policy_config(args)
+    if args.policy_type == "state_diffusion":
+        restrict_policy_config_to_state_only(policy_cfg, dataset_info["features"])
+
     wandb_cfg = WandBConfig(
         enable=not args.disable_wandb,
         project=args.wandb_project,
@@ -344,7 +421,7 @@ def main() -> None:
         print(f"Validation episodes: {val_episodes}")
         print(f"Validation frequency: {val_freq}")
 
-    train_dataset = make_dataset(cfg)
+    train_dataset = make_training_dataset(cfg)
     val_dataset = None
     if val_episodes:
         val_cfg = TrainPipelineConfig(
@@ -362,9 +439,9 @@ def main() -> None:
             save_freq=args.save_freq,
             wandb=wandb_cfg,
         )
-        val_dataset = make_dataset(val_cfg)
+        val_dataset = make_training_dataset(val_cfg)
 
-    policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta, rename_map=cfg.rename_map)
+    policy = make_training_policy(cfg.policy, train_dataset.meta)
 
     processor_kwargs: dict[str, Any] = {}
     postprocessor_kwargs: dict[str, Any] = {}

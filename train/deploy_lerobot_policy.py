@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import pickle  # nosec
+import sys
 import time
 import traceback
 from concurrent import futures
@@ -18,6 +19,11 @@ import grpc
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+TRAIN_DIR = Path(__file__).resolve().parent
+if str(TRAIN_DIR) not in sys.path:
+    sys.path.insert(0, str(TRAIN_DIR))
+
+from state_diffusion_policy import StateDiffusionPolicy
 
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
@@ -95,7 +101,7 @@ def infer_policy_type(config: dict[str, Any]) -> str:
 def infer_actions_per_chunk(policy_type: str, config: dict[str, Any]) -> int:
     if policy_type == "act":
         return int(config.get("n_action_steps", config.get("chunk_size", 1)))
-    if policy_type == "diffusion":
+    if policy_type in {"diffusion", "state_diffusion"}:
         return int(config.get("n_action_steps", 1))
     if policy_type == "vqbet":
         return int(config.get("n_action_pred_token", 1))
@@ -111,13 +117,20 @@ def describe_action_layout(action_dim: int) -> str:
 
 
 def make_deployment_policy_server():
-    from lerobot.async_inference.constants import SUPPORTED_POLICIES
     from lerobot.async_inference.helpers import RemotePolicyConfig
     from lerobot.async_inference.policy_server import PolicyServer
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
     from lerobot.policies.utils import populate_queues
     from lerobot.transport import services_pb2
     from lerobot.utils.constants import ACTION, OBS_IMAGES
+
+    supported_policies = {"state_diffusion"}
+    try:
+        from lerobot.async_inference.constants import SUPPORTED_POLICIES
+
+        supported_policies.update(SUPPORTED_POLICIES)
+    except Exception:
+        pass
 
     class DeploymentPolicyServer(PolicyServer):
         def SendPolicyInstructions(self, request, context):  # noqa: N802
@@ -131,10 +144,10 @@ def make_deployment_policy_server():
             if not isinstance(policy_specs, RemotePolicyConfig):
                 raise TypeError(f"Policy specs must be a RemotePolicyConfig. Got {type(policy_specs)}")
 
-            if policy_specs.policy_type not in SUPPORTED_POLICIES:
+            if policy_specs.policy_type not in supported_policies:
                 raise ValueError(
                     f"Policy type {policy_specs.policy_type} not supported. "
-                    f"Supported policies: {SUPPORTED_POLICIES}"
+                    f"Supported policies: {sorted(supported_policies)}"
                 )
 
             self.logger.info(
@@ -150,7 +163,10 @@ def make_deployment_policy_server():
             self.lerobot_features = policy_specs.lerobot_features
             self.actions_per_chunk = policy_specs.actions_per_chunk
 
-            policy_class = get_policy_class(self.policy_type)
+            if self.policy_type == "state_diffusion":
+                policy_class = StateDiffusionPolicy
+            else:
+                policy_class = get_policy_class(self.policy_type)
 
             start = time.perf_counter()
             self.policy = policy_class.from_pretrained(
@@ -303,7 +319,10 @@ def inspect_policy(policy_path: Path, dataset_root: Path) -> None:
     state_dim = int(dataset_info["features"]["observation.state"]["shape"][0])
     action_dim = int(dataset_info["features"]["action"]["shape"][0])
 
-    policy_class = get_policy_class(policy_type)
+    if policy_type == "state_diffusion":
+        policy_class = StateDiffusionPolicy
+    else:
+        policy_class = get_policy_class(policy_type)
     policy = policy_class.from_pretrained(policy_path)
 
     print("Deployment inspection")

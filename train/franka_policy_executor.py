@@ -187,7 +187,7 @@ def infer_actions_per_chunk(policy_path: Path, policy_type: str) -> int:
     config = load_json(policy_path / "config.json")
     if policy_type == "act":
         return int(config.get("n_action_steps", config.get("chunk_size", 1)))
-    if policy_type == "diffusion":
+    if policy_type in {"diffusion", "state_diffusion"}:
         return int(config.get("n_action_steps", 1))
     if policy_type == "vqbet":
         return int(config.get("n_action_pred_token", 1))

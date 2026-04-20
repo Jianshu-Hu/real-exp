@@ -45,3 +45,7 @@ python3 data_collection/replay_pylibfranka.py --help
 The detailed data collection and replay instructions now live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md).
 
 ## Notes
+
+* Do not change GELLO USB connection. If the device mapping changes, verify the configured serial port or by-id path before launching the ROS 2 nodes again.
+* Start the arm controllers in the correct mode for the task you are running. Use the normal teleoperation/data-collection launch flow for recording, and use `deployment_mode:=true` only for live policy execution as described in [train/DEPLOY_README.md](train/DEPLOY_README.md).
+* Check the GELLO offsets whenever the teleoperator joints do not align with the robot or after any hardware reset. Recompute the offsets with the procedure in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md) and update the selected GELLO config before collecting data.

@@ -6,6 +6,7 @@
 - `replay_pylibfranka.py`: Replay a recorded LeRobot episode on the real Franka arms using `pylibfranka`, with optional `--dry-run` inspection before motion.
 - `reset_pylibfranka.py`: Reset both Franka arms to the hardcoded initial state copied from `data/pick_and_place_test` episode 0, without reading dataset parquet files at runtime.
 - `delete_lerobot_episode.py`: Remove one or more episodes from a local LeRobot dataset while preserving the remaining metadata, videos, and parquet data.
+- `validate_dataset.py`: Validate a local LeRobot dataset and print dataset-level and per-episode consistency information.
 
 Quick links:
 
@@ -174,6 +175,43 @@ Then run the LeRobot recorder from the repo root:
 ```bash
 source ~/anaconda3/bin/activate && conda activate lerobot
 python lerobot_collection.py
+```
+
+## Dataset Validation
+
+After recording or editing a dataset, validate that the metadata, parquet data, and videos still agree.
+
+Run the default validation:
+
+```bash
+python3 data_collection/validate_dataset.py \
+  --dataset-root data/pick_and_place_test
+```
+
+Print one row per episode:
+
+```bash
+python3 data_collection/validate_dataset.py \
+  --dataset-root data/pick_and_place_test \
+  --verbose
+```
+
+The validator checks:
+
+- `meta/info.json` totals against actual episode metadata and data rows
+- continuous episode indices and global frame indices
+- per-episode `length` against state/action row counts
+- per-episode `frame_index` and timestamp continuity
+- `observation.state` and `action` dimensions against `info.json`
+- video timestamp ranges against episode lengths
+- physical MP4 frame counts when OpenCV is available
+
+If OpenCV is not available in the active Python environment, either install it or skip physical video checks:
+
+```bash
+python3 data_collection/validate_dataset.py \
+  --dataset-root data/pick_and_place_test \
+  --skip-video-frames
 ```
 
 

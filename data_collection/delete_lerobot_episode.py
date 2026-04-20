@@ -14,6 +14,8 @@ LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
 if str(LOCAL_LEROBOT_SRC) not in sys.path:
     sys.path.insert(0, str(LOCAL_LEROBOT_SRC))
 
+from dataset_stats import ensure_dataset_stats
+
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 
@@ -623,6 +625,7 @@ def main() -> None:
             video_workers=args.video_workers,
         )
         copy_optional_metadata(source_root, output_root)
+        ensure_dataset_stats(repo_id, output_root, force_recompute=True)
 
     except Exception:
         if moved_to_backup and backup_root is not None and backup_root.exists():

@@ -5,9 +5,15 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_COLLECTION_DIR = REPO_ROOT / "data_collection"
+if str(DATA_COLLECTION_DIR) not in sys.path:
+    sys.path.insert(0, str(DATA_COLLECTION_DIR))
 
 import torch
 from accelerate import Accelerator
@@ -31,8 +37,8 @@ from lerobot.utils.train_utils import (
 )
 from lerobot.utils.utils import init_logging
 
+from dataset_stats import ensure_dataset_stats
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"
@@ -73,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         help="Directory where checkpoints and logs will be written.",
     )
     parser.add_argument("--steps", type=int, default=50_000, help="Number of optimizer steps.")
-    parser.add_argument("--batch-size", type=int, default=8, help="Training batch size.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader worker count.")
     parser.add_argument("--save-freq", type=int, default=2_500, help="Checkpoint save frequency.")
     parser.add_argument("--log-freq", type=int, default=100, help="Logging frequency in steps.")
@@ -279,6 +285,8 @@ def main() -> None:
     dataset_root = args.dataset_root.resolve()
     if not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
+
+    ensure_dataset_stats(args.dataset_repo_id, dataset_root)
 
     if args.push_to_hub and not args.policy_repo_id:
         raise ValueError("--policy-repo-id is required when --push-to-hub is set.")

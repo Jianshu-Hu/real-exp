@@ -38,6 +38,11 @@ from lerobot.utils.train_utils import (
 from lerobot.utils.utils import init_logging
 
 from dataset_stats import ensure_dataset_stats
+from image_preprocessing import (
+    ResizePadConfig,
+    apply_resize_pad_to_feature_specs,
+    make_resize_pad_transform,
+)
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
@@ -84,6 +89,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-freq", type=int, default=2_500, help="Checkpoint save frequency.")
     parser.add_argument("--log-freq", type=int, default=100, help="Logging frequency in steps.")
     parser.add_argument("--seed", type=int, default=1000, help="Random seed.")
+    parser.add_argument(
+        "--image-resize-pad-size",
+        type=int,
+        default=224,
+        help="Resize camera images aspect-preservingly and pad to this square size. Set <=0 to disable.",
+    )
+    parser.add_argument(
+        "--image-resize-pad-fill",
+        type=float,
+        default=0.0,
+        help="Constant fill value used for padded image regions.",
+    )
     parser.add_argument(
         "--device",
         default=None,
@@ -199,6 +216,14 @@ def build_policy_config(args: argparse.Namespace):
     raise ValueError(f"Unsupported policy type: {args.policy_type}")
 
 
+def resolve_resize_pad_config(args: argparse.Namespace) -> ResizePadConfig:
+    return ResizePadConfig(
+        enabled=args.image_resize_pad_size > 0,
+        size=max(1, args.image_resize_pad_size),
+        fill=args.image_resize_pad_fill,
+    )
+
+
 def resolve_output_dir(args: argparse.Namespace) -> Path:
     if args.output_dir is not None:
         return args.output_dir.resolve()
@@ -226,7 +251,11 @@ def resolve_episode_split(args: argparse.Namespace, total_episodes: int) -> tupl
     return train_episodes, val_episodes
 
 
-def make_local_dataset_cfg(repo_id: str, root: Path, episodes: list[int]) -> DatasetConfig:
+def make_local_dataset_cfg(
+    repo_id: str,
+    root: Path,
+    episodes: list[int],
+) -> DatasetConfig:
     return DatasetConfig(repo_id=repo_id, root=str(root), episodes=episodes)
 
 
@@ -247,6 +276,13 @@ def build_dataloader(
         drop_last=False,
         prefetch_factor=2 if num_workers > 0 else None,
     )
+
+
+def apply_dataset_image_transform(dataset, resize_pad_config: ResizePadConfig) -> None:
+    apply_resize_pad_to_feature_specs(dataset.meta.info["features"], resize_pad_config)
+    transform = make_resize_pad_transform(resize_pad_config)
+    if transform is not None:
+        dataset.set_image_transforms(transform)
 
 
 def evaluate_validation_loss(
@@ -298,6 +334,8 @@ def main() -> None:
     dataset_info = json.loads(dataset_info_path.read_text())
     total_episodes = int(dataset_info["total_episodes"])
     train_episodes, val_episodes = resolve_episode_split(args, total_episodes)
+    resize_pad_config = resolve_resize_pad_config(args)
+    apply_resize_pad_to_feature_specs(dataset_info["features"], resize_pad_config)
 
     if not train_episodes:
         raise ValueError("Training split is empty.")
@@ -311,7 +349,11 @@ def main() -> None:
         project=args.wandb_project,
         mode="disabled" if args.disable_wandb else None,
     )
-    train_dataset_cfg = make_local_dataset_cfg(args.dataset_repo_id, dataset_root, train_episodes)
+    train_dataset_cfg = make_local_dataset_cfg(
+        args.dataset_repo_id,
+        dataset_root,
+        train_episodes,
+    )
 
     cfg = TrainPipelineConfig(
         dataset=train_dataset_cfg,
@@ -353,10 +395,15 @@ def main() -> None:
         print(f"Validation frequency: {val_freq}")
 
     train_dataset = make_dataset(cfg)
+    apply_dataset_image_transform(train_dataset, resize_pad_config)
     val_dataset = None
     if val_episodes:
         val_cfg = TrainPipelineConfig(
-            dataset=make_local_dataset_cfg(args.dataset_repo_id, dataset_root, val_episodes),
+            dataset=make_local_dataset_cfg(
+                args.dataset_repo_id,
+                dataset_root,
+                val_episodes,
+            ),
             policy=policy_cfg,
             output_dir=output_dir,
             job_name=cfg.job_name,
@@ -371,6 +418,7 @@ def main() -> None:
             wandb=wandb_cfg,
         )
         val_dataset = make_dataset(val_cfg)
+        apply_dataset_image_transform(val_dataset, resize_pad_config)
 
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta, rename_map=cfg.rename_map)
 

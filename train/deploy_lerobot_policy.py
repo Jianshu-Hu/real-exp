@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import pickle  # nosec
+import sys
 import time
 import traceback
 from concurrent import futures
@@ -18,7 +19,11 @@ import grpc
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+TRAIN_DIR = REPO_ROOT / "train"
+if str(TRAIN_DIR) not in sys.path:
+    sys.path.insert(0, str(TRAIN_DIR))
 
+from image_preprocessing import ResizePadSquare, infer_square_resize_pad_size_from_policy_features
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"
@@ -158,6 +163,10 @@ def make_deployment_policy_server():
                 cli_overrides=[f"--device={self.device}"],
             )
             self.policy.to(self.device)
+            resize_pad_size = infer_square_resize_pad_size_from_policy_features(self.policy.config.image_features)
+            self.image_preprocess = (
+                ResizePadSquare(size=resize_pad_size, fill=0.0) if resize_pad_size is not None else None
+            )
 
             device_override = {"device": self.device}
             self.preprocessor, self.postprocessor = make_pre_post_processors(
@@ -233,6 +242,9 @@ def make_deployment_policy_server():
                         "Observation is missing image features expected by the policy. "
                         f"Missing: {missing_image_keys}. Available keys: {sorted(batch.keys())}"
                     )
+                if self.image_preprocess is not None:
+                    for key in expected_image_keys:
+                        batch[key] = self.image_preprocess(batch[key])
                 batch[OBS_IMAGES] = torch.stack([batch[key] for key in expected_image_keys], dim=-4)
 
             if hasattr(self.policy, "_queues"):

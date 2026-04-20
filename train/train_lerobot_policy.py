@@ -10,12 +10,24 @@ import time
 from pathlib import Path
 from typing import Any
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+TRAIN_DIR = Path(__file__).resolve().parent
+DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"
+if str(TRAIN_DIR) not in sys.path:
+    sys.path.insert(0, str(TRAIN_DIR))
+
+hf_home = Path(os.environ.get("HF_HOME", DEFAULT_HF_CACHE))
+hf_datasets_cache = Path(os.environ.get("HF_DATASETS_CACHE", hf_home / "datasets"))
+hf_home.mkdir(parents=True, exist_ok=True)
+hf_datasets_cache.mkdir(parents=True, exist_ok=True)
+os.environ["HF_HOME"] = str(hf_home)
+os.environ["HF_DATASETS_CACHE"] = str(hf_datasets_cache)
+
 import torch
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
 from lerobot.configs.default import DatasetConfig, WandBConfig
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.utils import dataset_to_policy_features
@@ -35,17 +47,11 @@ from lerobot.utils.train_utils import (
 from lerobot.utils.utils import init_logging
 from lerobot.utils.constants import ACTION, OBS_STATE
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-TRAIN_DIR = Path(__file__).resolve().parent
-if str(TRAIN_DIR) not in sys.path:
-    sys.path.insert(0, str(TRAIN_DIR))
-
 from state_diffusion_policy import StateDiffusionConfig, StateDiffusionPolicy
 from state_only_dataset import StateOnlyLeRobotDataset
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
-DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"
 
 
 def format_duration(seconds: float) -> str:
@@ -259,12 +265,12 @@ def make_local_dataset_cfg(repo_id: str, root: Path, episodes: list[int]) -> Dat
     return DatasetConfig(repo_id=repo_id, root=str(root), episodes=episodes)
 
 
-def resolve_state_only_delta_timestamps(policy_cfg: StateDiffusionConfig, ds_meta: LeRobotDatasetMetadata) -> dict[str, list]:
+def resolve_state_only_delta_timestamps(policy_cfg: StateDiffusionConfig, fps: int) -> dict[str, list]:
     delta_timestamps: dict[str, list] = {}
     if policy_cfg.action_delta_indices is not None:
-        delta_timestamps[ACTION] = [i / ds_meta.fps for i in policy_cfg.action_delta_indices]
+        delta_timestamps[ACTION] = [i / fps for i in policy_cfg.action_delta_indices]
     if policy_cfg.observation_delta_indices is not None:
-        delta_timestamps[OBS_STATE] = [i / ds_meta.fps for i in policy_cfg.observation_delta_indices]
+        delta_timestamps[OBS_STATE] = [i / fps for i in policy_cfg.observation_delta_indices]
     return delta_timestamps
 
 
@@ -272,8 +278,9 @@ def make_training_dataset(cfg: TrainPipelineConfig):
     if cfg.policy.type != "state_diffusion":
         return make_dataset(cfg)
 
-    ds_meta = LeRobotDatasetMetadata(cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision)
-    delta_timestamps = resolve_state_only_delta_timestamps(cfg.policy, ds_meta)
+    dataset_info_path = Path(cfg.dataset.root) / "meta" / "info.json"
+    dataset_info = json.loads(dataset_info_path.read_text())
+    delta_timestamps = resolve_state_only_delta_timestamps(cfg.policy, int(dataset_info["fps"]))
     return StateOnlyLeRobotDataset(
         cfg.dataset.repo_id,
         root=cfg.dataset.root,
@@ -348,7 +355,10 @@ def evaluate_validation_loss(
 def main() -> None:
     args = parse_args()
     ensure_runtime_env()
-    val_freq = args.save_freq if args.val_freq is None else args.val_freq
+    if args.val_freq is None:
+        val_freq = args.save_freq if args.val_ratio > 0 else 0
+    else:
+        val_freq = args.val_freq
 
     dataset_root = args.dataset_root.resolve()
     if not dataset_root.exists():

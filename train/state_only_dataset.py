@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
+import pandas as pd
 import torch
 
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
     check_delta_timestamps,
     get_delta_indices,
     get_hf_features_from_features,
     hf_transform_to_torch,
     load_nested_dataset,
+    load_info,
+    load_stats,
+    load_subtasks,
+    load_tasks,
 )
 
 
@@ -23,6 +28,16 @@ def normalize_feature_shapes(features: dict[str, dict]) -> dict[str, dict]:
             "shape": tuple(shape) if shape is not None else shape,
         }
     return normalized
+
+
+def load_episode_rows(root: Path) -> list[dict]:
+    episode_paths = sorted((root / "meta" / "episodes").glob("*/*.parquet"))
+    if not episode_paths:
+        raise FileNotFoundError(f"Missing episode metadata under {root / 'meta' / 'episodes'}")
+
+    episodes_df = pd.concat([pd.read_parquet(path) for path in episode_paths], ignore_index=True)
+    episodes_df = episodes_df.sort_values("episode_index").reset_index(drop=True)
+    return episodes_df.to_dict(orient="records")
 
 
 class StateOnlyLeRobotDataset(torch.utils.data.Dataset):
@@ -38,7 +53,31 @@ class StateOnlyLeRobotDataset(torch.utils.data.Dataset):
         self.repo_id = repo_id
         self.root = Path(root) if root is not None else None
         self.episodes = episodes
-        self.meta = LeRobotDatasetMetadata(repo_id, root=root, revision=revision)
+        if self.root is None:
+            raise ValueError("StateOnlyLeRobotDataset requires an explicit local dataset root.")
+
+        info = load_info(self.root)
+        tasks = load_tasks(self.root)
+        subtasks = load_subtasks(self.root)
+        stats = load_stats(self.root)
+        episode_rows = load_episode_rows(self.root)
+        self._episode_rows = episode_rows
+        self._episode_index_lookup = {
+            int(ep["episode_index"]): ep for ep in self._episode_rows
+        }
+        self.meta = SimpleNamespace(
+            repo_id=repo_id,
+            root=self.root,
+            revision=revision,
+            info=info,
+            episodes=episode_rows,
+            tasks=tasks,
+            subtasks=subtasks,
+            stats=stats,
+            fps=info["fps"],
+            features=info["features"],
+            total_episodes=info["total_episodes"],
+        )
         self.features = normalize_feature_shapes(self.meta.features)
         self._absolute_to_relative_idx: dict[int, int] | None = None
 
@@ -48,7 +87,11 @@ class StateOnlyLeRobotDataset(torch.utils.data.Dataset):
             self.delta_indices = get_delta_indices(delta_timestamps, self.meta.fps)
 
         hf_features = get_hf_features_from_features(self.features)
-        self.hf_dataset = load_nested_dataset(self.meta.root / "data", features=hf_features, episodes=episodes)
+        self.hf_dataset = load_nested_dataset(
+            self.root / "data",
+            features=hf_features,
+            episodes=self.episodes,
+        )
         self.hf_dataset.set_transform(hf_transform_to_torch)
         self._build_index_mapping()
 
@@ -74,7 +117,7 @@ class StateOnlyLeRobotDataset(torch.utils.data.Dataset):
     def _get_query_indices(
         self, abs_idx: int, ep_idx: int
     ) -> tuple[dict[str, list[int]], dict[str, torch.Tensor]]:
-        ep = self.meta.episodes[ep_idx]
+        ep = self._episode_index_lookup[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
         query_indices = {

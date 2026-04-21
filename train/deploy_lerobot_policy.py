@@ -409,11 +409,17 @@ def inspect_policy(policy_path: Path, dataset_root: Path) -> None:
     print(f"dataset_action_layout: {describe_action_layout(action_dim)}")
     print(f"dataset_image_keys: {', '.join(image_keys)}")
     if action_cfg is not None:
+        arm_action_representation = action_cfg.get("arm_action_representation")
         print(
             "dataset_action_representation: "
-            f"arm={action_cfg.get('arm_action_representation')}, "
+            f"arm={arm_action_representation}, "
             f"gripper={action_cfg.get('gripper_action_representation')}"
         )
+        if arm_action_representation != "absolute_joint_position":
+            print(
+                "warning: current deployment expects arm=absolute_joint_position; "
+                "old delta_joint_position policies should be retrained on a new dataset."
+            )
 
     print()
     print("Policy expectations")

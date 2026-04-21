@@ -47,6 +47,7 @@ from image_preprocessing import (
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"
+ACTION_CONFIG_REL_PATH = Path("meta/real_exp_action_config.json")
 
 
 def format_duration(seconds: float) -> str:
@@ -259,6 +260,29 @@ def make_local_dataset_cfg(
     return DatasetConfig(repo_id=repo_id, root=str(root), episodes=episodes)
 
 
+def require_absolute_joint_action_dataset(dataset_root: Path) -> None:
+    action_config_path = dataset_root / ACTION_CONFIG_REL_PATH
+    if not action_config_path.exists():
+        raise FileNotFoundError(
+            f"Missing action metadata: {action_config_path}. "
+            "Record a new dataset with the current absolute_joint_position collector."
+        )
+
+    action_config = json.loads(action_config_path.read_text())
+    arm_representation = str(action_config.get("arm_action_representation", "")).strip().lower()
+    if arm_representation != "absolute_joint_position":
+        raise ValueError(
+            f"Dataset arm_action_representation is '{arm_representation}'. "
+            "Training now expects absolute_joint_position actions. "
+            "Record a new dataset or convert the old delta-action dataset first."
+        )
+
+
+def load_action_config(dataset_root: Path) -> dict[str, Any]:
+    action_config_path = dataset_root / ACTION_CONFIG_REL_PATH
+    return json.loads(action_config_path.read_text())
+
+
 def build_dataloader(
     dataset,
     batch_size: int,
@@ -322,14 +346,16 @@ def main() -> None:
     if not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
 
-    ensure_dataset_stats(args.dataset_repo_id, dataset_root)
-
     if args.push_to_hub and not args.policy_repo_id:
         raise ValueError("--policy-repo-id is required when --push-to-hub is set.")
 
     dataset_info_path = dataset_root / "meta" / "info.json"
     if not dataset_info_path.exists():
         raise FileNotFoundError(f"Missing dataset metadata: {dataset_info_path}")
+
+    require_absolute_joint_action_dataset(dataset_root)
+    action_config = load_action_config(dataset_root)
+    ensure_dataset_stats(args.dataset_repo_id, dataset_root)
 
     dataset_info = json.loads(dataset_info_path.read_text())
     total_episodes = int(dataset_info["total_episodes"])
@@ -393,6 +419,11 @@ def main() -> None:
         print(f"Train episodes: {train_episodes}")
         print(f"Validation episodes: {val_episodes}")
         print(f"Validation frequency: {val_freq}")
+        print(
+            "Action representation: "
+            f"arm={action_config.get('arm_action_representation')}, "
+            f"gripper={action_config.get('gripper_action_representation')}"
+        )
 
     train_dataset = make_dataset(cfg)
     apply_dataset_image_transform(train_dataset, resize_pad_config)

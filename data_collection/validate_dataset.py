@@ -9,6 +9,7 @@ from typing import Any
 
 
 INFO_PATH = Path("meta/info.json")
+ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,12 +58,25 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Maximum valid gripper state/action value. Default: 1.0.",
     )
+    parser.add_argument(
+        "--gripper-tolerance",
+        type=float,
+        default=1e-5,
+        help="Tolerance around gripper min/max bounds for floating-point sensor noise. Default: 1e-5.",
+    )
     return parser.parse_args()
 
 
 def load_json(path: Path) -> dict[str, Any]:
     with path.open() as f:
         return json.load(f)
+
+
+def load_action_config(dataset_root: Path) -> dict[str, Any] | None:
+    action_config_path = dataset_root / ACTION_CONFIG_PATH
+    if not action_config_path.exists():
+        return None
+    return load_json(action_config_path)
 
 
 def require_pyarrow():
@@ -190,10 +204,12 @@ def check_cross_camera_ranges(
 def check_state_action_semantics(
     episode_index: int,
     rows: list[dict[str, Any]],
+    arm_action_representation: str,
     delta_action_tolerance: float,
     action_outlier_threshold: float,
     gripper_min: float,
     gripper_max: float,
+    gripper_tolerance: float,
 ) -> tuple[list[str], dict[str, Any]]:
     issues: list[str] = []
     metrics: dict[str, Any] = {
@@ -224,13 +240,13 @@ def check_state_action_semantics(
 
         if len(state) >= 16:
             for value in (state[7], state[15]):
-                if value < gripper_min or value > gripper_max:
+                if value < gripper_min - gripper_tolerance or value > gripper_max + gripper_tolerance:
                     metrics["gripper_outlier_frames"].append(frame_index)
                     break
 
         if len(action) >= 16:
             for value in (action[7], action[15]):
-                if value < gripper_min or value > gripper_max:
+                if value < gripper_min - gripper_tolerance or value > gripper_max + gripper_tolerance:
                     metrics["gripper_outlier_frames"].append(frame_index)
                     break
 
@@ -238,7 +254,10 @@ def check_state_action_semantics(
             right_max = max((abs(value) for value in action[8:15]), default=0.0)
             metrics["max_left_arm_delta"] = max(metrics["max_left_arm_delta"], left_max)
             metrics["max_right_arm_delta"] = max(metrics["max_right_arm_delta"], right_max)
-            if left_max > action_outlier_threshold or right_max > action_outlier_threshold:
+            if (
+                arm_action_representation == "delta_joint_position"
+                and (left_max > action_outlier_threshold or right_max > action_outlier_threshold)
+            ):
                 metrics["arm_action_outlier_frames"].append(
                     {
                         "frame_index": frame_index,
@@ -268,7 +287,7 @@ def check_state_action_semantics(
             f"{action_outlier_threshold}: {sample}"
         )
 
-    if len(sorted_rows) >= 2:
+    if arm_action_representation == "delta_joint_position" and len(sorted_rows) >= 2:
         for idx in range(len(sorted_rows) - 1):
             state = states[idx]
             next_state = states[idx + 1]
@@ -295,6 +314,8 @@ def check_state_action_semantics(
                 f"delta-action check failed on {metrics['delta_action_bad_frames']} frame(s); "
                 f"max error {metrics['delta_action_max_error']:.6g} > tolerance {delta_action_tolerance}"
             )
+    elif arm_action_representation != "absolute_joint_position":
+        issues.append(f"unsupported arm action representation '{arm_action_representation}'")
 
     return issues, metrics
 
@@ -367,6 +388,7 @@ def validate_dataset(
     action_outlier_threshold: float,
     gripper_min: float,
     gripper_max: float,
+    gripper_tolerance: float,
 ) -> int:
     if not (dataset_root / INFO_PATH).exists():
         raise FileNotFoundError(
@@ -374,6 +396,10 @@ def validate_dataset(
         )
 
     info = load_json(dataset_root / INFO_PATH)
+    action_config = load_action_config(dataset_root)
+    arm_action_representation = str(
+        (action_config or {}).get("arm_action_representation", "absolute_joint_position")
+    ).strip().lower()
     fps = float(info["fps"])
     total_episodes = int(info["total_episodes"])
     total_frames = int(info["total_frames"])
@@ -401,6 +427,7 @@ def validate_dataset(
     print(f"  data rows: {len(data_rows)}")
     print(f"  state dim: {state_dim if state_dim is not None else 'missing'}")
     print(f"  action dim: {action_dim if action_dim is not None else 'missing'}")
+    print(f"  arm action representation: {arm_action_representation}")
     print(f"  video keys: {', '.join(video_keys) if video_keys else 'none'}")
     print(f"  metadata episode indices: {format_indices(episode_indices)}")
     print(f"  data episode indices: {format_indices(data_episode_indices)}")
@@ -509,10 +536,12 @@ def validate_dataset(
         semantic_issues, semantic_metrics = check_state_action_semantics(
             episode_index=episode_index,
             rows=rows,
+            arm_action_representation=arm_action_representation,
             delta_action_tolerance=delta_action_tolerance,
             action_outlier_threshold=action_outlier_threshold,
             gripper_min=gripper_min,
             gripper_max=gripper_max,
+            gripper_tolerance=gripper_tolerance,
         )
         episode_issues.extend(semantic_issues)
 
@@ -543,16 +572,23 @@ def validate_dataset(
             issues.append("global data indices are not continuous from 0")
 
     print("\nSemantic checks")
-    print(f"  max absolute left arm action delta: {max_left_arm_delta:.6g}")
-    print(f"  max absolute right arm action delta: {max_right_arm_delta:.6g}")
-    print(f"  arm action outlier threshold: {action_outlier_threshold:.6g}")
-    print(f"  arm action outlier frames: {total_arm_action_outlier_frames}")
-    print(f"  gripper valid range: [{gripper_min:.6g}, {gripper_max:.6g}]")
+    if arm_action_representation == "delta_joint_position":
+        print(f"  max absolute left arm action delta: {max_left_arm_delta:.6g}")
+        print(f"  max absolute right arm action delta: {max_right_arm_delta:.6g}")
+        print(f"  arm action outlier threshold: {action_outlier_threshold:.6g}")
+        print(f"  arm action outlier frames: {total_arm_action_outlier_frames}")
+    else:
+        print(f"  max absolute left arm target value: {max_left_arm_delta:.6g}")
+        print(f"  max absolute right arm target value: {max_right_arm_delta:.6g}")
+    print(f"  gripper valid range: [{gripper_min:.6g}, {gripper_max:.6g}] +/- {gripper_tolerance:.6g}")
     print(f"  gripper outlier frames: {total_gripper_outlier_frames}")
     print(f"  non-finite state/action frames: {total_non_finite_frames}")
-    print(f"  delta-action tolerance: {delta_action_tolerance:.6g}")
-    print(f"  max delta-action error: {max_delta_action_error:.6g}")
-    print(f"  delta-action bad frames: {total_delta_action_bad_frames}")
+    if arm_action_representation == "delta_joint_position":
+        print(f"  delta-action tolerance: {delta_action_tolerance:.6g}")
+        print(f"  max delta-action error: {max_delta_action_error:.6g}")
+        print(f"  delta-action bad frames: {total_delta_action_bad_frames}")
+    else:
+        print("  delta-action consistency check: skipped for absolute_joint_position actions")
 
     if not skip_video_frames and video_keys:
         print("\nPhysical video checks")
@@ -593,11 +629,12 @@ def main() -> None:
             dataset_root=dataset_root,
             skip_video_frames=args.skip_video_frames,
             verbose=args.verbose,
-            delta_action_tolerance=args.delta_action_tolerance,
-            action_outlier_threshold=args.action_outlier_threshold,
-            gripper_min=args.gripper_min,
-            gripper_max=args.gripper_max,
-        )
+        delta_action_tolerance=args.delta_action_tolerance,
+        action_outlier_threshold=args.action_outlier_threshold,
+        gripper_min=args.gripper_min,
+        gripper_max=args.gripper_max,
+        gripper_tolerance=args.gripper_tolerance,
+    )
     except Exception as exc:
         print(f"Validation failed with error: {exc}", file=sys.stderr)
         raise

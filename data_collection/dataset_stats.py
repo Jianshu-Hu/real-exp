@@ -14,6 +14,8 @@ LOGGER = logging.getLogger(__name__)
 IMAGENET_CAMERA_STATS = {
     "mean": np.array([[[0.485]], [[0.456]], [[0.406]]], dtype=np.float32),
     "std": np.array([[[0.229]], [[0.224]], [[0.225]]], dtype=np.float32),
+    "min": np.array([[[0.0]], [[0.0]], [[0.0]]], dtype=np.float32),
+    "max": np.array([[[1.0]], [[1.0]], [[1.0]]], dtype=np.float32),
 }
 
 
@@ -50,6 +52,9 @@ def ensure_dataset_stats(
                 if stat_name not in camera_stats:
                     camera_stats[stat_name] = stat_value
                     stats_updated = True
+            if "count" not in camera_stats:
+                camera_stats["count"] = np.array([dataset.num_frames], dtype=np.int64)
+                stats_updated = True
 
     if stats_updated:
         write_stats(dataset.meta.stats, dataset_root)

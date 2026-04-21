@@ -154,10 +154,10 @@ def get_episode_data(dataset_root: Path, episode_index: int) -> tuple[np.ndarray
     return states, actions, action_config
 
 
-def require_delta_arm_actions(action_config: dict[str, Any] | None) -> None:
+def require_supported_arm_actions(action_config: dict[str, Any] | None) -> str:
     if action_config is None:
         raise ValueError(
-            "Dataset action metadata is missing. Replay now requires a delta-joint dataset "
+            "Dataset action metadata is missing. Replay requires a dataset "
             "recorded with meta/real_exp_action_config.json."
         )
 
@@ -169,12 +169,13 @@ def require_delta_arm_actions(action_config: dict[str, Any] | None) -> None:
             "Treating this dataset as delta_joint_position."
         )
         action_config["arm_action_representation"] = "delta_joint_position"
-        return
-    if arm_action_representation != "delta_joint_position":
+        return "delta_joint_position"
+    if arm_action_representation not in {"absolute_joint_position", "delta_joint_position"}:
         raise ValueError(
             f"Unsupported arm action representation '{arm_action_representation}'. "
-            "Replay now only supports delta_joint_position datasets."
+            "Replay supports absolute_joint_position and legacy delta_joint_position datasets."
         )
+    return arm_action_representation
 
 
 def read_current_joint_positions(robot_ip: str, arm_name: str) -> np.ndarray | None:
@@ -499,6 +500,72 @@ def replay_arm_deltas_as_velocities(
     raise RuntimeError("Playback aborted while replaying arm actions.")
 
 
+def replay_arm_targets_as_velocities(
+    control: pylibfranka.ActiveControlBase,
+    arm_targets: np.ndarray,
+    fps: int,
+    arm_name: str,
+    abort_event: threading.Event,
+    velocity_filter_tau_s: float,
+    position_tracking_gain_per_s: float,
+    initial_commanded_velocity: np.ndarray,
+) -> dict[str, float]:
+    sample_dt = 1.0 / fps
+    targets = np.asarray(arm_targets, dtype=float)
+    total_frames = len(targets)
+    time_elapsed = 0.0
+    commanded_velocity = np.asarray(initial_commanded_velocity, dtype=float).copy()
+    summed_abs_error = 0.0
+    sample_count = 0
+    current_frame_idx = 0
+    current_position_error = np.zeros(7, dtype=float)
+
+    while not abort_event.is_set():
+        try:
+            state, time_step = control.readOnce()
+            dt = duration_to_seconds(time_step)
+            time_elapsed += dt
+            current_frame_idx = int(time_elapsed / sample_dt)
+
+            if current_frame_idx >= total_frames:
+                ramp_joint_velocity_to_zero(control, commanded_velocity, abort_event)
+                print(f"[{arm_name}] Playback finished successfully.")
+                return {
+                    "sum_abs_error": summed_abs_error,
+                    "num_error_samples": float(sample_count),
+                }
+
+            phase = (time_elapsed - current_frame_idx * sample_dt) / sample_dt
+            q_start = targets[current_frame_idx]
+            q_end = targets[min(current_frame_idx + 1, total_frames - 1)]
+            reference_target = q_start * (1.0 - phase) + q_end * phase
+            executed_state = np.asarray(state.q, dtype=float)
+            current_position_error = reference_target - executed_state
+            summed_abs_error += float(np.sum(np.abs(current_position_error)))
+            sample_count += 1
+
+            tracking_velocity = position_tracking_gain_per_s * current_position_error
+            hold_velocity = HOLD_POSE_TRACKING_GAIN_PER_S * current_position_error
+            start_blend = min(time_elapsed / REPLAY_START_BLEND_TIME_S, 1.0)
+            blended_velocity = hold_velocity * (1.0 - start_blend) + tracking_velocity * start_blend
+
+            filter_alpha = dt / max(velocity_filter_tau_s + dt, 1e-6)
+            filtered_velocity = commanded_velocity + filter_alpha * (blended_velocity - commanded_velocity)
+            commanded_velocity = limit_velocity_command(commanded_velocity, filtered_velocity, dt)
+            control.writeOnce(pylibfranka.JointVelocities(commanded_velocity.tolist()))
+        except Exception as exc:
+            mean_abs_error = summed_abs_error / max(sample_count, 1)
+            max_abs_joint_error = float(np.max(np.abs(current_position_error)))
+            raise RuntimeError(
+                f"Replay failed at episode frame {current_frame_idx}/{total_frames - 1} "
+                f"(t={time_elapsed:.3f}s, control_sample={sample_count}, "
+                f"mean_abs_error_so_far={mean_abs_error:.6f} rad, "
+                f"max_abs_joint_error={max_abs_joint_error:.6f} rad): {exc}"
+            ) from exc
+
+    raise RuntimeError("Playback aborted while replaying arm targets.")
+
+
 def register_worker_ready(
     worker_name: str,
     ready_count: Any,
@@ -519,7 +586,8 @@ def arm_worker(
     robot_ip: str,
     start_q: np.ndarray,
     arm_states: np.ndarray,
-    arm_deltas: np.ndarray,
+    arm_actions: np.ndarray,
+    arm_action_representation: str,
     fps: int,
     arm_name: str,
     velocity_filter_tau_s: float,
@@ -557,17 +625,29 @@ def arm_worker(
             start_event,
             commanded_velocity,
         )
-        replay_summary = replay_arm_deltas_as_velocities(
-            velocity_control,
-            arm_states,
-            arm_deltas,
-            fps,
-            arm_name,
-            abort_event,
-            velocity_filter_tau_s,
-            position_tracking_gain_per_s,
-            commanded_velocity,
-        )
+        if arm_action_representation == "absolute_joint_position":
+            replay_summary = replay_arm_targets_as_velocities(
+                velocity_control,
+                arm_actions,
+                fps,
+                arm_name,
+                abort_event,
+                velocity_filter_tau_s,
+                position_tracking_gain_per_s,
+                commanded_velocity,
+            )
+        else:
+            replay_summary = replay_arm_deltas_as_velocities(
+                velocity_control,
+                arm_states,
+                arm_actions,
+                fps,
+                arm_name,
+                abort_event,
+                velocity_filter_tau_s,
+                position_tracking_gain_per_s,
+                commanded_velocity,
+            )
         result_queue.put(
             {
                 "arm_name": arm_name,
@@ -730,12 +810,15 @@ def replay_dual_trajectory(
     right_start_q = np.asarray(data["right_arm_state"][0], dtype=float)
     left_arm_states = np.asarray(data["left_arm_state"], dtype=float)
     right_arm_states = np.asarray(data["right_arm_state"], dtype=float)
-    left_arm_deltas = np.asarray(data["left_arm_action"], dtype=float)
-    right_arm_deltas = np.asarray(data["right_arm_action"], dtype=float)
+    left_arm_actions = np.asarray(data["left_arm_action"], dtype=float)
+    right_arm_actions = np.asarray(data["right_arm_action"], dtype=float)
+    arm_action_representation = str(
+        (action_config or {}).get("arm_action_representation", "absolute_joint_position")
+    ).strip().lower()
     gripper_action_representation = str(
         (action_config or {}).get("gripper_action_representation", "absolute_width")
     )
-    print("Arm action mode: delta_joint_position")
+    print(f"Arm action mode: {arm_action_representation}")
     if data["left_gripper_action"] is not None or data["right_gripper_action"] is not None:
         print(f"Gripper action mode: {gripper_action_representation}")
 
@@ -772,7 +855,8 @@ def replay_dual_trajectory(
                 ip_left,
                 left_start_q,
                 left_arm_states,
-                left_arm_deltas,
+                left_arm_actions,
+                arm_action_representation,
                 fps,
                 "Left Arm",
                 velocity_filter_tau_s,
@@ -793,7 +877,8 @@ def replay_dual_trajectory(
                 ip_right,
                 right_start_q,
                 right_arm_states,
-                right_arm_deltas,
+                right_arm_actions,
+                arm_action_representation,
                 fps,
                 "Right Arm",
                 velocity_filter_tau_s,
@@ -890,7 +975,7 @@ def main() -> None:
     args = parse_args()
     dataset_root = Path(args.dataset_dir).expanduser()
     states, actions, action_config = get_episode_data(dataset_root, args.episode)
-    require_delta_arm_actions(action_config)
+    require_supported_arm_actions(action_config)
     if args.dry_run:
         dry_run_summary(args.ip_left, args.ip_right, states, actions)
         return

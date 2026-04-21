@@ -14,7 +14,9 @@ from pprint import pformat
 from queue import Empty
 from typing import Any
 
-import grpc
+import torch
+
+from image_preprocessing import ResizePadSquare, infer_square_resize_pad_size_from_policy_features
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -108,9 +110,62 @@ def describe_action_layout(action_dim: int) -> str:
     return f"Unsupported or custom action layout with dim={action_dim}"
 
 
+def resize_pad_robot_observation_image(
+    image: torch.Tensor,
+    resize_dims: tuple[int, int, int],
+    image_preprocess: ResizePadSquare | None,
+) -> torch.Tensor:
+    assert image.ndim == 3, f"Image must be (H, W, C)! Received {image.shape}"
+    image = image.permute(2, 0, 1)
+
+    if image_preprocess is not None:
+        return image_preprocess(image)
+
+    dims = (resize_dims[1], resize_dims[2])
+    image_batched = image.unsqueeze(0)
+    resized = torch.nn.functional.interpolate(image_batched, size=dims, mode="bilinear", align_corners=False)
+    return resized.squeeze(0)
+
+
+def raw_observation_to_observation_with_resize_pad(
+    raw_observation: dict[str, Any],
+    lerobot_features: dict[str, dict],
+    policy_image_features: dict[str, Any],
+    image_preprocess: ResizePadSquare | None,
+) -> dict[str, Any]:
+    from lerobot.async_inference.helpers import (
+        extract_images_from_raw_observation,
+        extract_state_from_raw_observation,
+        is_image_key,
+        make_lerobot_observation,
+        prepare_image,
+    )
+
+    lerobot_obs = make_lerobot_observation(raw_observation, lerobot_features)
+    image_keys = list(filter(is_image_key, lerobot_obs))
+
+    observation: dict[str, Any] = {  # state is expected as (B, state_dim)
+        "observation.state": extract_state_from_raw_observation(lerobot_obs)
+    }
+
+    for image_key in image_keys:
+        raw_image = extract_images_from_raw_observation(lerobot_obs, image_key)
+        resized_image = resize_pad_robot_observation_image(
+            torch.as_tensor(raw_image),
+            policy_image_features[image_key].shape,
+            image_preprocess,
+        )
+        observation[image_key] = prepare_image(resized_image).unsqueeze(0)
+
+    if "task" in raw_observation:
+        observation["task"] = raw_observation["task"]
+
+    return observation
+
+
 def make_deployment_policy_server():
     from lerobot.async_inference.constants import SUPPORTED_POLICIES
-    from lerobot.async_inference.helpers import RemotePolicyConfig
+    from lerobot.async_inference.helpers import Observation, RemotePolicyConfig
     from lerobot.async_inference.policy_server import PolicyServer
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
     from lerobot.transport import services_pb2
@@ -165,11 +220,75 @@ def make_deployment_policy_server():
                 },
                 postprocessor_overrides={"device_processor": device_override},
             )
+            image_size = infer_square_resize_pad_size_from_policy_features(self.policy_image_features)
+            self.image_preprocess = ResizePadSquare(size=image_size) if image_size is not None else None
 
             end = time.perf_counter()
             self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
+            if self.image_preprocess is not None:
+                self.logger.info(
+                    "Using aspect-preserving resize + constant padding during inference "
+                    f"for square image inputs of size {self.image_preprocess.size}"
+                )
+            else:
+                self.logger.info("Using upstream direct resize during inference image preparation")
 
             return services_pb2.Empty()
+
+        def _predict_action_chunk(self, observation_t) -> list[Any]:
+            start_prepare = time.perf_counter()
+            observation: Observation = raw_observation_to_observation_with_resize_pad(
+                observation_t.get_observation(),
+                self.lerobot_features,
+                self.policy_image_features,
+                self.image_preprocess,
+            )
+            prepare_time = time.perf_counter() - start_prepare
+
+            start_preprocess = time.perf_counter()
+            observation = self.preprocessor(observation)
+            self.last_processed_obs = observation_t
+            preprocessing_time = time.perf_counter() - start_preprocess
+
+            start_inference = time.perf_counter()
+            action_tensor = self._get_action_chunk(observation)
+            inference_time = time.perf_counter() - start_inference
+            self.logger.info(
+                f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
+            )
+
+            start_postprocess = time.perf_counter()
+            _, chunk_size, _ = action_tensor.shape
+            processed_actions = []
+            for i in range(chunk_size):
+                single_action = action_tensor[:, i, :]
+                processed_action = self.postprocessor(single_action)
+                processed_actions.append(processed_action)
+
+            action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+            self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
+            action_tensor = action_tensor.detach().cpu()
+
+            action_chunk = self._time_action_chunk(
+                observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+            )
+            postprocess_stops = time.perf_counter()
+            postprocessing_time = postprocess_stops - start_postprocess
+
+            self.logger.info(
+                f"Observation {observation_t.get_timestep()} | "
+                f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
+            )
+            self.logger.debug(
+                f"Observation {observation_t.get_timestep()} | "
+                f"Prepare time: {1000 * prepare_time:.2f}ms | "
+                f"Preprocessing time: {1000 * preprocessing_time:.2f}ms | "
+                f"Inference time: {1000 * inference_time:.2f}ms | "
+                f"Postprocessing time: {1000 * postprocessing_time:.2f}ms | "
+                f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
+            )
+
+            return action_chunk
 
         def GetActions(self, request, context):  # noqa: N802
             try:
@@ -221,6 +340,8 @@ def make_deployment_policy_server():
 
 
 def serve_deployment_policy_server(cfg) -> None:
+    import grpc
+
     from lerobot.transport import services_pb2_grpc
 
     DeploymentPolicyServer = make_deployment_policy_server()

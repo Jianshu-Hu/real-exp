@@ -262,4 +262,10 @@ python data_collection/fetch_lerobot_dataset.py \
   --repo-id Jianshu1/pick_and_place_test
 ```
 
-By default, `fetch_lerobot_dataset.py` downloads into `data/<repo-name>`.
+By default:
+
+- `push_lerobot_dataset.py` pushes to remote branch `main`
+- `fetch_lerobot_dataset.py` fetches from remote branch `main`
+- `fetch_lerobot_dataset.py` replaces `data/<repo-name>` so the local copy matches the remote dataset
+
+Use `--branch`, `--revision`, `--no-clean`, or `--no-force-cache-sync` only when you intentionally want non-default behavior.

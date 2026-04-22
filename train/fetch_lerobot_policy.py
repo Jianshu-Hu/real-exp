@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
@@ -32,8 +33,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--revision",
-        default=None,
-        help="Optional Hub branch, tag, or commit to fetch.",
+        default="main",
+        help=(
+            "Hub branch, tag, or commit to fetch. "
+            "Defaults to 'main' so the local policy matches the remote branch by default."
+        ),
     )
     parser.add_argument(
         "--token",
@@ -44,6 +48,21 @@ def parse_args() -> argparse.Namespace:
         "--local-files-only",
         action="store_true",
         help="Use only local Hub cache files and avoid network access.",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        default=True,
+        help=(
+            "Delete the target local policy directory before fetching. "
+            "Enabled by default so fetch replaces the local copy with the current remote contents."
+        ),
+    )
+    parser.add_argument(
+        "--no-clean",
+        dest="clean",
+        action="store_false",
+        help="Keep the existing local policy directory instead of replacing it before fetch.",
     )
     return parser.parse_args()
 
@@ -59,6 +78,26 @@ def default_local_dir(repo_id: str) -> Path:
     return DEFAULT_OUTPUT_ROOT / repo_name
 
 
+def remove_existing_policy(local_dir: Path) -> None:
+    if not local_dir.exists():
+        return
+    if not local_dir.is_dir():
+        raise NotADirectoryError(f"Cannot clean non-directory path: {local_dir}")
+
+    resolved_repo_root = REPO_ROOT.resolve()
+    resolved_outputs_root = (REPO_ROOT / "outputs").resolve()
+    resolved_local_dir = local_dir.resolve()
+    if resolved_local_dir in (resolved_repo_root, resolved_outputs_root, Path("/")):
+        raise ValueError(f"Refusing to clean unsafe policy path: {resolved_local_dir}")
+    if resolved_outputs_root not in resolved_local_dir.parents and resolved_repo_root not in resolved_local_dir.parents:
+        raise ValueError(
+            f"Refusing to clean path outside this repository. Remove it manually if intended: {resolved_local_dir}"
+        )
+
+    print(f"Removing existing local policy: {resolved_local_dir}")
+    shutil.rmtree(resolved_local_dir)
+
+
 def main() -> None:
     args = parse_args()
     ensure_runtime_env()
@@ -68,6 +107,8 @@ def main() -> None:
         if args.local_dir is not None
         else default_local_dir(args.repo_id).resolve()
     )
+    if args.clean:
+        remove_existing_policy(local_dir)
     local_dir.parent.mkdir(parents=True, exist_ok=True)
 
     resolved_dir = snapshot_download(

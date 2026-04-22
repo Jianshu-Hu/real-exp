@@ -161,9 +161,8 @@ Push a saved local policy to Hugging Face:
 
 ```bash
 python train/push_lerobot_policy.py \
-  --policy-path outputs/pick_and_place_test_act/checkpoints/last\
-  --repo-id Jianshu1/pick_and_place_test_act \
-  --private
+  --policy-path outputs/pick_and_place_test_act/checkpoints/last \
+  --repo-id Jianshu1/pick_and_place_test_act
 ```
 
 Fetch a policy from Hugging Face:
@@ -173,4 +172,10 @@ python train/fetch_lerobot_policy.py \
   --repo-id Jianshu1/pick_and_place_test_act
 ```
 
-By default, fetched policies are stored under `outputs/fetched_policies/<repo-name>`.
+By default:
+
+- `push_lerobot_policy.py` pushes to remote branch `main`
+- `fetch_lerobot_policy.py` fetches from remote branch `main`
+- `fetch_lerobot_policy.py` replaces `outputs/fetched_policies/<repo-name>` so the local copy matches the remote policy
+
+Use `--branch`, `--revision`, or `--no-clean` only when you intentionally want non-default behavior.

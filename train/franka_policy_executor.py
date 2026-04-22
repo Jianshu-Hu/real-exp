@@ -249,6 +249,25 @@ def split_action(action: np.ndarray) -> dict[str, Any]:
     raise ValueError(f"Unsupported action dimension: {action.shape[0]}")
 
 
+def split_state(state: np.ndarray) -> dict[str, Any]:
+    state = np.asarray(state, dtype=float)
+    if state.shape[0] == 16:
+        return {
+            "left_arm": state[0:7],
+            "left_gripper": float(state[7]),
+            "right_arm": state[8:15],
+            "right_gripper": float(state[15]),
+        }
+    if state.shape[0] == 14:
+        return {
+            "left_arm": state[0:7],
+            "left_gripper": None,
+            "right_arm": state[7:14],
+            "right_gripper": None,
+        }
+    raise ValueError(f"Unsupported state dimension: {state.shape[0]}")
+
+
 def controller_mode() -> object:
     if pylibfranka is None:
         raise RuntimeError("pylibfranka is required for robot execution mode.")
@@ -315,7 +334,20 @@ class FrankaPolicyExecutor:
             )
         self.dataset_info = load_json(self.dataset_root / INFO_REL_PATH)
         action_config_path = self.dataset_root / ACTION_CONFIG_REL_PATH
-        self.action_config = load_json(action_config_path) if action_config_path.exists() else {}
+        if not action_config_path.exists():
+            raise FileNotFoundError(
+                f"Missing action metadata: {action_config_path}. "
+                "Deployment now requires an absolute-target dataset recorded with "
+                "meta/real_exp_action_config.json."
+            )
+        self.action_config = load_json(action_config_path)
+        arm_action_representation = self._arm_action_representation()
+        if arm_action_representation != "absolute_joint_position":
+            raise ValueError(
+                f"Dataset arm_action_representation is '{arm_action_representation}'. "
+                "Deployment now expects absolute_joint_position arm actions. "
+                "Record and train a new absolute-target dataset before executing this policy."
+            )
         grpc, services_pb2, services_pb2_grpc, grpc_channel_options, send_bytes_in_chunks = import_grpc_runtime()
         self.grpc = grpc
         self.services_pb2 = services_pb2
@@ -470,7 +502,7 @@ class FrankaPolicyExecutor:
 
     def _arm_action_representation(self) -> str:
         return str(
-            self.action_config.get("arm_action_representation", "delta_joint_position")
+            self.action_config.get("arm_action_representation", "absolute_joint_position")
         ).strip().lower()
 
     def _gripper_action_representation(self) -> str:
@@ -479,22 +511,16 @@ class FrankaPolicyExecutor:
         ).strip().lower()
 
     def _joint_targets_from_action(self, current_state: np.ndarray, split: dict[str, Any]) -> dict[str, list[float]]:
-        current_split = split_action(current_state)
         representation = self._arm_action_representation()
-        if representation == "delta_joint_position":
-            left_target = (
-                np.asarray(current_split["left_arm"], dtype=float) + np.asarray(split["left_arm"], dtype=float)
-            ).tolist()
-            right_target = (
-                np.asarray(current_split["right_arm"], dtype=float) + np.asarray(split["right_arm"], dtype=float)
-            ).tolist()
-            return {"left": left_target, "right": right_target}
         if representation == "absolute_joint_position":
             return {
                 "left": np.asarray(split["left_arm"], dtype=float).tolist(),
                 "right": np.asarray(split["right_arm"], dtype=float).tolist(),
             }
-        raise ValueError(f"Unsupported arm action representation '{representation}' for bridge execution.")
+        raise ValueError(
+            f"Unsupported arm action representation '{representation}' for bridge execution. "
+            "Record and train datasets with arm_action_representation=absolute_joint_position."
+        )
 
     def _gripper_command_from_action(self, value: float | None) -> float | None:
         if value is None:
@@ -584,14 +610,26 @@ class FrankaPolicyExecutor:
             self._send_bridge_command(split, current_packet)
             return
 
+        if self._arm_action_representation() != "absolute_joint_position":
+            raise ValueError(
+                "The direct pylibfranka executor now expects absolute_joint_position arm actions."
+            )
+
         dt = 1.0 / self.args.fps
         if self.left_control is not None:
             dt = read_once(self.left_control)
         if self.right_control is not None:
             dt = min(dt, read_once(self.right_control))
 
-        target_left_velocity = np.asarray(split["left_arm"], dtype=float) / max(1.0 / self.args.fps, 1e-6)
-        target_right_velocity = np.asarray(split["right_arm"], dtype=float) / max(1.0 / self.args.fps, 1e-6)
+        current_split = split_state(np.asarray(current_packet["state"], dtype=float))
+        target_left_velocity = (
+            np.asarray(split["left_arm"], dtype=float)
+            - np.asarray(current_split["left_arm"], dtype=float)
+        ) / max(1.0 / self.args.fps, 1e-6)
+        target_right_velocity = (
+            np.asarray(split["right_arm"], dtype=float)
+            - np.asarray(current_split["right_arm"], dtype=float)
+        ) / max(1.0 / self.args.fps, 1e-6)
 
         if self.args.velocity_filter_tau > 0:
             alpha = dt / max(self.args.velocity_filter_tau + dt, 1e-6)

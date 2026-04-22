@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
 if str(LOCAL_LEROBOT_SRC) not in sys.path:
     sys.path.insert(0, str(LOCAL_LEROBOT_SRC))
+
+from dataset_stats import ensure_dataset_stats
 
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
@@ -75,6 +79,15 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Print the planned deletion and exit without modifying anything.",
+    )
+    parser.add_argument(
+        "--video-workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of worker threads used for copying or re-encoding video files during deletion. "
+            "Defaults to min(number of affected video files, CPU count)."
+        ),
     )
     return parser.parse_args()
 
@@ -232,17 +245,247 @@ class LocalDatasetView:
 def load_lerobot_dependencies():
     from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
     from lerobot.datasets.dataset_tools import (
+        _keep_episodes_from_video_with_av,
         _copy_and_reindex_data,
         _copy_and_reindex_episodes_metadata,
-        _copy_and_reindex_videos,
     )
+    from lerobot.datasets.io_utils import load_episodes
 
     return (
         LeRobotDatasetMetadata,
+        _keep_episodes_from_video_with_av,
         _copy_and_reindex_data,
         _copy_and_reindex_episodes_metadata,
-        _copy_and_reindex_videos,
+        load_episodes,
     )
+
+
+def resolve_video_workers(requested_workers: int | None, task_count: int) -> int:
+    if task_count <= 0:
+        return 1
+
+    if requested_workers is not None:
+        if requested_workers <= 0:
+            raise ValueError(f"--video-workers must be positive, received: {requested_workers}")
+        return min(requested_workers, task_count)
+
+    return max(1, min(task_count, os.cpu_count() or 1))
+
+
+def copy_and_reindex_videos_parallel(
+    source_dataset: LocalDatasetView,
+    output_meta: object,
+    episode_mapping: dict[int, int],
+    keep_episodes_from_video_with_av,
+    load_episodes,
+    video_workers: int | None,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+) -> dict[int, dict]:
+    if source_dataset.meta.episodes is None:
+        source_dataset.meta.episodes = load_episodes(source_dataset.meta.root)
+
+    if output_meta.video_path is None:
+        raise ValueError("Destination metadata has no video_path defined")
+
+    episodes_video_metadata: dict[int, dict] = {new_idx: {} for new_idx in episode_mapping.values()}
+    file_tasks: list[tuple[str, int, int, list[int], list[int]]] = []
+
+    for video_key in source_dataset.meta.video_keys:
+        file_to_kept_episodes: dict[tuple[int, int], list[int]] = {}
+        file_to_all_episodes: dict[tuple[int, int], list[int]] = {}
+
+        for ep_idx in range(source_dataset.meta.total_episodes):
+            source_episode = source_dataset.meta.episodes[ep_idx]
+            chunk_idx = source_episode.get(f"videos/{video_key}/chunk_index")
+            file_idx = source_episode.get(f"videos/{video_key}/file_index")
+            if chunk_idx is None or file_idx is None:
+                continue
+
+            file_key = (chunk_idx, file_idx)
+            if file_key not in file_to_all_episodes:
+                file_to_all_episodes[file_key] = []
+            file_to_all_episodes[file_key].append(ep_idx)
+
+            if ep_idx in episode_mapping:
+                if file_key not in file_to_kept_episodes:
+                    file_to_kept_episodes[file_key] = []
+                file_to_kept_episodes[file_key].append(ep_idx)
+
+        for (src_chunk_idx, src_file_idx), episodes_in_file in sorted(file_to_kept_episodes.items()):
+            file_tasks.append(
+                (
+                    video_key,
+                    src_chunk_idx,
+                    src_file_idx,
+                    episodes_in_file,
+                    file_to_all_episodes[(src_chunk_idx, src_file_idx)],
+                )
+            )
+
+    if not file_tasks:
+        return episodes_video_metadata
+
+    max_workers = resolve_video_workers(video_workers, len(file_tasks))
+    print(f"  video copy workers: {max_workers}")
+    print(f"  affected video files: {len(file_tasks)}")
+
+    def keep_video_ranges(
+        src_video_path: Path,
+        dst_video_path: Path,
+        episode_frame_ranges: list[tuple[int, int]],
+    ) -> None:
+        try:
+            keep_episodes_from_video_with_av(
+                src_video_path,
+                dst_video_path,
+                episode_frame_ranges,
+                source_dataset.meta.fps,
+                vcodec,
+                pix_fmt,
+            )
+            return
+        except ModuleNotFoundError as exc:
+            if exc.name != "av":
+                raise
+
+        import cv2
+
+        capture = cv2.VideoCapture(str(src_video_path))
+        if not capture.isOpened():
+            raise RuntimeError(f"Failed to open source video: {src_video_path}")
+
+        fps = capture.get(cv2.CAP_PROP_FPS) or source_dataset.meta.fps
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width <= 0 or height <= 0:
+            capture.release()
+            raise RuntimeError(f"Failed to read video dimensions from: {src_video_path}")
+
+        writer = cv2.VideoWriter(
+            str(dst_video_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            capture.release()
+            raise RuntimeError(f"Failed to open destination video writer: {dst_video_path}")
+
+        try:
+            for start_frame, end_frame in episode_frame_ranges:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                for frame_idx in range(start_frame, end_frame):
+                    ok, frame = capture.read()
+                    if not ok:
+                        raise RuntimeError(
+                            f"Failed to read frame {frame_idx} from {src_video_path}"
+                        )
+                    writer.write(frame)
+        finally:
+            writer.release()
+            capture.release()
+
+    def process_video_file(
+        video_key: str,
+        src_chunk_idx: int,
+        src_file_idx: int,
+        episodes_in_file: list[int],
+        all_episodes_in_file: list[int],
+    ) -> tuple[tuple[str, int, int], dict[int, dict]]:
+        file_metadata: dict[int, dict] = {}
+        kept_episode_set = set(episodes_in_file)
+        all_episode_set = set(all_episodes_in_file)
+
+        assert source_dataset.meta.video_path is not None
+        src_video_path = source_dataset.root / source_dataset.meta.video_path.format(
+            video_key=video_key,
+            chunk_index=src_chunk_idx,
+            file_index=src_file_idx,
+        )
+        dst_video_path = output_meta.root / output_meta.video_path.format(
+            video_key=video_key,
+            chunk_index=src_chunk_idx,
+            file_index=src_file_idx,
+        )
+        dst_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if all_episode_set == kept_episode_set:
+            shutil.copy(src_video_path, dst_video_path)
+
+            for old_idx in episodes_in_file:
+                new_idx = episode_mapping[old_idx]
+                source_episode = source_dataset.meta.episodes[old_idx]
+                file_metadata[new_idx] = {
+                    f"videos/{video_key}/chunk_index": src_chunk_idx,
+                    f"videos/{video_key}/file_index": src_file_idx,
+                    f"videos/{video_key}/from_timestamp": source_episode[f"videos/{video_key}/from_timestamp"],
+                    f"videos/{video_key}/to_timestamp": source_episode[f"videos/{video_key}/to_timestamp"],
+                }
+        else:
+            sorted_keep_episodes = sorted(episodes_in_file, key=lambda idx: episode_mapping[idx])
+            episode_frame_ranges: list[tuple[int, int]] = []
+            for old_idx in sorted_keep_episodes:
+                source_episode = source_dataset.meta.episodes[old_idx]
+                from_frame = round(source_episode[f"videos/{video_key}/from_timestamp"] * source_dataset.meta.fps)
+                to_frame = round(source_episode[f"videos/{video_key}/to_timestamp"] * source_dataset.meta.fps)
+                assert source_episode["length"] == to_frame - from_frame, (
+                    f"Episode length mismatch: {source_episode['length']} vs {to_frame - from_frame}"
+                )
+                episode_frame_ranges.append((from_frame, to_frame))
+
+            keep_video_ranges(src_video_path, dst_video_path, episode_frame_ranges)
+
+            cumulative_ts = 0.0
+            for old_idx in sorted_keep_episodes:
+                new_idx = episode_mapping[old_idx]
+                source_episode = source_dataset.meta.episodes[old_idx]
+                episode_duration = source_episode["length"] / source_dataset.meta.fps
+                file_metadata[new_idx] = {
+                    f"videos/{video_key}/chunk_index": src_chunk_idx,
+                    f"videos/{video_key}/file_index": src_file_idx,
+                    f"videos/{video_key}/from_timestamp": cumulative_ts,
+                    f"videos/{video_key}/to_timestamp": cumulative_ts + episode_duration,
+                }
+                cumulative_ts += episode_duration
+
+        return (video_key, src_chunk_idx, src_file_idx), file_metadata
+
+    task_results: list[tuple[tuple[str, int, int], dict[int, dict]]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                process_video_file,
+                video_key,
+                src_chunk_idx,
+                src_file_idx,
+                episodes_in_file,
+                all_episodes_in_file,
+            ): (video_key, src_chunk_idx, src_file_idx)
+            for video_key, src_chunk_idx, src_file_idx, episodes_in_file, all_episodes_in_file in file_tasks
+        }
+
+        completed = 0
+        for future in as_completed(future_map):
+            completed += 1
+            task_descriptor = future_map[future]
+            try:
+                task_results.append(future.result())
+            except Exception as exc:
+                video_key, src_chunk_idx, src_file_idx = task_descriptor
+                raise RuntimeError(
+                    f"Failed while processing video file for {video_key} "
+                    f"(chunk {src_chunk_idx}, file {src_file_idx})"
+                ) from exc
+
+            if completed == len(file_tasks) or completed % 10 == 0:
+                print(f"  processed video files: {completed}/{len(file_tasks)}")
+
+    for _, file_metadata in sorted(task_results, key=lambda item: item[0]):
+        for episode_idx, video_meta in file_metadata.items():
+            episodes_video_metadata[episode_idx].update(video_meta)
+
+    return episodes_video_metadata
 
 
 def delete_episodes_local(
@@ -251,12 +494,14 @@ def delete_episodes_local(
     repo_id: str,
     episode_indices: list[int],
     dataset_info: dict,
+    video_workers: int | None,
 ) -> None:
     (
         LeRobotDatasetMetadata,
+        keep_episodes_from_video_with_av,
         copy_and_reindex_data,
         copy_and_reindex_episodes_metadata,
-        copy_and_reindex_videos,
+        load_episodes,
     ) = load_lerobot_dependencies()
 
     source_meta = LeRobotDatasetMetadata(
@@ -283,7 +528,14 @@ def delete_episodes_local(
 
     video_metadata = None
     if source_meta.video_keys:
-        video_metadata = copy_and_reindex_videos(source_dataset, new_meta, episode_mapping)
+        video_metadata = copy_and_reindex_videos_parallel(
+            source_dataset=source_dataset,
+            output_meta=new_meta,
+            episode_mapping=episode_mapping,
+            keep_episodes_from_video_with_av=keep_episodes_from_video_with_av,
+            load_episodes=load_episodes,
+            video_workers=video_workers,
+        )
 
     data_metadata = copy_and_reindex_data(source_dataset, new_meta, episode_mapping)
     copy_and_reindex_episodes_metadata(
@@ -370,8 +622,10 @@ def main() -> None:
             repo_id=repo_id,
             episode_indices=episode_indices,
             dataset_info=dataset_info,
+            video_workers=args.video_workers,
         )
         copy_optional_metadata(source_root, output_root)
+        ensure_dataset_stats(repo_id, output_root, force_recompute=True)
 
     except Exception:
         if moved_to_backup and backup_root is not None and backup_root.exists():

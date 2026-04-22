@@ -207,6 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 .codex
+.hf-cache
 
 lerobot_data
 data

@@ -5,9 +5,15 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_COLLECTION_DIR = REPO_ROOT / "data_collection"
+if str(DATA_COLLECTION_DIR) not in sys.path:
+    sys.path.insert(0, str(DATA_COLLECTION_DIR))
 
 import torch
 from accelerate import Accelerator
@@ -31,11 +37,17 @@ from lerobot.utils.train_utils import (
 )
 from lerobot.utils.utils import init_logging
 
+from dataset_stats import ensure_dataset_stats
+from image_preprocessing import (
+    ResizePadConfig,
+    apply_resize_pad_to_feature_specs,
+    make_resize_pad_transform,
+)
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"
+ACTION_CONFIG_REL_PATH = Path("meta/real_exp_action_config.json")
 
 
 def format_duration(seconds: float) -> str:
@@ -73,11 +85,23 @@ def parse_args() -> argparse.Namespace:
         help="Directory where checkpoints and logs will be written.",
     )
     parser.add_argument("--steps", type=int, default=50_000, help="Number of optimizer steps.")
-    parser.add_argument("--batch-size", type=int, default=8, help="Training batch size.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader worker count.")
     parser.add_argument("--save-freq", type=int, default=2_500, help="Checkpoint save frequency.")
     parser.add_argument("--log-freq", type=int, default=100, help="Logging frequency in steps.")
     parser.add_argument("--seed", type=int, default=1000, help="Random seed.")
+    parser.add_argument(
+        "--image-resize-pad-size",
+        type=int,
+        default=224,
+        help="Resize camera images aspect-preservingly and pad to this square size. Set <=0 to disable.",
+    )
+    parser.add_argument(
+        "--image-resize-pad-fill",
+        type=float,
+        default=0.0,
+        help="Constant fill value used for padded image regions.",
+    )
     parser.add_argument(
         "--device",
         default=None,
@@ -193,6 +217,14 @@ def build_policy_config(args: argparse.Namespace):
     raise ValueError(f"Unsupported policy type: {args.policy_type}")
 
 
+def resolve_resize_pad_config(args: argparse.Namespace) -> ResizePadConfig:
+    return ResizePadConfig(
+        enabled=args.image_resize_pad_size > 0,
+        size=max(1, args.image_resize_pad_size),
+        fill=args.image_resize_pad_fill,
+    )
+
+
 def resolve_output_dir(args: argparse.Namespace) -> Path:
     if args.output_dir is not None:
         return args.output_dir.resolve()
@@ -220,8 +252,35 @@ def resolve_episode_split(args: argparse.Namespace, total_episodes: int) -> tupl
     return train_episodes, val_episodes
 
 
-def make_local_dataset_cfg(repo_id: str, root: Path, episodes: list[int]) -> DatasetConfig:
+def make_local_dataset_cfg(
+    repo_id: str,
+    root: Path,
+    episodes: list[int],
+) -> DatasetConfig:
     return DatasetConfig(repo_id=repo_id, root=str(root), episodes=episodes)
+
+
+def require_absolute_joint_action_dataset(dataset_root: Path) -> None:
+    action_config_path = dataset_root / ACTION_CONFIG_REL_PATH
+    if not action_config_path.exists():
+        raise FileNotFoundError(
+            f"Missing action metadata: {action_config_path}. "
+            "Record a new dataset with the current absolute_joint_position collector."
+        )
+
+    action_config = json.loads(action_config_path.read_text())
+    arm_representation = str(action_config.get("arm_action_representation", "")).strip().lower()
+    if arm_representation != "absolute_joint_position":
+        raise ValueError(
+            f"Dataset arm_action_representation is '{arm_representation}'. "
+            "Training now expects absolute_joint_position actions. "
+            "Record a new dataset or convert the old delta-action dataset first."
+        )
+
+
+def load_action_config(dataset_root: Path) -> dict[str, Any]:
+    action_config_path = dataset_root / ACTION_CONFIG_REL_PATH
+    return json.loads(action_config_path.read_text())
 
 
 def build_dataloader(
@@ -241,6 +300,13 @@ def build_dataloader(
         drop_last=False,
         prefetch_factor=2 if num_workers > 0 else None,
     )
+
+
+def apply_dataset_image_transform(dataset, resize_pad_config: ResizePadConfig) -> None:
+    apply_resize_pad_to_feature_specs(dataset.meta.info["features"], resize_pad_config)
+    transform = make_resize_pad_transform(resize_pad_config)
+    if transform is not None:
+        dataset.set_image_transforms(transform)
 
 
 def evaluate_validation_loss(
@@ -287,9 +353,15 @@ def main() -> None:
     if not dataset_info_path.exists():
         raise FileNotFoundError(f"Missing dataset metadata: {dataset_info_path}")
 
+    require_absolute_joint_action_dataset(dataset_root)
+    action_config = load_action_config(dataset_root)
+    ensure_dataset_stats(args.dataset_repo_id, dataset_root)
+
     dataset_info = json.loads(dataset_info_path.read_text())
     total_episodes = int(dataset_info["total_episodes"])
     train_episodes, val_episodes = resolve_episode_split(args, total_episodes)
+    resize_pad_config = resolve_resize_pad_config(args)
+    apply_resize_pad_to_feature_specs(dataset_info["features"], resize_pad_config)
 
     if not train_episodes:
         raise ValueError("Training split is empty.")
@@ -303,7 +375,11 @@ def main() -> None:
         project=args.wandb_project,
         mode="disabled" if args.disable_wandb else None,
     )
-    train_dataset_cfg = make_local_dataset_cfg(args.dataset_repo_id, dataset_root, train_episodes)
+    train_dataset_cfg = make_local_dataset_cfg(
+        args.dataset_repo_id,
+        dataset_root,
+        train_episodes,
+    )
 
     cfg = TrainPipelineConfig(
         dataset=train_dataset_cfg,
@@ -343,12 +419,22 @@ def main() -> None:
         print(f"Train episodes: {train_episodes}")
         print(f"Validation episodes: {val_episodes}")
         print(f"Validation frequency: {val_freq}")
+        print(
+            "Action representation: "
+            f"arm={action_config.get('arm_action_representation')}, "
+            f"gripper={action_config.get('gripper_action_representation')}"
+        )
 
     train_dataset = make_dataset(cfg)
+    apply_dataset_image_transform(train_dataset, resize_pad_config)
     val_dataset = None
     if val_episodes:
         val_cfg = TrainPipelineConfig(
-            dataset=make_local_dataset_cfg(args.dataset_repo_id, dataset_root, val_episodes),
+            dataset=make_local_dataset_cfg(
+                args.dataset_repo_id,
+                dataset_root,
+                val_episodes,
+            ),
             policy=policy_cfg,
             output_dir=output_dir,
             job_name=cfg.job_name,
@@ -363,6 +449,7 @@ def main() -> None:
             wandb=wandb_cfg,
         )
         val_dataset = make_dataset(val_cfg)
+        apply_dataset_image_transform(val_dataset, resize_pad_config)
 
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta, rename_map=cfg.rename_map)
 

@@ -1,172 +1,64 @@
-## Deployment Helper
+## Deploying a Trained Policy
 
-The deployment helper currently supports two jobs:
+This document describes the recommended process for deploying a trained LeRobot policy to a Franka setup.
 
-- `inspect`: validate a trained checkpoint against the dataset contract
-- `server`: start a LeRobot async inference server
+The intended topology is:
 
-Inspect a checkpoint:
+- run policy inference on a server or GPU workstation
+- run the real-time executor on the computer connected to the robot
+- use the ROS 2 bridge on the robot machine to publish live observations and receive execution commands
 
-```bash
-python train/deploy_lerobot_policy.py \
-  inspect \
-  --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model
-```
+This split is safer because:
 
-Start a policy server:
+- the robot machine stays focused on low-latency IO, safety checks, and command execution
+- the inference machine can use a larger GPU and heavier models
+- server restarts do not directly disturb the robot-side control process
 
-```bash
-python train/deploy_lerobot_policy.py \
-  server \
-  --host 0.0.0.0 \
-  --port 8080 \
-  --fps 15
-```
+## Deployment Flow
 
-The `server` command in `train/deploy_lerobot_policy.py` includes the deployment-specific runtime fixes locally, so you do not need to edit the `lerobot` submodule to run the Franka deployment flow.
+Use this order:
 
-Inspecting the checkpoint before deployment is recommended because it prints:
-
-- the policy type
-- the recommended `actions_per_chunk`
-- the dataset state/action dimensions
-- the expected camera keys
-- the recorded action representation
-
-## Recommended Deployment Topology
-
-For Franka, the safer design is:
-
-- Run the policy model on a server or GPU workstation
-- Run the real-time executor on the computer connected to the Franka robot
-
-This split is usually better because:
-
-- The robot computer can stay focused on low-latency IO, safety checks, and command execution
-- The server can use a larger GPU and heavier policy models
-- You can restart inference without directly disturbing the robot-side process
+1. inspect the checkpoint and confirm the dataset contract
+2. start the camera publisher on the robot machine
+3. start the ROS 2 bridge
+4. start the policy server on the inference machine
+5. for live execution, start the ROS 2 arm and gripper consumers
+6. start the executor in dry-run mode on the robot machine
+7. verify that observations and predictions look correct
+8. restart the executor with `--execute` only after dry-run looks safe
 
 ## What Runs Where
 
 Policy server machine:
 
-- Load the trained LeRobot checkpoint
-- Receive observations over the network
-- Run policy inference
-- Return action chunks
+- load the trained checkpoint
+- receive observations over the network
+- run policy inference
+- return action chunks
 
 Robot-connected machine:
 
-- Read robot joint state, gripper state, and camera frames
-- Build observations in the same format used during training
-- Send observations to the policy server
-- Receive action chunks
-- Convert policy actions into Franka-safe commands
-- Enforce velocity limits, interpolation, watchdog timeout, and abort handling locally
+- read robot joint state, gripper state, and camera frames
+- build observations in the same format used during training
+- send observations to the policy server
+- receive action chunks
+- convert policy actions into Franka-safe commands
+- enforce velocity limits, interpolation, watchdog timeout, and abort handling locally
 
 ROS 2 bridge on the robot machine:
 
-- Subscribe to robot joint states, gripper state, gripper commands, and RGB cameras
-- Publish synchronized live packets over ZMQ for the executor
-- Keep the live observation/action dimensions aligned with the training dataset contract
+- subscribe to robot joint states, gripper state, gripper commands, and RGB cameras
+- publish synchronized live packets over ZMQ for the executor
+- receive command packets for deployment execution
+- keep the live observation and action dimensions aligned with the training dataset contract
 
 The ROS 2 bridge does not create robot or gripper state by itself.
-It only republishes already-running ROS topics into the ZMQ format expected by the policy executor.
+It republishes already-running ROS topics into the ZMQ format expected by the policy executor.
 For the default Franka duo setup, start the robot and gripper bringup before starting the bridge.
 
-## Deployment Contract
+## End-to-End Procedure
 
-For the default dataset at `data/pick_and_place_test`, the expected runtime contract is:
-
-- dataset FPS: `15`
-- observation state dimension: `16`
-- action dimension: `16`
-- camera keys: `cam_left`, `cam_front`, `cam_right`
-- action layout: `[Left Arm(7), Left Gripper(1), Right Arm(7), Right Gripper(1)]`
-- arm action representation: `delta_joint_position`
-- gripper action representation: `binary_open_close`
-
-These values come from:
-
-- `data/pick_and_place_test/meta/info.json`
-- `data/pick_and_place_test/meta/real_exp_action_config.json`
-
-The executor expects live packets from the ROS 2 bridge to match this contract.
-It verifies the live `action_dim` against the dataset metadata before starting execution.
-
-## Franka Executor
-
-`franka_policy_executor.py` is the robot-side process for the Franka computer.
-
-It currently:
-
-- Subscribes to the live ZMQ observation stream
-- Sends observations to the remote LeRobot policy server
-- Receives action chunks back
-- Interprets the action layout using the training dataset contract
-- Runs in dry-run mode by default
-- Can send arm velocity commands to the Franka only when `--execute` is explicitly passed
-
-At runtime it:
-
-- infers the policy type from `<policy-path>/config.json` unless overridden
-- connects to the remote LeRobot async inference server over gRPC
-- uses the first ZMQ packet to infer live observation feature shapes
-- sends only `observation.state`, camera frames, and the task string to the policy
-- interprets returned actions using the dataset action contract
-- converts arm actions into filtered joint velocity commands before sending them to Franka
-
-Dry run example:
-
-```bash
-python train/franka_policy_executor.py \
-  --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
-  --server-address 192.168.1.10:8080 \
-  --zmq-host 127.0.0.1 \
-  --zmq-port 5555 \
-  --fps 15
-```
-
-Live execution example:
-
-```bash
-python train/franka_policy_executor.py \
-  --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
-  --server-address 192.168.1.10:8080 \
-  --zmq-host 127.0.0.1 \
-  --zmq-port 5555 \
-  --fps 15 \
-  --execute
-```
-
-Gripper commands are enabled by default. If you want to disable them:
-
-```bash
-python train/franka_policy_executor.py \
-  --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
-  --server-address 192.168.1.10:8080 \
-  --execute \
-  --disable-gripper
-```
-
-## Recommended Bring-Up Order
-
-1. Start the robot/camera observation bridge that publishes the ZMQ packets.
-2. Start the policy server on the inference machine.
-3. Start `franka_policy_executor.py` in dry-run mode first.
-4. Verify that observations are flowing and action predictions look sensible.
-5. Only then restart with `--execute`.
-
-## Step-By-Step Deployment
-
-This section assumes:
-
-- the ROS 2 bridge runs on the Franka-connected machine
-- the policy server runs on a machine that can load the trained checkpoint
-- the checkpoint lives at `outputs/pick_and_place_test_act/checkpoints/last/pretrained_model`
-- the policy server is reachable from the robot machine at `192.168.1.10:8080`
-
-### 1. Check the trained checkpoint
+### 1. Inspect the checkpoint
 
 Run this on the machine that has the checkpoint and the `lerobot` environment:
 
@@ -176,39 +68,42 @@ python train/deploy_lerobot_policy.py \
   --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model
 ```
 
+Inspecting before deployment is recommended because it prints:
+
+- the policy type
+- the recommended `actions_per_chunk`
+- the dataset state and action dimensions
+- the expected camera keys
+- the recorded action representation
+
 Verify that:
 
 - `dataset_fps` is `15`
 - `dataset_state_dim` is `16`
 - `dataset_action_dim` is `16`
 - `dataset_image_keys` are `observation.images.cam_left`, `observation.images.cam_front`, `observation.images.cam_right`
-- `dataset_action_representation` says `arm=delta_joint_position, gripper=binary_open_close`
+- `dataset_action_representation` says `arm=absolute_joint_position, gripper=binary_open_close`
 
-### 2. Start the ROS 2 bridge on the robot machine
+### 2. Start the camera publisher
 
-Build and source the ROS 2 workspace:
-
-```bash
-cd gello_software/ros2
-colcon build
-source install/setup.bash
-```
-
-For the default dual-arm deployment setup, launch the bridge with the ROS 2 control deployment config:
+Start the RealSense camera publisher:
 
 ```bash
-ros2 launch franka_lerobot_data_bridge bridge.launch.py config_file:=deployment_duo.yaml
+ros2 launch franka_realsense_camera_publisher cameras.launch.py
 ```
 
-For single-arm deployment, launch:
+The default camera publisher config is:
 
-```bash
-ros2 launch franka_lerobot_data_bridge bridge.launch.py config_file:=deployment_single.yaml
-```
+- `gello_software/ros2/src/franka_realsense_camera_publisher/config/example_three_cameras.yaml`
 
-For live execution with the ROS 2 controller stack, `deployment_duo.yaml` uses ROS topics as the deployment state source instead of direct `pylibfranka` reads, which avoids conflicts with `ros2_control` during live execution.
+If `camera_1_serial`, `camera_2_serial`, or `camera_3_serial` are left empty, the node auto-assigns detected RealSense devices in sorted serial-number order.
+For stable camera-to-name mapping, set those serial numbers explicitly in the YAML.
 
-Before launching, check the selected YAML config and make sure these values match the training setup:
+Make sure the publisher exposes the camera topics expected by training before starting the bridge.
+
+### 3. Start the ROS 2 bridge
+
+Before launching the bridge, check the selected bridge config and make sure it matches training:
 
 - `include_right_arm`
 - `include_gripper`
@@ -219,29 +114,26 @@ Before launching, check the selected YAML config and make sure these values matc
 - `camera_1_name`, `camera_2_name`, `camera_3_name`
 - camera topic names
 
-The default dual-arm deployment config for live ROS 2 execution is:
+For the default dual-arm deployment setup:
 
-- `gello_software/ros2/src/franka_lerobot_data_bridge/config/deployment_duo.yaml`
+```bash
+ros2 launch franka_lerobot_data_bridge bridge.launch.py config_file:=deployment_duo.yaml
+```
 
-If the bridge logs `waiting for left robot joint states` in deployment mode, it could not read the left robot state from `left_robot_ip`.
-If it logs that it is waiting for gripper state, it could not read the Franka gripper width from the configured robot IP.
+For single-arm deployment:
 
-### 3. Confirm the bridge matches the training contract
+```bash
+ros2 launch franka_lerobot_data_bridge bridge.launch.py config_file:=deployment_single.yaml
+```
 
-For the default dataset, your live bridge should publish:
+For the default dataset, the live bridge should publish:
 
 - 16-dimensional robot state
 - 16-dimensional action packets
 - three RGB cameras named `cam_left`, `cam_front`, and `cam_right`
 
-Important detail:
-
-- in deployment mode the bridge publishes real `observation.state` from live hardware reads
-- it publishes placeholder action vectors only to preserve the trained dataset action dimension and layout
-- the action placeholders are not used as policy input by `franka_policy_executor.py`
-- the trained policy should still be interpreted using the dataset metadata, which for the default dataset is `delta_joint_position` for arms and `binary_open_close` for grippers
-
-So during deployment, keep using the dataset metadata as the source of truth for action interpretation.
+The deployment bridge starts in `STANDBY` mode by default.
+In standby it can publish hold commands to the ROS 2 controller topics, but it does not publish live ZMQ observation packets until deployment is activated.
 
 ### 4. Start the policy server on the inference machine
 
@@ -261,9 +153,9 @@ If needed, set:
 - `--inference-latency` to your target server-side inference budget
 - `--obs-queue-timeout` if you need a different observation timeout
 
-### 4.5. Start the ROS 2 arm and gripper consumers on the robot machine for live execution
+### 5. Start the ROS 2 arm and gripper consumers for live execution
 
-If you only want dry-run inference, you can skip this step.
+If you only want dry-run inference, skip this step until you are ready to move the robot.
 
 For live execution, start the existing controller stack in deployment-gated mode:
 
@@ -279,70 +171,31 @@ and:
 ros2 launch franka_gripper_manager franka_gripper_client.launch.py config_file:=example_fr3_duo_config_franka_hand.yaml
 ```
 
-In `deployment_mode:=true`, `joint_impedance_controller` holds the current arm pose until the bridge explicitly enables deployment control. The bridge republishes policy actions to the existing topics:
+In `deployment_mode:=true`, `joint_impedance_controller` holds the current arm pose until the bridge explicitly enables deployment control.
+The bridge republishes policy actions to these existing topics:
 
 - `/left/gello/joint_states`
 - `/right/gello/joint_states`
 - `/left/gripper/gripper_client/target_gripper_width_percent`
 - `/right/gripper/gripper_client/target_gripper_width_percent`
 
-so the existing ROS 2 consumers can be reused during deployment.
+This lets the existing ROS 2 consumers be reused during deployment.
 
-Important ordering for live execution:
+### 6. Start the executor in dry-run mode
 
-1. start the bridge with `deployment_duo.yaml` or `deployment_single.yaml`
-2. start the arm controllers with `deployment_mode:=true`
-3. start the gripper manager
-4. start the remote policy server
-5. start the executor with `--execute`
-6. the executor auto-activates the bridge before sending the first command
-
-The deployment bridge starts in `STANDBY` mode by default. In standby it can publish hold commands to the ROS 2 controller topics, but it does not publish live ZMQ observation packets until deployment is activated.
-
-If you want to activate the bridge manually instead, pass `--no-auto-activate-bridge` to the executor and then call:
-
-```bash
-ros2 service call /set_deployment_active std_srvs/srv/SetBool "{data: true}"
-```
-
-The bridge only enables the deployment-gated arm controllers after it receives the first real command packet from the executor. If you start the bridge in direct `pylibfranka` deployment-state mode while `ros2_control` is active, the bridge may stop publishing fresh `/left/right/gello/joint_states`, which causes the joint impedance controllers to time out waiting for valid command input.
-
-### 5. Start the executor in dry-run mode on the robot machine
-
-Run:
+Run this on the robot machine:
 
 ```bash
 python train/franka_policy_executor.py \
   --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
-  --server-address 192.168.1.10:8080 \
+  --server-address 192.168.50.6:8080 \
   --zmq-host 127.0.0.1 \
   --zmq-port 5555 \
   --fps 15 \
   --task "pick and place"
 ```
 
-Important:
-
-- in deployment mode, dry-run does **not** auto-activate the bridge
-- if the bridge was launched with `deployment_duo.yaml` or `deployment_single.yaml`, call the activation service once before expecting the first ZMQ packet:
-
-```bash
-ros2 service call /set_deployment_active std_srvs/srv/SetBool "{data: true}"
-```
-
-- if you skip this step, the executor will wait at `Waiting for the first ZMQ packet...`
-
-What should happen:
-
-- it waits for the first ZMQ packet from the ROS 2 bridge
-- it prints the live `state_dim`, `action_dim`, and camera names
-- it checks that live `action_dim` matches the dataset action dimension
-- it tells the remote server which checkpoint to load
-- it starts printing predicted actions instead of moving the robot
-
-If the executor raises an `action_dim` mismatch, fix the ROS 2 bridge configuration so the live stream matches the dataset used for training.
-
-If the checkpoint exists only on the policy server machine and is not present on the robot computer, pass:
+If the checkpoint exists only on the policy server machine and not on the robot computer, pass:
 
 - `--policy-path` as the path on the server machine
 - `--policy-type` explicitly
@@ -363,9 +216,17 @@ python train/franka_policy_executor.py \
   --task "pick and place"
 ```
 
-### 6. Check predictions before moving the robot
+### 7. Validate dry-run before moving the robot
 
-In dry-run mode, confirm:
+What should happen:
+
+- the executor waits for the first ZMQ packet from the ROS 2 bridge
+- it prints the live `state_dim`, `action_dim`, and camera names
+- it checks that live `action_dim` matches the dataset action dimension
+- it tells the remote server which checkpoint to load
+- it starts printing predicted actions instead of moving the robot
+
+Do not move on to live execution until all of the following look correct:
 
 - camera streams are live
 - the task string is correct
@@ -373,16 +234,16 @@ In dry-run mode, confirm:
 - the policy responds continuously without large delays
 - no dimension mismatch or missing camera errors appear
 
-Do not move on to real execution until dry-run behavior looks correct.
+If the executor raises an `action_dim` mismatch, fix the ROS 2 bridge configuration so the live stream matches the dataset used for training.
 
-### 7. Enable live robot execution
+### 8. Restart the executor with `--execute`
 
-Restart the executor with `--execute`:
+Once dry-run is stable, restart the executor for live execution:
 
 ```bash
 python train/franka_policy_executor.py \
   --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
-  --server-address 192.168.1.10:8080 \
+  --server-address 192.168.50.6:8080 \
   --zmq-host 127.0.0.1 \
   --zmq-port 5555 \
   --command-zmq-host 127.0.0.1 \
@@ -398,23 +259,41 @@ If you want to disable gripper actions during execution, add:
 --disable-gripper
 ```
 
+Live execution ordering should be:
+
+1. start the bridge with `deployment_duo.yaml` or `deployment_single.yaml`
+2. start the arm controllers with `deployment_mode:=true`
+3. start the gripper manager
+4. start the remote policy server
+5. start the executor with `--execute`
+6. let the executor auto-activate the bridge before the first command
+
+With the current executor flow, you do not need to call `/set_deployment_active` manually for live execution unless you explicitly pass `--no-auto-activate-bridge`.
+
 The executor will:
 
-- split the policy action into left/right arm and gripper components
+- split the policy action into left and right arm and gripper components
 - interpret arm actions using the trained dataset layout
-- convert `delta_joint_position` actions into absolute joint targets using the live observation state
+- send `absolute_joint_position` arm actions directly as robot joint targets
 - send those targets to the bridge command socket
 - let the bridge enable the deployment-gated arm controllers and republish targets to the existing ROS 2 arm and gripper topics
 
-With the current executor flow, you do **not** need to call `/set_deployment_active` manually for live execution unless you explicitly pass `--no-auto-activate-bridge`.
-
-Important live-control caveat:
+Important live-control caveats:
 
 - the ROS 2 bridge needs upstream camera topics and direct Franka state access
 - the current deployment execute path is intended to use the ROS 2 controller stack, not direct active `pylibfranka` control
-- do not run another node that also publishes conflicting targets to `/left/gello/joint_states` or `/right/gello/joint_states`
+- do not run another node that publishes conflicting targets to `/left/gello/joint_states` or `/right/gello/joint_states`
 
-### 8. Tune only if needed
+If you want to keep bridge activation manual during execution, pass `--no-auto-activate-bridge` to the executor and then call:
+
+```bash
+ros2 service call /set_deployment_active std_srvs/srv/SetBool "{data: true}"
+```
+
+The bridge only enables the deployment-gated arm controllers after it receives the first real command packet from the executor.
+If you start the bridge in direct `pylibfranka` deployment-state mode while `ros2_control` is active, the bridge may stop publishing fresh `/left/right/gello/joint_states`, which causes the joint impedance controllers to time out waiting for valid command input.
+
+### 9. Tune only if needed
 
 Useful executor options:
 
@@ -431,14 +310,14 @@ Useful executor options:
 ## Common Failure Modes
 
 - `action_dim` mismatch:
-  - your live ROS 2 bridge config does not match the dataset used for training
+  - the live ROS 2 bridge config does not match the dataset used for training
 - missing camera keys:
   - live camera names differ from the dataset camera feature names
 - `Repo id must be in the form ...` on the server:
   - the server cannot find the checkpoint path locally
   - pass `--policy-path` as the path on the server machine, not the robot machine
 - no ZMQ packets received:
-  - the ROS 2 bridge is not running, not publishing, or is bound to a different host/port
+  - the ROS 2 bridge is not running, not publishing, or is bound to a different host or port
 - gRPC connection errors:
   - the executor cannot reach the policy server at `--server-address`
 - `failed to connect to all addresses` or `No route to host`:
@@ -451,7 +330,7 @@ Useful executor options:
   - the policy did not receive a valid stacked image batch
   - confirm the live bridge publishes all cameras from the training contract and restart `python train/deploy_lerobot_policy.py server ...`
 - `Action receiver RPC error: Channel closed!` on the robot machine:
-  - this usually means the server crashed while handling inference
+  - the server usually crashed while handling inference
   - check the server log first and fix the upstream error there
 - executor appears to hang after the first packet when using `--execute`:
   - make sure you are using the ROS 2 bridge execution backend and that `franka_fr3_arm_controllers` is running
@@ -465,28 +344,29 @@ Useful executor options:
   - for live ROS 2 deployment, launch the bridge with `deployment_duo.yaml` or `deployment_single.yaml`
   - rebuild and source the ROS 2 workspace before relaunching
 - `franka_robot_state_broadcaster` fails with `State interface with key 'fr3/robot_state' does not exist`:
-  - this has been observed in the current setup during controller bring-up
+  - this has been observed in the current setup during controller bringup
   - if `joint_state_broadcaster` and `joint_impedance_controller` still configure successfully, deployment can still proceed
 - `zmq.error.Again: Resource temporarily unavailable` on the robot machine:
   - the bridge did not publish a fresh packet before the ZMQ receive timeout
   - the patched executor now skips that cycle and waits for the next packet
 - robot does not move in dry-run:
-  - expected, because dry-run prints predicted actions and does not command Franka
+  - expected because dry-run prints predicted actions and does not command Franka
 - gripper does not move during execution:
   - gripper commands are enabled by default; if you passed `--disable-gripper`, remove it
 
-## Franka-Specific Note
+## Franka Control Note
 
-Your dataset action representation is delta joint position for the arms, with optional gripper commands. That means the robot-side executor should not directly stream raw policy outputs into the robot without a local control layer.
+The dataset action representation is absolute joint position for the arms, with optional gripper commands.
+That means the robot-side executor can send policy arm outputs to the deployment bridge as joint targets, while still keeping local safety checks and the ROS 2 controller layer in the loop.
 
-The robot-side executor should interpret actions using the same structure as the dataset:
+The executor should interpret actions using the same structure as the dataset:
 
 - 16-dim: `[Left Arm(7), Left Gripper(1), Right Arm(7), Right Gripper(1)]`
 - 14-dim: `[Left Arm(7), Right Arm(7)]`
 
 In practice, the executor should:
 
-- Convert delta joint actions into target velocities or target joint positions
-- Clamp commands to conservative Franka limits
-- Smooth/interpolate commands between network updates
-- Stop safely if server responses are delayed or missing
+- command absolute joint targets through the deployment bridge
+- clamp commands to conservative Franka limits
+- smooth or interpolate commands between network updates
+- stop safely if server responses are delayed or missing

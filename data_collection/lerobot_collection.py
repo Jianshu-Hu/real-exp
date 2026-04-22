@@ -18,6 +18,8 @@ if str(LOCAL_LEROBOT_SRC) not in sys.path:
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+from dataset_stats import ensure_dataset_stats
+
 LEROBOT_INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 SYSTEM_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
@@ -79,9 +81,15 @@ def is_lerobot_dataset_root(root: Path) -> bool:
 
 
 def action_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
-    arm_action_representation = "delta_joint_position"
+    packet_arm_representation = str(packet.get("arm_action_representation", "absolute_joint_position")).strip().lower()
+    if packet_arm_representation != "absolute_joint_position":
+        raise ValueError(
+            f"ROS 2 bridge published arm_action_representation={packet_arm_representation!r}. "
+            "Data collection now requires absolute_joint_position arm actions."
+        )
+    arm_action_representation = "absolute_joint_position"
     gripper_action_representation = str(packet.get("gripper_action_representation", "absolute_width"))
-    arm_action_definition = "q[t+1]-q[t]"
+    arm_action_definition = "q_target[t+1]"
     gripper_action_definition = {
         "absolute_width": "open_width_percent",
         "binary_open_close": "latched_binary_command (0=close, 1=open)",
@@ -110,9 +118,15 @@ def write_action_config(dataset_root: Path, action_config: dict[str, Any]) -> No
     action_config_path.write_text(json.dumps(action_config, indent=2, sort_keys=True) + "\n")
 
 
+def finalize_dataset(dataset: LeRobotDataset, repo_id: str) -> None:
+    dataset.finalize()
+    ensure_dataset_stats(repo_id, Path(dataset.root), force_recompute=True)
+
+
 def assumed_legacy_action_config(packet: dict[str, Any]) -> dict[str, Any]:
     return {
-        "arm_action_representation": "absolute_joint_position",
+        "arm_action_representation": "delta_joint_position",
+        "arm_action_definition": "q[t+1]-q[t]",
         "gripper_action_representation": "absolute_width",
         "gripper_action_definition": "open_width_percent",
         "include_right_arm": bool(packet.get("include_right_arm", True)),
@@ -248,19 +262,19 @@ def compute_recorded_action(
 
     if action_dim == 16:
         recorded_action = np.empty(16, dtype=np.float32)
-        recorded_action[0:7] = next_action[0:7] - current_action[0:7]
+        recorded_action[0:7] = next_action[0:7]
         recorded_action[7] = current_action[7]
-        recorded_action[8:15] = next_action[8:15] - current_action[8:15]
+        recorded_action[8:15] = next_action[8:15]
         recorded_action[15] = current_action[15]
         return recorded_action
 
     if action_dim == 14:
         recorded_action = np.empty(14, dtype=np.float32)
-        recorded_action[0:7] = next_action[0:7] - current_action[0:7]
-        recorded_action[7:14] = next_action[7:14] - current_action[7:14]
+        recorded_action[0:7] = next_action[0:7]
+        recorded_action[7:14] = next_action[7:14]
         return recorded_action
 
-    raise ValueError(f"Unsupported action dimension for recorder transform: {action_dim}")
+    raise ValueError(f"Unsupported action dimension for recorder absolute target transform: {action_dim}")
 
 
 def packet_pair_to_frame(
@@ -400,11 +414,11 @@ def main() -> None:
         else:
             dataset.save_episode()
             episode_count += 1
-            dataset.finalize()
+            finalize_dataset(dataset, args.repo_id)
             print(f"Episode {episode_count} saved to {dataset.root}")
             return
         if dataset is not None:
-            dataset.finalize()
+            finalize_dataset(dataset, args.repo_id)
     finally:
         socket.close(0)
         context.term()

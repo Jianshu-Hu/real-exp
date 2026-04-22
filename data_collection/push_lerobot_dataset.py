@@ -4,6 +4,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from huggingface_hub import HfApi
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
 if str(LOCAL_LEROBOT_SRC) not in sys.path:
@@ -11,7 +13,20 @@ if str(LOCAL_LEROBOT_SRC) not in sys.path:
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+from dataset_stats import ensure_dataset_stats
+
 INFO_PATH = Path("meta/info.json")
+DATASET_ALLOW_PATTERNS = [
+    "README.md",
+    ".gitattributes",
+    "data/**/*.parquet",
+    "meta/**/*.json",
+    "meta/**/*.parquet",
+    "videos/**/*.mp4",
+]
+DATASET_ALLOW_PATTERNS_NO_VIDEOS = [
+    pattern for pattern in DATASET_ALLOW_PATTERNS if not pattern.startswith("videos/")
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,7 +80,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not create the LeRobot codebase-version tag on the Hub repo.",
     )
+    parser.add_argument(
+        "--delete-remote-backups",
+        action="store_true",
+        help="Delete existing *.bak files from the target Hub dataset repo after pushing.",
+    )
     return parser.parse_args()
+
+
+def delete_remote_backup_files(repo_id: str, branch: str | None) -> list[str]:
+    api = HfApi()
+    files = api.list_repo_files(repo_id, repo_type="dataset", revision=branch)
+    backup_files = [path for path in files if path.endswith(".bak")]
+    if not backup_files:
+        return []
+
+    api.delete_files(
+        repo_id=repo_id,
+        delete_patterns=backup_files,
+        repo_type="dataset",
+        revision=branch,
+        commit_message="Remove backup parquet files",
+    )
+    return backup_files
 
 
 def main() -> None:
@@ -76,7 +113,7 @@ def main() -> None:
             f"{dataset_root} does not look like a LeRobot dataset root; missing {(dataset_root / INFO_PATH)}."
         )
 
-    dataset = LeRobotDataset(repo_id=args.repo_id, root=dataset_root)
+    dataset = ensure_dataset_stats(args.repo_id, dataset_root)
     print(f"Loaded dataset from {dataset.root}")
     print(f"Pushing to https://huggingface.co/datasets/{args.repo_id}")
     dataset.push_to_hub(
@@ -86,8 +123,17 @@ def main() -> None:
         tag_version=not args.no_tag_version,
         push_videos=not args.skip_videos,
         private=args.private,
+        allow_patterns=DATASET_ALLOW_PATTERNS_NO_VIDEOS if args.skip_videos else DATASET_ALLOW_PATTERNS,
         upload_large_folder=args.upload_large_folder,
     )
+    if args.delete_remote_backups:
+        deleted_files = delete_remote_backup_files(args.repo_id, args.branch)
+        if deleted_files:
+            print("Deleted remote backup files:")
+            for path in deleted_files:
+                print(f"  {path}")
+        else:
+            print("No remote backup files found.")
     print("Push complete.")
 
 

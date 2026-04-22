@@ -6,6 +6,7 @@
 - `replay_pylibfranka.py`: Replay a recorded LeRobot episode on the real Franka arms using `pylibfranka`, with optional `--dry-run` inspection before motion.
 - `reset_pylibfranka.py`: Reset both Franka arms to the hardcoded initial state copied from `data/pick_and_place_test` episode 0, without reading dataset parquet files at runtime.
 - `delete_lerobot_episode.py`: Remove one or more episodes from a local LeRobot dataset while preserving the remaining metadata, videos, and parquet data.
+- `validate_dataset.py`: Validate a local LeRobot dataset and print dataset-level and per-episode consistency information.
 
 Quick links:
 
@@ -55,25 +56,46 @@ If you open a new shell after building, run `source install/setup.bash` again be
 
 ## Robot Reset And Replay
 
-Use the direct `pylibfranka` reset script when you want to return both robots to the fixed initial pose used for the `pick_and_place_test` setup.
+Use the direct `pylibfranka` reset script when you want to return both robots to a dataset start pose before recording, replay, or deployment.
 
-The reset target is stored as a constant inside `data_collection/reset_pylibfranka.py`:
+By default, the script preserves the legacy hardcoded target stored inside `data_collection/reset_pylibfranka.py`:
 
 - left arm joint positions
 - left gripper width
 - right arm joint positions
 - right gripper width
 
-Preview the target state without moving the robots:
+Preview the legacy target state without moving the robots:
 
 ```bash
 python data_collection/reset_pylibfranka.py --dry-run
 ```
 
-Reset both arms and grippers:
+Reset both arms and grippers to the legacy target:
 
 ```bash
 python data_collection/reset_pylibfranka.py
+```
+
+To reset to the actual initial `observation.state` from a dataset episode, pass `--dataset-root`, `--episode`, and optionally `--frame-index`.
+
+Preview dataset episode 0, frame 0:
+
+```bash
+python data_collection/reset_pylibfranka.py \
+  --dataset-root data/pick_and_place_test \
+  --episode 0 \
+  --frame-index 0 \
+  --dry-run
+```
+
+Reset to that dataset frame:
+
+```bash
+python data_collection/reset_pylibfranka.py \
+  --dataset-root data/pick_and_place_test \
+  --episode 0 \
+  --frame-index 0
 ```
 
 ## Teleoperation Quick Start
@@ -138,7 +160,7 @@ The recording path is split into two pieces:
 The dataset currently records:
 
 - `observation.state`: actual robot joint positions, plus gripper width if enabled
-- `action`: arm state deltas computed as `q[t+1] - q[t]`, plus gripper command if enabled
+- `action`: absolute arm joint targets for the next sample, plus gripper command if enabled
 - `observation.images.cam_left`, `observation.images.cam_front`, `observation.images.cam_right`: RGB video streams
 
 The bridge expects:
@@ -149,7 +171,7 @@ The bridge expects:
 - Gripper commands on a topic like `/left/gripper/gripper_client/target_gripper_width_percent`
 - RGB image topics for three cameras
 
-By default the bridge now publishes the current measured robot joint states (`robot_state`). The recorder converts adjacent arm states into dataset actions using `q[t+1] - q[t]`.
+By default the bridge publishes current measured robot joint states (`robot_state`) as both the observation state and the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
 
 Launch the camera publisher from the ROS 2 workspace:
 
@@ -174,6 +196,43 @@ Then run the LeRobot recorder from the repo root:
 ```bash
 source ~/anaconda3/bin/activate && conda activate lerobot
 python lerobot_collection.py
+```
+
+## Dataset Validation
+
+After recording or editing a dataset, validate that the metadata, parquet data, and videos still agree.
+
+Run the default validation:
+
+```bash
+python3 data_collection/validate_dataset.py \
+  --dataset-root data/pick_and_place_test
+```
+
+Print one row per episode:
+
+```bash
+python3 data_collection/validate_dataset.py \
+  --dataset-root data/pick_and_place_test \
+  --verbose
+```
+
+The validator checks:
+
+- `meta/info.json` totals against actual episode metadata and data rows
+- continuous episode indices and global frame indices
+- per-episode `length` against state/action row counts
+- per-episode `frame_index` and timestamp continuity
+- `observation.state` and `action` dimensions against `info.json`
+- video timestamp ranges against episode lengths
+- physical MP4 frame counts when OpenCV is available
+
+If OpenCV is not available in the active Python environment, either install it or skip physical video checks:
+
+```bash
+python3 data_collection/validate_dataset.py \
+  --dataset-root data/pick_and_place_test \
+  --skip-video-frames
 ```
 
 

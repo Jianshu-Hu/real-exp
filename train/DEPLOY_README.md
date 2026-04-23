@@ -205,7 +205,7 @@ Example:
 
 ```bash
 python train/franka_policy_executor.py \
-  --policy-path /home/serveruser/real-exp/outputs/pick_and_place_test_diffusion/checkpoints/010000/pretrained_model \
+  --policy-path /home/pair/real-exp/outputs/policy-dir \
   --policy-type diffusion \
   --actions-per-chunk 8 \
   --policy-device cuda:0 \

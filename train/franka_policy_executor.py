@@ -9,12 +9,13 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 import torch
 
-from lerobot.async_inference.configs import get_aggregate_function
+# from lerobot.async_inference.configs import get_aggregate_function
 from lerobot.async_inference.helpers import RemotePolicyConfig, TimedAction, TimedObservation
 
 
@@ -73,14 +74,6 @@ def parse_args() -> argparse.Namespace:
             "Default 0.9 was validated to give smooth overlapping ACT chunks."
         ),
     )
-    parser.add_argument(
-        "--aggregate-fn",
-        default="conservative",
-        help=(
-            "Aggregation function for overlapping timesteps. "
-            "Default conservative keeps more weight on the queued plan for smoother Franka motion."
-        ),
-    )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--command-zmq-host", default="127.0.0.1")
     parser.add_argument("--command-zmq-port", type=int, default=5556)
@@ -97,11 +90,25 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional deployment log run name. Defaults to a timestamp plus policy/chunk settings.",
     )
+    parser.add_argument(
+        "--aggregate-ration-old",
+        type=float,
+        default=0.8,
+        help=(
+            "Weight assigned to the queued action when aggregating overlapping timesteps. "
+            "The blended action is old_ratio * old + (1 - old_ratio) * new."
+        ),
+    )
     return parser.parse_args()
 
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
+
+
+def get_aggregate_function(old_ration: float) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Build an aggregate function from the queued-action ratio."""
+    return lambda old, new: old_ration * old + (1.0 - old_ration) * new
 
 
 def infer_policy_type(policy_path: Path) -> str:
@@ -200,7 +207,7 @@ def default_run_name(args: argparse.Namespace) -> str:
     return (
         f"{timestamp}_{policy_name}_{args.policy_type or 'auto'}"
         f"_apc{args.actions_per_chunk or 'auto'}"
-        f"_thr{args.chunk_size_threshold:g}_{args.aggregate_fn}"
+        f"_thr{args.chunk_size_threshold:g}_{args.aggregate_ration_old}"
     )
 
 
@@ -236,8 +243,12 @@ class FrankaPolicyExecutor:
 
         if not 0.0 <= args.chunk_size_threshold <= 1.0:
             raise ValueError(f"--chunk-size-threshold must be between 0 and 1, got {args.chunk_size_threshold}")
+        if not 0.0 <= args.aggregate_ration_old <= 1.0:
+            raise ValueError(
+                f"--aggregate-ration-old must be between 0 and 1, got {args.aggregate_ration_old}"
+            )
 
-        self.aggregate_fn = get_aggregate_function(args.aggregate_fn)
+        self.aggregate_fn = get_aggregate_function(args.aggregate_ration_old)
         self.dataset_info = load_json(self.dataset_root / INFO_REL_PATH)
         action_config_path = self.dataset_root / ACTION_CONFIG_REL_PATH
         if not action_config_path.exists():
@@ -348,7 +359,7 @@ class FrankaPolicyExecutor:
             "camera_names": list(first_packet["camera_names"]),
             "actions_per_chunk": self.actions_per_chunk,
             "chunk_size_threshold": self.args.chunk_size_threshold,
-            "aggregate_fn": self.args.aggregate_fn,
+            "aggregate_ration_old": self.args.aggregate_ration_old,
             "fps": self.args.fps,
             "task": self.args.task,
             "execute": self.args.execute,
@@ -745,7 +756,7 @@ class FrankaPolicyExecutor:
         print(f"dataset_action_dim: {dataset_action_dim}")
         print(f"actions_per_chunk: {self.actions_per_chunk}")
         print(f"chunk_size_threshold: {self.args.chunk_size_threshold}")
-        print(f"aggregate_fn: {self.args.aggregate_fn}")
+        print(f"aggregate_ration_old: {self.args.aggregate_ration_old}")
         print(f"execute: {self.args.execute}")
 
         context = zmq.Context()
@@ -825,7 +836,9 @@ class FrankaPolicyExecutor:
                             {
                                 "timestep": action.get_timestep(),
                                 "left_arm": np.round(np.asarray(split_action(action.get_action())["left_arm"]), 4).tolist(),
+                                "left_gripper": np.round(np.asarray(split_action(action.get_action())["left_gripper"]), 4).tolist(),
                                 "right_arm": np.round(np.asarray(split_action(action.get_action())["right_arm"]), 4).tolist(),
+                                "right_gripper": np.round(np.asarray(split_action(action.get_action())["right_gripper"]), 4).tolist(),
                             },
                         )
                     self._log_action_executed(

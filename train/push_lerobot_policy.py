@@ -30,8 +30,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--branch",
-        default=None,
-        help="Optional Hub branch to push to.",
+        default="main",
+        help="Hub branch to push to. Defaults to 'main'.",
     )
     parser.add_argument(
         "--private",

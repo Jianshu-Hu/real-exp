@@ -685,31 +685,41 @@ class FrankaPolicyExecutor:
     def _aggregate_action_queue(self, incoming_actions: list[TimedAction]) -> dict[str, Any]:
         with self.action_queue_lock:
             current_queue = {action.get_timestep(): action for action in self.action_queue}
+            latest_executed_timestep = self.latest_executed_timestep
 
-        added = 0
-        blended = 0
-        dropped = 0
-        for new_action in incoming_actions:
-            timestep = new_action.get_timestep()
-            if timestep <= self.latest_executed_timestep:
-                dropped += 1
-                continue
+            added = 0
+            blended = 0
+            dropped = 0
+            for new_action in incoming_actions:
+                timestep = new_action.get_timestep()
+                if timestep <= latest_executed_timestep:
+                    dropped += 1
+                    continue
 
-            if timestep not in current_queue:
+                if timestep not in current_queue:
+                    current_queue[timestep] = new_action
+                    added += 1
+                    continue
+
+                old_action = current_queue[timestep]
+                old_tensor = torch.as_tensor(np.asarray(old_action.get_action(), dtype=np.float32))
+                new_tensor = torch.as_tensor(np.asarray(new_action.get_action(), dtype=np.float32))
+                blended_tensor = self.aggregate_fn(old_tensor, new_tensor)
+                new_action.action = blended_tensor.detach().cpu().numpy()
                 current_queue[timestep] = new_action
-                added += 1
-                continue
+                blended += 1
 
-            old_action = current_queue[timestep]
-            old_tensor = torch.as_tensor(np.asarray(old_action.get_action(), dtype=np.float32))
-            new_tensor = torch.as_tensor(np.asarray(new_action.get_action(), dtype=np.float32))
-            blended_tensor = self.aggregate_fn(old_tensor, new_tensor)
-            new_action.action = blended_tensor.detach().cpu().numpy()
-            current_queue[timestep] = new_action
-            blended += 1
+            # Drop any stale timesteps again while still holding the queue lock, so an action
+            # executed concurrently with chunk reception cannot be reinserted into the queue.
+            stale_timesteps = [timestep for timestep in current_queue if timestep <= self.latest_executed_timestep]
+            if stale_timesteps:
+                dropped += len(stale_timesteps)
+                for timestep in stale_timesteps:
+                    current_queue.pop(timestep, None)
 
-        ordered_timesteps = sorted(current_queue)
-        with self.action_queue_lock:
+            ordered_timesteps = sorted(current_queue)
+            if len(ordered_timesteps) != len(set(ordered_timesteps)):
+                print(f"[WARN] duplicate timesteps remained in action queue: {ordered_timesteps}")
             self.action_queue = deque(current_queue[timestep] for timestep in ordered_timesteps)
 
         return {
@@ -839,8 +849,8 @@ class FrankaPolicyExecutor:
             if not self.action_queue:
                 return None, queue_before, queue_before
             action = self.action_queue.popleft()
+            self.latest_executed_timestep = action.get_timestep()
             queue_after = self._queue_snapshot_unlocked()
-        self.latest_executed_timestep = action.get_timestep()
         return action, queue_before, queue_after
 
     def _queue_snapshot_unlocked(self) -> dict[str, Any]:

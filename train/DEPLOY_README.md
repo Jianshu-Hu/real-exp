@@ -198,16 +198,23 @@ python train/franka_policy_executor.py \
 If you want to control how overlapping action chunks are blended, add:
 
 ```bash
---aggregate-ration-old 0.8
+--act-aggregate-ratio-old 0.8
 ```
 
-This flag sets the weight of the already-queued action when the executor receives a new action for the same timestep:
+This ACT-specific flag sets the weight of the already-queued action when the executor receives a new action for the same timestep:
 
 - blended action = `old_ratio * old + (1 - old_ratio) * new`
 - valid range is `0.0` to `1.0`
 - `0.0` means fully replace the queued action with the new action
 - `1.0` means keep the queued action and ignore the new action at overlapping timesteps
 - the default is `0.8`
+
+For diffusion deployment, use the diffusion-specific knobs instead:
+
+```bash
+--diffusion-chunk-size-threshold 0.25
+--diffusion-aggregate-ratio-old 0.0
+```
 
 If the checkpoint exists only on the policy server machine and not on the robot computer, pass:
 
@@ -228,7 +235,8 @@ python train/franka_policy_executor.py \
   --zmq-port 5555 \
   --fps 15 \
   --task "pick and place" \
-  --aggregate-ration-old 0.8
+  --diffusion-chunk-size-threshold 0.25 \
+  --diffusion-aggregate-ratio-old 0.0
 ```
 
 ### 7. Validate dry-run before moving the robot
@@ -265,7 +273,7 @@ python train/franka_policy_executor.py \
   --command-zmq-port 5556 \
   --fps 15 \
   --task "pick and place" \
-  --aggregate-ration-old 0.8 \
+  --act-aggregate-ratio-old 0.8 \
   --execute
 ```
 
@@ -310,7 +318,9 @@ Useful executor options:
 - `--actions-per-chunk` to override the chunk length requested from the server
 - `--policy-type` if automatic inference from `config.json` is not what you want
 - `--policy-device` to tell the remote policy server which device to use
-- `--aggregate-ration-old` to set the queued-action weight for overlapping timesteps
+- `--act-chunk-size-threshold` and `--act-aggregate-ratio-old` to tune overlapping ACT chunks
+- `--diffusion-chunk-size-threshold` and `--diffusion-aggregate-ratio-old` to tune overlapping diffusion chunks
+- `--diffusion-noise-scheduler-type` and `--diffusion-num-inference-steps` on the server to override diffusion denoising at load time
 - `--command-zmq-host` and `--command-zmq-port` to match the bridge command socket
 - `--bridge-activation-service` to override the ROS 2 `SetBool` service used for bridge activation
 - `--no-auto-activate-bridge` to keep bridge activation manual

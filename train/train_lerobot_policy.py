@@ -35,6 +35,7 @@ from lerobot.utils.train_utils import (
     save_checkpoint,
     update_last_checkpoint,
 )
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.utils import init_logging
 
 from dataset_stats import ensure_dataset_stats
@@ -170,6 +171,18 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Number of observation steps for diffusion policy.",
     )
+    parser.add_argument(
+        "--diffusion-noise-scheduler-type",
+        choices=("DDPM", "DDIM"),
+        default="DDIM",
+        help="Noise scheduler used by the diffusion policy config.",
+    )
+    parser.add_argument(
+        "--diffusion-num-inference-steps",
+        type=int,
+        default=20,
+        help="Reverse diffusion steps recorded in the diffusion policy config.",
+    )
     return parser.parse_args()
 
 
@@ -210,6 +223,8 @@ def build_policy_config(args: argparse.Namespace):
             horizon=args.diffusion_horizon,
             n_obs_steps=args.diffusion_n_obs_steps,
             n_action_steps=max_action_steps,
+            noise_scheduler_type=args.diffusion_noise_scheduler_type,
+            num_inference_steps=args.diffusion_num_inference_steps,
             **common_kwargs,
         )
 
@@ -315,9 +330,48 @@ def evaluate_validation_loss(
     accelerator: Accelerator,
     max_batches: int | None,
 ) -> float:
+    def _predict_deployment_actions(
+        unwrapped_policy: PreTrainedPolicy,
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if unwrapped_policy.name == "act":
+            inference_batch = {OBS_STATE: batch[OBS_STATE]}
+            for key in unwrapped_policy.config.image_features:
+                inference_batch[key] = batch[key]
+            if unwrapped_policy.config.env_state_feature:
+                inference_batch[OBS_ENV_STATE] = batch[OBS_ENV_STATE]
+
+            predicted_actions = unwrapped_policy.predict_action_chunk(inference_batch)
+            target_actions = batch[ACTION][:, : predicted_actions.shape[1]]
+            target_is_pad = batch["action_is_pad"][:, : predicted_actions.shape[1]]
+            valid_mask = target_is_pad.logical_not().unsqueeze(-1).expand_as(predicted_actions)
+            return predicted_actions, target_actions, valid_mask
+
+        if unwrapped_policy.name == "diffusion":
+            inference_batch = {OBS_STATE: batch[OBS_STATE]}
+            if unwrapped_policy.config.image_features:
+                inference_batch[OBS_IMAGES] = torch.stack(
+                    [batch[key] for key in unwrapped_policy.config.image_features],
+                    dim=2,
+                )
+            if unwrapped_policy.config.env_state_feature:
+                inference_batch[OBS_ENV_STATE] = batch[OBS_ENV_STATE]
+
+            predicted_actions = unwrapped_policy.diffusion.generate_actions(inference_batch)
+            start = unwrapped_policy.config.n_obs_steps - 1
+            end = start + predicted_actions.shape[1]
+            target_actions = batch[ACTION][:, start:end]
+            target_is_pad = batch["action_is_pad"][:, start:end]
+            valid_mask = target_is_pad.logical_not().unsqueeze(-1).expand_as(predicted_actions)
+            return predicted_actions, target_actions, valid_mask
+
+        raise ValueError(f"Unsupported policy type for validation inference: {unwrapped_policy.name}")
+
     was_training = policy.training
-    policy.train()
-    losses: list[float] = []
+    policy.eval()
+    total_abs_error = torch.zeros(1, device=accelerator.device, dtype=torch.float64)
+    total_valid = torch.zeros(1, device=accelerator.device, dtype=torch.float64)
+    unwrapped_policy = accelerator.unwrap_model(policy)
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
@@ -325,15 +379,23 @@ def evaluate_validation_loss(
                 break
             batch = preprocessor(batch)
             with accelerator.autocast():
-                loss, _ = policy.forward(batch)
-            reduced_loss = accelerator.gather_for_metrics(loss.detach().reshape(1))
-            losses.extend(float(value.item()) for value in reduced_loss)
+                predicted_actions, target_actions, valid_mask = _predict_deployment_actions(
+                    unwrapped_policy, batch
+                )
+                abs_error = (predicted_actions - target_actions).abs() * valid_mask
+                batch_abs_error = abs_error.sum(dtype=torch.float64).reshape(1)
+                batch_valid = valid_mask.sum(dtype=torch.float64).reshape(1)
 
-    if not was_training:
-        policy.eval()
-    if not losses:
+            reduced_abs_error = accelerator.gather_for_metrics(batch_abs_error)
+            reduced_valid = accelerator.gather_for_metrics(batch_valid)
+            total_abs_error += reduced_abs_error.sum()
+            total_valid += reduced_valid.sum()
+
+    if was_training:
+        policy.train()
+    if total_valid.item() == 0:
         raise ValueError("Validation dataloader produced no batches.")
-    return sum(losses) / len(losses)
+    return (total_abs_error / total_valid).item()
 
 
 def main() -> None:

@@ -74,12 +74,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--task", default="pick and place")
     parser.add_argument(
-        "--chunk-size-threshold",
+        "--act-chunk-size-threshold",
         type=float,
         default=0.9,
         help=(
             "Send a new observation when queue_size / actions_per_chunk is at or below this value. "
             "Default 0.9 was validated to give smooth overlapping ACT chunks."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-chunk-size-threshold",
+        type=float,
+        default=0.5,
+        help=(
+            "Send a new observation when queue_size / actions_per_chunk is at or below this value "
+            "for diffusion deployment."
         ),
     )
     parser.add_argument("--execute", action="store_true")
@@ -99,11 +108,20 @@ def parse_args() -> argparse.Namespace:
         help="Optional deployment log run name. Defaults to a timestamp plus policy/chunk settings.",
     )
     parser.add_argument(
-        "--aggregate-ration-old",
+        "--act-aggregate-ratio-old",
         type=float,
         default=0.8,
         help=(
-            "Weight assigned to the queued action when aggregating overlapping timesteps. "
+            "ACT-only weight assigned to the queued action when aggregating overlapping timesteps. "
+            "The blended action is old_ratio * old + (1 - old_ratio) * new."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-aggregate-ratio-old",
+        type=float,
+        default=0.5,
+        help=(
+            "Diffusion-only weight assigned to the queued action when aggregating overlapping timesteps. "
             "The blended action is old_ratio * old + (1 - old_ratio) * new."
         ),
     )
@@ -212,10 +230,16 @@ def json_safe(value: Any) -> Any:
 def default_run_name(args: argparse.Namespace) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     policy_name = args.policy_path.expanduser().name
+    if args.policy_type == "diffusion":
+        threshold = args.diffusion_chunk_size_threshold
+        aggregate_ratio = args.diffusion_aggregate_ratio_old
+    else:
+        threshold = args.act_chunk_size_threshold
+        aggregate_ratio = args.act_aggregate_ratio_old
     return (
         f"{timestamp}_{policy_name}_{args.policy_type or 'auto'}"
         f"_apc{args.actions_per_chunk or 'auto'}"
-        f"_thr{args.chunk_size_threshold:g}_{args.aggregate_ration_old}"
+        f"_thr{threshold:g}_{aggregate_ratio}"
     )
 
 
@@ -265,14 +289,33 @@ class FrankaPolicyExecutor:
                     f"chunk size ({max_actions_per_chunk})."
                 )
 
-        if not 0.0 <= args.chunk_size_threshold <= 1.0:
-            raise ValueError(f"--chunk-size-threshold must be between 0 and 1, got {args.chunk_size_threshold}")
-        if not 0.0 <= args.aggregate_ration_old <= 1.0:
+        if not 0.0 <= args.act_chunk_size_threshold <= 1.0:
             raise ValueError(
-                f"--aggregate-ration-old must be between 0 and 1, got {args.aggregate_ration_old}"
+                f"--act-chunk-size-threshold must be between 0 and 1, got {args.act_chunk_size_threshold}"
+            )
+        if not 0.0 <= args.diffusion_chunk_size_threshold <= 1.0:
+            raise ValueError(
+                "--diffusion-chunk-size-threshold must be between 0 and 1, "
+                f"got {args.diffusion_chunk_size_threshold}"
+            )
+        if not 0.0 <= args.act_aggregate_ratio_old <= 1.0:
+            raise ValueError(
+                f"--act-aggregate-ratio-old must be between 0 and 1, got {args.act_aggregate_ratio_old}"
+            )
+        if not 0.0 <= args.diffusion_aggregate_ratio_old <= 1.0:
+            raise ValueError(
+                "--diffusion-aggregate-ratio-old must be between 0 and 1, "
+                f"got {args.diffusion_aggregate_ratio_old}"
             )
 
-        self.aggregate_fn = get_aggregate_function(args.aggregate_ration_old)
+        if self.policy_type == "diffusion":
+            self.chunk_size_threshold = args.diffusion_chunk_size_threshold
+            self.aggregate_ratio_old = args.diffusion_aggregate_ratio_old
+        else:
+            self.chunk_size_threshold = args.act_chunk_size_threshold
+            self.aggregate_ratio_old = args.act_aggregate_ratio_old
+
+        self.aggregate_fn = get_aggregate_function(self.aggregate_ratio_old)
         self.dataset_info = load_json(self.dataset_root / INFO_REL_PATH)
         action_config_path = self.dataset_root / ACTION_CONFIG_REL_PATH
         if not action_config_path.exists():
@@ -312,6 +355,7 @@ class FrankaPolicyExecutor:
         self.log_path: Path | None = None
         self.log_started_monotonic = time.perf_counter()
         self.inflight_observation_sent_monotonic: float | None = None
+        self.latest_streamed_observation_timestep = -1
 
     def _arm_action_representation(self) -> str:
         return str(
@@ -345,6 +389,11 @@ class FrankaPolicyExecutor:
                 return self.action_queue[0].get_timestep(), queue_snapshot
 
         return max(self.latest_executed_timestep + 1, 0), queue_snapshot
+
+    def _next_action_anchor_timestep_unlocked(self) -> int:
+        if self.action_queue:
+            return self.action_queue[0].get_timestep()
+        return max(self.latest_executed_timestep + 1, 0)
 
     def _mark_observation_inflight(self, timestep: int) -> None:
         with self.inflight_observation_lock:
@@ -382,8 +431,12 @@ class FrankaPolicyExecutor:
             "live_action_dim": int(first_packet["action_dim"]),
             "camera_names": list(first_packet["camera_names"]),
             "actions_per_chunk": self.actions_per_chunk,
-            "chunk_size_threshold": self.args.chunk_size_threshold,
-            "aggregate_ration_old": self.args.aggregate_ration_old,
+            "chunk_size_threshold": self.chunk_size_threshold,
+            "aggregate_ratio_old": self.aggregate_ratio_old,
+            "act_chunk_size_threshold": self.args.act_chunk_size_threshold,
+            "diffusion_chunk_size_threshold": self.args.diffusion_chunk_size_threshold,
+            "act_aggregate_ratio_old": self.args.act_aggregate_ratio_old,
+            "diffusion_aggregate_ratio_old": self.args.diffusion_aggregate_ratio_old,
             "fps": self.args.fps,
             "task": self.args.task,
             "execute": self.args.execute,
@@ -593,12 +646,41 @@ class FrankaPolicyExecutor:
         self.stub.SendObservations(request_iterator)
 
     def _ready_to_send_observation(self) -> bool:
+        if self.policy_type == "diffusion":
+            return True
+
         if self._get_inflight_observation_timestep() is not None:
             return False
 
         with self.action_queue_lock:
             queue_fraction = len(self.action_queue) / float(max(self.action_chunk_size, 1))
-        return queue_fraction <= self.args.chunk_size_threshold
+        return queue_fraction <= self.chunk_size_threshold
+
+    def _make_stream_observation_timestep(self) -> int:
+        self.latest_streamed_observation_timestep = max(
+            self.latest_streamed_observation_timestep + 1,
+            self.latest_executed_timestep + 1,
+        )
+        return self.latest_streamed_observation_timestep
+
+    def _prepare_diffusion_observation_send(self) -> tuple[int, dict[str, Any], bool]:
+        stream_timestep = self._make_stream_observation_timestep()
+        with self.inflight_observation_lock:
+            with self.action_queue_lock:
+                queue_snapshot = self._queue_snapshot_unlocked()
+                queue_fraction = len(self.action_queue) / float(max(self.action_chunk_size, 1))
+                must_go = (
+                    queue_fraction <= self.chunk_size_threshold
+                    and self.inflight_observation_timestep is None
+                )
+                observation_timestep = stream_timestep
+                if must_go:
+                    # Diffusion history is updated continuously, but the generated chunk must still be
+                    # anchored to the next action-execution timestep rather than the observation-stream index.
+                    observation_timestep = self._next_action_anchor_timestep_unlocked()
+                    self.inflight_observation_timestep = observation_timestep
+                    self.inflight_observation_sent_monotonic = time.perf_counter()
+        return observation_timestep, queue_snapshot, must_go
 
     def _aggregate_action_queue(self, incoming_actions: list[TimedAction]) -> dict[str, Any]:
         with self.action_queue_lock:
@@ -779,8 +861,8 @@ class FrankaPolicyExecutor:
         print(f"server_address: {self.args.server_address}")
         print(f"dataset_action_dim: {dataset_action_dim}")
         print(f"actions_per_chunk: {self.actions_per_chunk}")
-        print(f"chunk_size_threshold: {self.args.chunk_size_threshold}")
-        print(f"aggregate_ration_old: {self.args.aggregate_ration_old}")
+        print(f"chunk_size_threshold: {self.chunk_size_threshold}")
+        print(f"aggregate_ratio_old: {self.aggregate_ratio_old}")
         print(f"execute: {self.args.execute}")
 
         context = zmq.Context()
@@ -825,13 +907,20 @@ class FrankaPolicyExecutor:
                     continue
 
                 if self._ready_to_send_observation():
-                    observation_timestep, queue_snapshot = self._next_observation_timestep()
-                    self._mark_observation_inflight(observation_timestep)
+                    if self.policy_type == "diffusion":
+                        observation_timestep, queue_snapshot, must_go = (
+                            self._prepare_diffusion_observation_send()
+                        )
+                    else:
+                        observation_timestep, queue_snapshot = self._next_observation_timestep()
+                        must_go = True
+                    if must_go and self.policy_type != "diffusion":
+                        self._mark_observation_inflight(observation_timestep)
                     observation = TimedObservation(
                         timestamp=time.time(),
                         observation=packet_to_raw_observation(current_packet, self.args.task),
                         timestep=observation_timestep,
-                        must_go=True,
+                        must_go=must_go,
                     )
                     try:
                         self.send_observation(observation)

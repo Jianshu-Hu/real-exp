@@ -8,6 +8,7 @@ import pickle  # nosec
 import time
 import traceback
 from concurrent import futures
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 from pprint import pformat
@@ -17,6 +18,9 @@ from typing import Any
 import torch
 
 from image_preprocessing import ResizePadSquare, infer_square_resize_pad_size_from_policy_features
+from lerobot.policies.utils import populate_queues
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.transport.utils import receive_bytes_in_chunks
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -67,6 +71,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=2.0,
         help="Observation queue timeout in seconds.",
+    )
+    serve_parser.add_argument(
+        "--diffusion-noise-scheduler-type",
+        choices=("DDPM", "DDIM"),
+        default="DDIM",
+        help="Override the diffusion scheduler when loading a diffusion policy on the server.",
+    )
+    serve_parser.add_argument(
+        "--diffusion-num-inference-steps",
+        type=int,
+        default=20,
+        help="Override the diffusion denoising steps when loading a diffusion policy on the server.",
     )
 
     return parser.parse_args()
@@ -163,7 +179,7 @@ def raw_observation_to_observation_with_resize_pad(
     return observation
 
 
-def make_deployment_policy_server():
+def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = None):
     from lerobot.async_inference.constants import SUPPORTED_POLICIES
     from lerobot.async_inference.helpers import Observation, RemotePolicyConfig
     from lerobot.async_inference.policy_server import PolicyServer
@@ -202,11 +218,15 @@ def make_deployment_policy_server():
             self.actions_per_chunk = policy_specs.actions_per_chunk
 
             policy_class = get_policy_class(self.policy_type)
+            cli_overrides = [f"--device={self.device}"]
+            if self.policy_type == "diffusion" and diffusion_cli_overrides:
+                cli_overrides.extend(diffusion_cli_overrides)
+                self.logger.info(f"Applying diffusion CLI overrides: {diffusion_cli_overrides}")
 
             start = time.perf_counter()
             self.policy = policy_class.from_pretrained(
                 policy_specs.pretrained_name_or_path,
-                cli_overrides=[f"--device={self.device}"],
+                cli_overrides=cli_overrides,
             )
             self.policy.to(self.device)
             max_actions_per_chunk = infer_actions_per_chunk(self.policy_type, asdict(self.policy.config))
@@ -239,9 +259,20 @@ def make_deployment_policy_server():
             else:
                 self.logger.info("Using upstream direct resize during inference image preparation")
 
+            if self.policy_type == "diffusion":
+                self._diffusion_history = {
+                    OBS_STATE: deque(maxlen=self.policy.config.n_obs_steps),
+                }
+                if self.policy.config.image_features:
+                    self._diffusion_history[OBS_IMAGES] = deque(maxlen=self.policy.config.n_obs_steps)
+                if self.policy.config.env_state_feature:
+                    self._diffusion_history[OBS_ENV_STATE] = deque(maxlen=self.policy.config.n_obs_steps)
+            else:
+                self._diffusion_history = None
+
             return services_pb2.Empty()
 
-        def _predict_action_chunk(self, observation_t) -> list[Any]:
+        def _prepare_policy_observation(self, observation_t) -> Observation:
             start_prepare = time.perf_counter()
             observation: Observation = raw_observation_to_observation_with_resize_pad(
                 observation_t.get_observation(),
@@ -254,6 +285,42 @@ def make_deployment_policy_server():
             start_preprocess = time.perf_counter()
             observation = self.preprocessor(observation)
             self.last_processed_obs = observation_t
+            return observation, start_prepare, prepare_time, start_preprocess
+
+        def _update_diffusion_history(self, observation: dict[str, torch.Tensor]) -> None:
+            if self.policy_type != "diffusion" or self._diffusion_history is None:
+                return
+
+            history_input = {OBS_STATE: observation[OBS_STATE]}
+            if self.policy.config.image_features:
+                history_input[OBS_IMAGES] = torch.stack(
+                    [observation[key] for key in self.policy.config.image_features],
+                    dim=-4,
+                )
+            if self.policy.config.env_state_feature and OBS_ENV_STATE in observation:
+                history_input[OBS_ENV_STATE] = observation[OBS_ENV_STATE]
+
+            self._diffusion_history = populate_queues(self._diffusion_history, history_input)
+
+        def _build_diffusion_history_batch(self) -> dict[str, torch.Tensor]:
+            if self._diffusion_history is None:
+                raise RuntimeError("Diffusion history is not initialized.")
+
+            history_batch: dict[str, torch.Tensor] = {}
+            for key, queue in self._diffusion_history.items():
+                if not queue:
+                    raise RuntimeError(
+                        f"Diffusion deployment could not build history for '{key}'. "
+                        "No observations have been buffered yet."
+                    )
+                history_batch[key] = torch.stack(list(queue), dim=1)
+
+            return history_batch
+
+        def _predict_action_chunk(self, observation_t) -> list[Any]:
+            observation, start_prepare, prepare_time, start_preprocess = self._prepare_policy_observation(
+                observation_t
+            )
             preprocessing_time = time.perf_counter() - start_preprocess
 
             start_inference = time.perf_counter()
@@ -295,6 +362,71 @@ def make_deployment_policy_server():
             )
 
             return action_chunk
+
+        def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
+            if self.policy_type == "diffusion":
+                history_batch = self._build_diffusion_history_batch()
+                chunk = self.policy.diffusion.generate_actions(history_batch)
+                if chunk.ndim != 3:
+                    chunk = chunk.unsqueeze(0)
+                return chunk[:, : self.actions_per_chunk, :]
+
+            return super()._get_action_chunk(observation)
+
+        def SendObservations(self, request_iterator, context):  # noqa: N802
+            client_id = context.peer()
+            self.logger.debug(f"Receiving observations from {client_id}")
+
+            receive_time = time.time()
+            start_deserialize = time.perf_counter()
+            received_bytes = receive_bytes_in_chunks(
+                request_iterator, None, self.shutdown_event, self.logger
+            )
+            timed_observation = pickle.loads(received_bytes)  # nosec
+            deserialize_time = time.perf_counter() - start_deserialize
+
+            self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
+
+            obs_timestep = timed_observation.get_timestep()
+            obs_timestamp = timed_observation.get_timestamp()
+            fps_metrics = self.fps_tracker.calculate_fps_metrics(obs_timestamp)
+
+            self.logger.debug(
+                f"Received observation #{obs_timestep} | "
+                f"Avg FPS: {fps_metrics['avg_fps']:.2f} | "
+                f"Target: {fps_metrics['target_fps']:.2f} | "
+                f"One-way latency: {(receive_time - obs_timestamp) * 1000:.2f}ms"
+            )
+            self.logger.debug(
+                f"Server timestamp: {receive_time:.6f} | "
+                f"Client timestamp: {obs_timestamp:.6f} | "
+                f"Deserialization time: {deserialize_time:.6f}s"
+            )
+
+            if self.policy_type == "diffusion" and self.preprocessor is not None:
+                try:
+                    observation, _, _, _ = self._prepare_policy_observation(timed_observation)
+                    self._update_diffusion_history(observation)
+                except Exception as exc:
+                    self.logger.error(f"Error updating diffusion history from observation stream: {exc}")
+                    self.logger.error(traceback.format_exc())
+
+                # For diffusion, every observation updates history, but only `must_go` observations
+                # should trigger a fresh chunk request.
+                if timed_observation.must_go:
+                    if not self._enqueue_observation(timed_observation):
+                        self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
+                else:
+                    self.logger.debug(
+                        f"Buffered diffusion observation #{obs_timestep} for history only "
+                        "(must_go: False)"
+                    )
+                return services_pb2.Empty()
+
+            if not self._enqueue_observation(timed_observation):
+                self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
+
+            return services_pb2.Empty()
 
         def GetActions(self, request, context):  # noqa: N802
             try:
@@ -345,12 +477,12 @@ def make_deployment_policy_server():
     return DeploymentPolicyServer
 
 
-def serve_deployment_policy_server(cfg) -> None:
+def serve_deployment_policy_server(cfg, diffusion_cli_overrides: list[str] | None = None) -> None:
     import grpc
 
     from lerobot.transport import services_pb2_grpc
 
-    DeploymentPolicyServer = make_deployment_policy_server()
+    DeploymentPolicyServer = make_deployment_policy_server(diffusion_cli_overrides)
 
     logging.info(pformat(asdict(cfg)))
 
@@ -466,7 +598,11 @@ def run_server(args: argparse.Namespace) -> None:
         inference_latency=inference_latency,
         obs_queue_timeout=args.obs_queue_timeout,
     )
-    serve_deployment_policy_server(cfg)
+    diffusion_cli_overrides = [
+        f"--noise_scheduler_type={args.diffusion_noise_scheduler_type}",
+        f"--num_inference_steps={args.diffusion_num_inference_steps}",
+    ]
+    serve_deployment_policy_server(cfg, diffusion_cli_overrides=diffusion_cli_overrides)
 
 
 def main() -> None:

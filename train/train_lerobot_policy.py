@@ -170,13 +170,6 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Number of observation steps for diffusion policy.",
     )
-    parser.add_argument(
-        "--diffusion-n-action-steps",
-        type=int,
-        default=8,
-        help="Number of action steps executed per diffusion rollout.",
-    )
-
     return parser.parse_args()
 
 
@@ -206,11 +199,17 @@ def build_policy_config(args: argparse.Namespace):
         )
 
     if args.policy_type == "diffusion":
+        max_action_steps = args.diffusion_horizon - args.diffusion_n_obs_steps + 1
+        if max_action_steps <= 0:
+            raise ValueError(
+                "--diffusion-horizon must be greater than or equal to --diffusion-n-obs-steps. "
+                f"Got horizon={args.diffusion_horizon}, n_obs_steps={args.diffusion_n_obs_steps}."
+            )
         return make_policy_config(
             "diffusion",
             horizon=args.diffusion_horizon,
             n_obs_steps=args.diffusion_n_obs_steps,
-            n_action_steps=args.diffusion_n_action_steps,
+            n_action_steps=max_action_steps,
             **common_kwargs,
         )
 

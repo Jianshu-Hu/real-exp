@@ -60,7 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-address", default="127.0.0.1:8080")
     parser.add_argument("--policy-device", default="cuda")
     parser.add_argument("--policy-type", default=None)
-    parser.add_argument("--actions-per-chunk", type=int, default=None)
+    parser.add_argument(
+        "--actions-per-chunk",
+        type=int,
+        default=None,
+        help=(
+            "Number of actions to request per deployment chunk. Required for diffusion policies; "
+            "defaults to the checkpoint chunk size for other policy types."
+        ),
+    )
     parser.add_argument("--zmq-host", default="127.0.0.1")
     parser.add_argument("--zmq-port", type=int, default=5555)
     parser.add_argument("--fps", type=int, default=15)
@@ -232,14 +240,30 @@ class FrankaPolicyExecutor:
             )
 
         if args.actions_per_chunk is not None:
+            if args.actions_per_chunk <= 0:
+                raise ValueError(f"--actions-per-chunk must be positive, got {args.actions_per_chunk}")
             self.actions_per_chunk = args.actions_per_chunk
         elif local_policy_config is not None:
+            if self.policy_type == "diffusion":
+                raise ValueError(
+                    "--actions-per-chunk is required for diffusion deployment. "
+                    "Training stores the maximum exportable diffusion chunk; deployment chooses how many "
+                    "actions to execute per chunk."
+                )
             self.actions_per_chunk = infer_actions_per_chunk(self.policy_path, self.policy_type)
         else:
             raise FileNotFoundError(
                 "Could not find a local policy config.json for --policy-path. "
                 "Pass --actions-per-chunk explicitly when the checkpoint only exists on the server."
             )
+
+        if args.actions_per_chunk is not None and local_policy_config is not None:
+            max_actions_per_chunk = infer_actions_per_chunk(self.policy_path, self.policy_type)
+            if self.actions_per_chunk > max_actions_per_chunk:
+                raise ValueError(
+                    f"--actions-per-chunk ({self.actions_per_chunk}) cannot exceed the policy maximum "
+                    f"chunk size ({max_actions_per_chunk})."
+                )
 
         if not 0.0 <= args.chunk_size_threshold <= 1.0:
             raise ValueError(f"--chunk-size-threshold must be between 0 and 1, got {args.chunk_size_threshold}")

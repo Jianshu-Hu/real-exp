@@ -209,6 +209,12 @@ def make_deployment_policy_server():
                 cli_overrides=[f"--device={self.device}"],
             )
             self.policy.to(self.device)
+            max_actions_per_chunk = infer_actions_per_chunk(self.policy_type, asdict(self.policy.config))
+            if self.actions_per_chunk > max_actions_per_chunk:
+                raise ValueError(
+                    f"actions_per_chunk ({self.actions_per_chunk}) cannot exceed the policy maximum "
+                    f"chunk size ({max_actions_per_chunk})."
+                )
 
             device_override = {"device": self.device}
             self.preprocessor, self.postprocessor = make_pre_post_processors(
@@ -384,7 +390,7 @@ def inspect_policy(policy_path: Path, dataset_root: Path) -> None:
     action_cfg = load_json(action_config_path) if action_config_path.exists() else None
 
     policy_type = infer_policy_type(policy_cfg)
-    actions_per_chunk = infer_actions_per_chunk(policy_type, policy_cfg)
+    max_actions_per_chunk = infer_actions_per_chunk(policy_type, policy_cfg)
     image_keys = [
         key
         for key, spec in dataset_info["features"].items()
@@ -400,7 +406,7 @@ def inspect_policy(policy_path: Path, dataset_root: Path) -> None:
     print("---------------------")
     print(f"policy_path: {policy_path}")
     print(f"policy_type: {policy_type}")
-    print(f"recommended_actions_per_chunk: {actions_per_chunk}")
+    print(f"max_actions_per_chunk: {max_actions_per_chunk}")
     print(f"dataset_root: {dataset_root}")
     print(f"dataset_fps: {dataset_info['fps']}")
     print(f"dataset_total_episodes: {dataset_info['total_episodes']}")

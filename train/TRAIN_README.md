@@ -66,7 +66,7 @@ python train/train_lerobot_policy.py \
   --diffusion-horizon 16 \
   --diffusion-n-obs-steps 2 \
   --diffusion-noise-scheduler-type DDIM \
-  --diffusion-num-inference-steps 20 \
+  --diffusion-num-inference-steps 10 \
   --disable-wandb
 ```
 
@@ -140,7 +140,7 @@ Diffusion-specific options:
 Default diffusion scheduler/inference settings in this repo:
 
 - `noise_scheduler_type = DDIM`
-- `num_inference_steps = 20`
+- `num_inference_steps = 10`
 
 ## Notes About Policy Choice
 

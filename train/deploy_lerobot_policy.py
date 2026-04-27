@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     serve_parser.add_argument(
         "--diffusion-num-inference-steps",
         type=int,
-        default=20,
+        default=10,
         help="Override the diffusion denoising steps when loading a diffusion policy on the server.",
     )
 

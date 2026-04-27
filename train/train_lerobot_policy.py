@@ -180,7 +180,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--diffusion-num-inference-steps",
         type=int,
-        default=20,
+        default=10,
         help="Reverse diffusion steps recorded in the diffusion policy config.",
     )
     return parser.parse_args()

@@ -212,8 +212,8 @@ This ACT-specific flag sets the weight of the already-queued action when the exe
 For diffusion deployment, use the diffusion-specific knobs instead:
 
 ```bash
---diffusion-chunk-size-threshold 0.25
---diffusion-aggregate-ratio-old 0.0
+--diffusion-chunk-size-threshold 0.5
+--diffusion-aggregate-ratio-old 0.5
 ```
 
 If the checkpoint exists only on the policy server machine and not on the robot computer, pass:
@@ -235,8 +235,8 @@ python train/franka_policy_executor.py \
   --zmq-port 5555 \
   --fps 15 \
   --task "pick and place" \
-  --diffusion-chunk-size-threshold 0.25 \
-  --diffusion-aggregate-ratio-old 0.0
+  --diffusion-chunk-size-threshold 0.5 \
+  --diffusion-aggregate-ratio-old 0.5
 ```
 
 ### 7. Validate dry-run before moving the robot

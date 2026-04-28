@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--diffusion-chunk-size-threshold",
         type=float,
-        default=1.0,
+        default=0.8,
         help=(
             "Send a new observation when queue_size / actions_per_chunk is at or below this value "
             "for diffusion deployment. Defaults to 1.0 to refresh diffusion chunks as soon as "
@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--diffusion-aggregate-ratio-old",
         type=float,
-        default=0.8,
+        default=0.7,
         help=(
             "Diffusion-only weight assigned to the queued action when aggregating overlapping timesteps. "
             "The blended action is old_ratio * old + (1 - old_ratio) * new. Defaults to 0.8 "

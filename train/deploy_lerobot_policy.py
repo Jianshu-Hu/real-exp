@@ -229,6 +229,7 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
                 cli_overrides=cli_overrides,
             )
             self.policy.to(self.device)
+            self.policy.eval()
             max_actions_per_chunk = infer_actions_per_chunk(self.policy_type, asdict(self.policy.config))
             if self.actions_per_chunk > max_actions_per_chunk:
                 raise ValueError(
@@ -313,7 +314,7 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
                         f"Diffusion deployment could not build history for '{key}'. "
                         "No observations have been buffered yet."
                     )
-                history_batch[key] = torch.stack(list(queue), dim=1)
+                history_batch[key] = torch.stack(list(queue), dim=1).clone()
 
             return history_batch
 
@@ -324,7 +325,7 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
             preprocessing_time = time.perf_counter() - start_preprocess
 
             start_inference = time.perf_counter()
-            action_tensor = self._get_action_chunk(observation)
+            action_tensor = self._get_action_chunk(observation, observation_t)
             inference_time = time.perf_counter() - start_inference
             self.logger.info(
                 f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
@@ -342,8 +343,14 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
             self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
             action_tensor = action_tensor.detach().cpu()
 
+            action_anchor_timestep = getattr(observation_t, "action_timestep", observation_t.get_timestep())
+            if action_anchor_timestep != observation_t.get_timestep():
+                self.logger.info(
+                    f"Timing action chunk from anchor #{action_anchor_timestep} "
+                    f"for observation stream #{observation_t.get_timestep()}"
+                )
             action_chunk = self._time_action_chunk(
-                observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+                observation_t.get_timestamp(), list(action_tensor), action_anchor_timestep
             )
             postprocess_stops = time.perf_counter()
             postprocessing_time = postprocess_stops - start_postprocess
@@ -363,15 +370,24 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
 
             return action_chunk
 
-        def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
+        def _get_action_chunk(self, observation: dict[str, torch.Tensor], observation_t=None) -> torch.Tensor:
             if self.policy_type == "diffusion":
-                history_batch = self._build_diffusion_history_batch()
-                chunk = self.policy.diffusion.generate_actions(history_batch)
+                history_batch = getattr(observation_t, "diffusion_history_batch", None)
+                if history_batch is None:
+                    history_batch = self._build_diffusion_history_batch()
+                else:
+                    self.logger.info(
+                        f"Using diffusion history snapshot from observation stream "
+                        f"#{observation_t.get_timestep()}"
+                    )
+                with torch.inference_mode():
+                    chunk = self.policy.diffusion.generate_actions(history_batch)
                 if chunk.ndim != 3:
                     chunk = chunk.unsqueeze(0)
                 return chunk[:, : self.actions_per_chunk, :]
 
-            return super()._get_action_chunk(observation)
+            with torch.inference_mode():
+                return super()._get_action_chunk(observation)
 
         def SendObservations(self, request_iterator, context):  # noqa: N802
             client_id = context.peer()
@@ -414,6 +430,12 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
                 # For diffusion, every observation updates history, but only `must_go` observations
                 # should trigger a fresh chunk request.
                 if timed_observation.must_go:
+                    try:
+                        timed_observation.diffusion_history_batch = self._build_diffusion_history_batch()
+                    except Exception as exc:
+                        self.logger.error(f"Error snapshotting diffusion history: {exc}")
+                        self.logger.error(traceback.format_exc())
+                        return services_pb2.Empty()
                     if not self._enqueue_observation(timed_observation):
                         self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
                 else:

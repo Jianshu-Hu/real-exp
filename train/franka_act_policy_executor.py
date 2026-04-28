@@ -53,20 +53,18 @@ def import_zmq_runtime():
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Robot-side Franka executor for a remote LeRobot policy server."
+        description="Robot-side Franka executor for a remote ACT LeRobot policy server."
     )
     parser.add_argument("--policy-path", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--server-address", default="127.0.0.1:8080")
     parser.add_argument("--policy-device", default="cuda")
-    parser.add_argument("--policy-type", default=None)
     parser.add_argument(
         "--actions-per-chunk",
         type=int,
         default=None,
         help=(
-            "Number of actions to request per deployment chunk. Required for diffusion policies; "
-            "defaults to the checkpoint chunk size for other policy types."
+            "Number of actions to request per deployment chunk. Defaults to the checkpoint chunk size."
         ),
     )
     parser.add_argument("--zmq-host", default="127.0.0.1")
@@ -80,15 +78,6 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Send a new observation when queue_size / actions_per_chunk is at or below this value. "
             "Default 0.9 was validated to give smooth overlapping ACT chunks."
-        ),
-    )
-    parser.add_argument(
-        "--diffusion-chunk-size-threshold",
-        type=float,
-        default=0.5,
-        help=(
-            "Send a new observation when queue_size / actions_per_chunk is at or below this value "
-            "for diffusion deployment."
         ),
     )
     parser.add_argument("--execute", action="store_true")
@@ -113,15 +102,6 @@ def parse_args() -> argparse.Namespace:
         default=0.8,
         help=(
             "ACT-only weight assigned to the queued action when aggregating overlapping timesteps. "
-            "The blended action is old_ratio * old + (1 - old_ratio) * new."
-        ),
-    )
-    parser.add_argument(
-        "--diffusion-aggregate-ratio-old",
-        type=float,
-        default=0.5,
-        help=(
-            "Diffusion-only weight assigned to the queued action when aggregating overlapping timesteps. "
             "The blended action is old_ratio * old + (1 - old_ratio) * new."
         ),
     )
@@ -230,14 +210,10 @@ def json_safe(value: Any) -> Any:
 def default_run_name(args: argparse.Namespace) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     policy_name = args.policy_path.expanduser().name
-    if args.policy_type == "diffusion":
-        threshold = args.diffusion_chunk_size_threshold
-        aggregate_ratio = args.diffusion_aggregate_ratio_old
-    else:
-        threshold = args.act_chunk_size_threshold
-        aggregate_ratio = args.act_aggregate_ratio_old
+    threshold = args.act_chunk_size_threshold
+    aggregate_ratio = args.act_aggregate_ratio_old
     return (
-        f"{timestamp}_{policy_name}_{args.policy_type or 'auto'}"
+        f"{timestamp}_{policy_name}_act"
         f"_apc{args.actions_per_chunk or 'auto'}"
         f"_thr{threshold:g}_{aggregate_ratio}"
     )
@@ -253,14 +229,13 @@ class FrankaPolicyExecutor:
         self.policy_path = args.policy_path.expanduser()
         self.dataset_root = args.dataset_root.resolve()
         local_policy_config = maybe_load_policy_config(self.policy_path)
-        if args.policy_type is not None:
-            self.policy_type = args.policy_type
-        elif local_policy_config is not None:
+        if local_policy_config is not None:
             self.policy_type = infer_policy_type(self.policy_path)
         else:
-            raise FileNotFoundError(
-                "Could not find a local policy config.json for --policy-path. "
-                "Pass --policy-type explicitly when the checkpoint only exists on the server."
+            self.policy_type = "act"
+        if self.policy_type != "act":
+            raise ValueError(
+                f"train/franka_act_policy_executor.py only supports ACT checkpoints, got {self.policy_type!r}."
             )
 
         if args.actions_per_chunk is not None:
@@ -268,12 +243,6 @@ class FrankaPolicyExecutor:
                 raise ValueError(f"--actions-per-chunk must be positive, got {args.actions_per_chunk}")
             self.actions_per_chunk = args.actions_per_chunk
         elif local_policy_config is not None:
-            if self.policy_type == "diffusion":
-                raise ValueError(
-                    "--actions-per-chunk is required for diffusion deployment. "
-                    "Training stores the maximum exportable diffusion chunk; deployment chooses how many "
-                    "actions to execute per chunk."
-                )
             self.actions_per_chunk = infer_actions_per_chunk(self.policy_path, self.policy_type)
         else:
             raise FileNotFoundError(
@@ -293,27 +262,12 @@ class FrankaPolicyExecutor:
             raise ValueError(
                 f"--act-chunk-size-threshold must be between 0 and 1, got {args.act_chunk_size_threshold}"
             )
-        if not 0.0 <= args.diffusion_chunk_size_threshold <= 1.0:
-            raise ValueError(
-                "--diffusion-chunk-size-threshold must be between 0 and 1, "
-                f"got {args.diffusion_chunk_size_threshold}"
-            )
         if not 0.0 <= args.act_aggregate_ratio_old <= 1.0:
             raise ValueError(
                 f"--act-aggregate-ratio-old must be between 0 and 1, got {args.act_aggregate_ratio_old}"
             )
-        if not 0.0 <= args.diffusion_aggregate_ratio_old <= 1.0:
-            raise ValueError(
-                "--diffusion-aggregate-ratio-old must be between 0 and 1, "
-                f"got {args.diffusion_aggregate_ratio_old}"
-            )
-
-        if self.policy_type == "diffusion":
-            self.chunk_size_threshold = args.diffusion_chunk_size_threshold
-            self.aggregate_ratio_old = args.diffusion_aggregate_ratio_old
-        else:
-            self.chunk_size_threshold = args.act_chunk_size_threshold
-            self.aggregate_ratio_old = args.act_aggregate_ratio_old
+        self.chunk_size_threshold = args.act_chunk_size_threshold
+        self.aggregate_ratio_old = args.act_aggregate_ratio_old
 
         self.aggregate_fn = get_aggregate_function(self.aggregate_ratio_old)
         self.dataset_info = load_json(self.dataset_root / INFO_REL_PATH)
@@ -434,9 +388,7 @@ class FrankaPolicyExecutor:
             "chunk_size_threshold": self.chunk_size_threshold,
             "aggregate_ratio_old": self.aggregate_ratio_old,
             "act_chunk_size_threshold": self.args.act_chunk_size_threshold,
-            "diffusion_chunk_size_threshold": self.args.diffusion_chunk_size_threshold,
             "act_aggregate_ratio_old": self.args.act_aggregate_ratio_old,
-            "diffusion_aggregate_ratio_old": self.args.diffusion_aggregate_ratio_old,
             "fps": self.args.fps,
             "task": self.args.task,
             "execute": self.args.execute,
@@ -473,6 +425,17 @@ class FrankaPolicyExecutor:
         current_packet: dict[str, Any],
         queue_snapshot: dict[str, Any],
     ) -> None:
+        executor_receive_s = time.time()
+        camera_stamps_s = {
+            camera_name: current_packet["cameras"][camera_name].get("stamp_s")
+            for camera_name in current_packet["camera_names"]
+        }
+        bridge_publish_s = current_packet.get("bridge_publish_s")
+        camera_wall_age_s = {
+            camera_name: executor_receive_s - stamp_s
+            for camera_name, stamp_s in camera_stamps_s.items()
+            if stamp_s is not None
+        }
         self._write_log_record(
             {
                 "event": "observation_sent",
@@ -481,12 +444,16 @@ class FrankaPolicyExecutor:
                 "queue": queue_snapshot,
                 "inflight_observation_timestep": self._get_inflight_observation_timestep(),
                 "latest_executed_timestep": self.latest_executed_timestep,
+                "executor_receive_s": executor_receive_s,
+                "bridge_publish_s": bridge_publish_s,
+                "bridge_to_executor_s": (
+                    executor_receive_s - bridge_publish_s if bridge_publish_s is not None else None
+                ),
                 "robot_state": np.asarray(current_packet["state"], dtype=float).tolist(),
                 "bridge_action": np.asarray(current_packet.get("action", []), dtype=float).tolist(),
-                "camera_stamps_s": {
-                    camera_name: current_packet["cameras"][camera_name].get("stamp_s")
-                    for camera_name in current_packet["camera_names"]
-                },
+                "camera_stamps_s": camera_stamps_s,
+                "executor_wall_minus_camera_stamp_s": camera_wall_age_s,
+                "camera_freshness": current_packet.get("camera_freshness"),
             }
         )
 
@@ -646,41 +613,12 @@ class FrankaPolicyExecutor:
         self.stub.SendObservations(request_iterator)
 
     def _ready_to_send_observation(self) -> bool:
-        if self.policy_type == "diffusion":
-            return True
-
         if self._get_inflight_observation_timestep() is not None:
             return False
 
         with self.action_queue_lock:
             queue_fraction = len(self.action_queue) / float(max(self.action_chunk_size, 1))
         return queue_fraction <= self.chunk_size_threshold
-
-    def _make_stream_observation_timestep(self) -> int:
-        self.latest_streamed_observation_timestep = max(
-            self.latest_streamed_observation_timestep + 1,
-            self.latest_executed_timestep + 1,
-        )
-        return self.latest_streamed_observation_timestep
-
-    def _prepare_diffusion_observation_send(self) -> tuple[int, dict[str, Any], bool]:
-        stream_timestep = self._make_stream_observation_timestep()
-        with self.inflight_observation_lock:
-            with self.action_queue_lock:
-                queue_snapshot = self._queue_snapshot_unlocked()
-                queue_fraction = len(self.action_queue) / float(max(self.action_chunk_size, 1))
-                must_go = (
-                    queue_fraction <= self.chunk_size_threshold
-                    and self.inflight_observation_timestep is None
-                )
-                observation_timestep = stream_timestep
-                if must_go:
-                    # Diffusion history is updated continuously, but the generated chunk must still be
-                    # anchored to the next action-execution timestep rather than the observation-stream index.
-                    observation_timestep = self._next_action_anchor_timestep_unlocked()
-                    self.inflight_observation_timestep = observation_timestep
-                    self.inflight_observation_sent_monotonic = time.perf_counter()
-        return observation_timestep, queue_snapshot, must_go
 
     def _aggregate_action_queue(self, incoming_actions: list[TimedAction]) -> dict[str, Any]:
         with self.action_queue_lock:
@@ -917,15 +855,9 @@ class FrankaPolicyExecutor:
                     continue
 
                 if self._ready_to_send_observation():
-                    if self.policy_type == "diffusion":
-                        observation_timestep, queue_snapshot, must_go = (
-                            self._prepare_diffusion_observation_send()
-                        )
-                    else:
-                        observation_timestep, queue_snapshot = self._next_observation_timestep()
-                        must_go = True
-                    if must_go and self.policy_type != "diffusion":
-                        self._mark_observation_inflight(observation_timestep)
+                    observation_timestep, queue_snapshot = self._next_observation_timestep()
+                    must_go = True
+                    self._mark_observation_inflight(observation_timestep)
                     observation = TimedObservation(
                         timestamp=time.time(),
                         observation=packet_to_raw_observation(current_packet, self.args.task),

@@ -4,7 +4,8 @@ This directory contains the repo-local training entrypoint for imitation learnin
 
 - `train/train_lerobot_policy.py`
 - `train/deploy_lerobot_policy.py`
-- `train/franka_policy_executor.py`
+- `train/franka_act_policy_executor.py`
+- `train/franka_diffusion_policy_executor.py`
 - `train/push_lerobot_policy.py`
 - `train/fetch_lerobot_policy.py`
 

@@ -186,7 +186,7 @@ This lets the existing ROS 2 consumers be reused during deployment.
 Run this on the robot machine:
 
 ```bash
-python train/franka_policy_executor.py \
+python train/franka_act_policy_executor.py \
   --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
   --server-address 192.168.50.6:8080 \
   --zmq-host 127.0.0.1 \
@@ -212,22 +212,28 @@ This ACT-specific flag sets the weight of the already-queued action when the exe
 For diffusion deployment, use the diffusion-specific knobs instead:
 
 ```bash
---diffusion-chunk-size-threshold 0.5
---diffusion-aggregate-ratio-old 0.5
+python train/franka_diffusion_policy_executor.py \
+  --policy-path outputs/pick_and_place_test_diffusion/checkpoints/last/pretrained_model \
+  --actions-per-chunk 8 \
+  --server-address 192.168.50.6:8080 \
+  --zmq-host 127.0.0.1 \
+  --zmq-port 5555 \
+  --fps 15 \
+  --task "pick and place" \
+  --diffusion-chunk-size-threshold 0.5 \
+  --diffusion-aggregate-ratio-old 0.5
 ```
 
 If the checkpoint exists only on the policy server machine and not on the robot computer, pass:
 
 - `--policy-path` as the path on the server machine
-- `--policy-type` explicitly
 - `--actions-per-chunk` explicitly
 
 Example:
 
 ```bash
-python train/franka_policy_executor.py \
+python train/franka_diffusion_policy_executor.py \
   --policy-path /home/pair/real-exp/outputs/policy-dir \
-  --policy-type diffusion \
   --actions-per-chunk 8 \
   --policy-device cuda:0 \
   --server-address 192.168.50.6:8080 \
@@ -264,7 +270,7 @@ If the executor raises an `action_dim` mismatch, fix the ROS 2 bridge configurat
 Once dry-run is stable, restart the executor for live execution:
 
 ```bash
-python train/franka_policy_executor.py \
+python train/franka_act_policy_executor.py \
   --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
   --server-address 192.168.50.6:8080 \
   --zmq-host 127.0.0.1 \
@@ -316,10 +322,9 @@ If you start the bridge in direct `pylibfranka` deployment-state mode while `ros
 Useful executor options:
 
 - `--actions-per-chunk` to override the chunk length requested from the server
-- `--policy-type` if automatic inference from `config.json` is not what you want
 - `--policy-device` to tell the remote policy server which device to use
-- `--act-chunk-size-threshold` and `--act-aggregate-ratio-old` to tune overlapping ACT chunks
-- `--diffusion-chunk-size-threshold` and `--diffusion-aggregate-ratio-old` to tune overlapping diffusion chunks
+- `--act-chunk-size-threshold` and `--act-aggregate-ratio-old` on `franka_act_policy_executor.py` to tune overlapping ACT chunks
+- `--diffusion-chunk-size-threshold` and `--diffusion-aggregate-ratio-old` on `franka_diffusion_policy_executor.py` to tune overlapping diffusion chunks
 - `--diffusion-noise-scheduler-type` and `--diffusion-num-inference-steps` on the server to override diffusion denoising at load time
 - `--command-zmq-host` and `--command-zmq-port` to match the bridge command socket
 - `--bridge-activation-service` to override the ROS 2 `SetBool` service used for bridge activation

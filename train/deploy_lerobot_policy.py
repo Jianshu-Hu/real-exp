@@ -84,7 +84,20 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Override the diffusion denoising steps when loading a diffusion policy on the server.",
     )
-
+    serve_parser.add_argument(
+        "--diffusion-fixed-noise-seed",
+        type=int,
+        default=0,
+        help=(
+            "Use a fixed random seed for diffusion inference noise. Defaults to 0 for deterministic "
+            "deployment. Set to a different integer to test another deterministic seed."
+        ),
+    )
+    serve_parser.add_argument(
+        "--disable-diffusion-fixed-noise",
+        action="store_true",
+        help="Disable fixed diffusion inference noise and use stochastic sampling.",
+    )
     return parser.parse_args()
 
 
@@ -179,7 +192,10 @@ def raw_observation_to_observation_with_resize_pad(
     return observation
 
 
-def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = None):
+def make_deployment_policy_server(
+    diffusion_cli_overrides: list[str] | None = None,
+    diffusion_fixed_noise_seed: int | None = None,
+):
     from lerobot.async_inference.constants import SUPPORTED_POLICIES
     from lerobot.async_inference.helpers import Observation, RemotePolicyConfig
     from lerobot.async_inference.policy_server import PolicyServer
@@ -274,19 +290,15 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
             return services_pb2.Empty()
 
         def _prepare_policy_observation(self, observation_t) -> Observation:
-            start_prepare = time.perf_counter()
             observation: Observation = raw_observation_to_observation_with_resize_pad(
                 observation_t.get_observation(),
                 self.lerobot_features,
                 self.policy_image_features,
                 self.image_preprocess,
             )
-            prepare_time = time.perf_counter() - start_prepare
-
-            start_preprocess = time.perf_counter()
             observation = self.preprocessor(observation)
             self.last_processed_obs = observation_t
-            return observation, start_prepare, prepare_time, start_preprocess
+            return observation
 
         def _update_diffusion_history(self, observation: dict[str, torch.Tensor]) -> None:
             if self.policy_type != "diffusion" or self._diffusion_history is None:
@@ -318,20 +330,28 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
 
             return history_batch
 
+        def _make_fixed_diffusion_noise(self, history_batch: dict[str, torch.Tensor]) -> torch.Tensor:
+            if diffusion_fixed_noise_seed is None:
+                raise RuntimeError("Fixed diffusion noise requested without a seed.")
+
+            state = history_batch[OBS_STATE]
+            generator = torch.Generator(device=state.device)
+            generator.manual_seed(diffusion_fixed_noise_seed)
+            return torch.randn(
+                size=(
+                    state.shape[0],
+                    self.policy.config.horizon,
+                    self.policy.config.action_feature.shape[0],
+                ),
+                dtype=state.dtype,
+                device=state.device,
+                generator=generator,
+            )
+
         def _predict_action_chunk(self, observation_t) -> list[Any]:
-            observation, start_prepare, prepare_time, start_preprocess = self._prepare_policy_observation(
-                observation_t
-            )
-            preprocessing_time = time.perf_counter() - start_preprocess
-
-            start_inference = time.perf_counter()
+            observation = self._prepare_policy_observation(observation_t)
             action_tensor = self._get_action_chunk(observation, observation_t)
-            inference_time = time.perf_counter() - start_inference
-            self.logger.info(
-                f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
-            )
 
-            start_postprocess = time.perf_counter()
             _, chunk_size, _ = action_tensor.shape
             processed_actions = []
             for i in range(chunk_size):
@@ -340,32 +360,11 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
                 processed_actions.append(processed_action)
 
             action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
-            self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
             action_tensor = action_tensor.detach().cpu()
 
             action_anchor_timestep = getattr(observation_t, "action_timestep", observation_t.get_timestep())
-            if action_anchor_timestep != observation_t.get_timestep():
-                self.logger.info(
-                    f"Timing action chunk from anchor #{action_anchor_timestep} "
-                    f"for observation stream #{observation_t.get_timestep()}"
-                )
             action_chunk = self._time_action_chunk(
                 observation_t.get_timestamp(), list(action_tensor), action_anchor_timestep
-            )
-            postprocess_stops = time.perf_counter()
-            postprocessing_time = postprocess_stops - start_postprocess
-
-            self.logger.info(
-                f"Observation {observation_t.get_timestep()} | "
-                f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
-            )
-            self.logger.debug(
-                f"Observation {observation_t.get_timestep()} | "
-                f"Prepare time: {1000 * prepare_time:.2f}ms | "
-                f"Preprocessing time: {1000 * preprocessing_time:.2f}ms | "
-                f"Inference time: {1000 * inference_time:.2f}ms | "
-                f"Postprocessing time: {1000 * postprocessing_time:.2f}ms | "
-                f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
             )
 
             return action_chunk
@@ -375,13 +374,13 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
                 history_batch = getattr(observation_t, "diffusion_history_batch", None)
                 if history_batch is None:
                     history_batch = self._build_diffusion_history_batch()
-                else:
-                    self.logger.info(
-                        f"Using diffusion history snapshot from observation stream "
-                        f"#{observation_t.get_timestep()}"
-                    )
+                noise = (
+                    self._make_fixed_diffusion_noise(history_batch)
+                    if diffusion_fixed_noise_seed is not None
+                    else None
+                )
                 with torch.inference_mode():
-                    chunk = self.policy.diffusion.generate_actions(history_batch)
+                    chunk = self.policy.diffusion.generate_actions(history_batch, noise=noise)
                 if chunk.ndim != 3:
                     chunk = chunk.unsqueeze(0)
                 return chunk[:, : self.actions_per_chunk, :]
@@ -390,38 +389,14 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
                 return super()._get_action_chunk(observation)
 
         def SendObservations(self, request_iterator, context):  # noqa: N802
-            client_id = context.peer()
-            self.logger.debug(f"Receiving observations from {client_id}")
-
-            receive_time = time.time()
-            start_deserialize = time.perf_counter()
             received_bytes = receive_bytes_in_chunks(
                 request_iterator, None, self.shutdown_event, self.logger
             )
             timed_observation = pickle.loads(received_bytes)  # nosec
-            deserialize_time = time.perf_counter() - start_deserialize
-
-            self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
-
-            obs_timestep = timed_observation.get_timestep()
-            obs_timestamp = timed_observation.get_timestamp()
-            fps_metrics = self.fps_tracker.calculate_fps_metrics(obs_timestamp)
-
-            self.logger.debug(
-                f"Received observation #{obs_timestep} | "
-                f"Avg FPS: {fps_metrics['avg_fps']:.2f} | "
-                f"Target: {fps_metrics['target_fps']:.2f} | "
-                f"One-way latency: {(receive_time - obs_timestamp) * 1000:.2f}ms"
-            )
-            self.logger.debug(
-                f"Server timestamp: {receive_time:.6f} | "
-                f"Client timestamp: {obs_timestamp:.6f} | "
-                f"Deserialization time: {deserialize_time:.6f}s"
-            )
 
             if self.policy_type == "diffusion" and self.preprocessor is not None:
                 try:
-                    observation, _, _, _ = self._prepare_policy_observation(timed_observation)
+                    observation = self._prepare_policy_observation(timed_observation)
                     self._update_diffusion_history(observation)
                 except Exception as exc:
                     self.logger.error(f"Error updating diffusion history from observation stream: {exc}")
@@ -436,17 +411,10 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
                         self.logger.error(f"Error snapshotting diffusion history: {exc}")
                         self.logger.error(traceback.format_exc())
                         return services_pb2.Empty()
-                    if not self._enqueue_observation(timed_observation):
-                        self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
-                else:
-                    self.logger.debug(
-                        f"Buffered diffusion observation #{obs_timestep} for history only "
-                        "(must_go: False)"
-                    )
+                    self._enqueue_observation(timed_observation)
                 return services_pb2.Empty()
 
-            if not self._enqueue_observation(timed_observation):
-                self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
+            self._enqueue_observation(timed_observation)
 
             return services_pb2.Empty()
 
@@ -454,34 +422,15 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
             try:
                 getactions_starts = time.perf_counter()
                 obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
-                self.logger.info(
-                    f"Running inference for observation #{obs.get_timestep()} (must_go: {obs.must_go})"
-                )
 
                 with self._predicted_timesteps_lock:
                     self._predicted_timesteps.add(obs.get_timestep())
 
-                start_time = time.perf_counter()
                 action_chunk = self._predict_action_chunk(obs)
-                inference_time = time.perf_counter() - start_time
 
-                start_time = time.perf_counter()
                 actions_bytes = pickle.dumps(action_chunk)  # nosec
-                serialize_time = time.perf_counter() - start_time
 
                 actions = services_pb2.Actions(data=actions_bytes)
-
-                self.logger.info(
-                    f"Action chunk #{obs.get_timestep()} generated | "
-                    f"Total time: {(inference_time + serialize_time) * 1000:.2f}ms"
-                )
-
-                self.logger.debug(
-                    f"Action chunk #{obs.get_timestep()} generated | "
-                    f"Inference time: {inference_time:.2f}s |"
-                    f"Serialize time: {serialize_time:.2f}s |"
-                    f"Total time: {inference_time + serialize_time:.2f}s"
-                )
 
                 time.sleep(
                     max(0, self.config.inference_latency - max(0, time.perf_counter() - getactions_starts))
@@ -499,12 +448,19 @@ def make_deployment_policy_server(diffusion_cli_overrides: list[str] | None = No
     return DeploymentPolicyServer
 
 
-def serve_deployment_policy_server(cfg, diffusion_cli_overrides: list[str] | None = None) -> None:
+def serve_deployment_policy_server(
+    cfg,
+    diffusion_cli_overrides: list[str] | None = None,
+    diffusion_fixed_noise_seed: int | None = None,
+) -> None:
     import grpc
 
     from lerobot.transport import services_pb2_grpc
 
-    DeploymentPolicyServer = make_deployment_policy_server(diffusion_cli_overrides)
+    DeploymentPolicyServer = make_deployment_policy_server(
+        diffusion_cli_overrides,
+        diffusion_fixed_noise_seed=diffusion_fixed_noise_seed,
+    )
 
     logging.info(pformat(asdict(cfg)))
 
@@ -624,7 +580,12 @@ def run_server(args: argparse.Namespace) -> None:
         f"--noise_scheduler_type={args.diffusion_noise_scheduler_type}",
         f"--num_inference_steps={args.diffusion_num_inference_steps}",
     ]
-    serve_deployment_policy_server(cfg, diffusion_cli_overrides=diffusion_cli_overrides)
+    fixed_noise_seed = None if args.disable_diffusion_fixed_noise else args.diffusion_fixed_noise_seed
+    serve_deployment_policy_server(
+        cfg,
+        diffusion_cli_overrides=diffusion_cli_overrides,
+        diffusion_fixed_noise_seed=fixed_noise_seed,
+    )
 
 
 def main() -> None:

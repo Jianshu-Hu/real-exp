@@ -219,10 +219,6 @@ def default_run_name(args: argparse.Namespace) -> str:
     )
 
 
-def format_optional_seconds(value: float | None) -> str:
-    return "None" if value is None else f"{value:.3f}s"
-
-
 class FrankaPolicyExecutor:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -424,6 +420,7 @@ class FrankaPolicyExecutor:
         observation: TimedObservation,
         current_packet: dict[str, Any],
         queue_snapshot: dict[str, Any],
+        dropped_zmq_packets: int = 0,
     ) -> None:
         executor_receive_s = time.time()
         camera_stamps_s = {
@@ -444,6 +441,7 @@ class FrankaPolicyExecutor:
                 "queue": queue_snapshot,
                 "inflight_observation_timestep": self._get_inflight_observation_timestep(),
                 "latest_executed_timestep": self.latest_executed_timestep,
+                "dropped_zmq_packets": dropped_zmq_packets,
                 "executor_receive_s": executor_receive_s,
                 "bridge_publish_s": bridge_publish_s,
                 "bridge_to_executor_s": (
@@ -454,6 +452,7 @@ class FrankaPolicyExecutor:
                 "camera_stamps_s": camera_stamps_s,
                 "executor_wall_minus_camera_stamp_s": camera_wall_age_s,
                 "camera_freshness": current_packet.get("camera_freshness"),
+                "camera_sync": current_packet.get("camera_sync"),
             }
         )
 
@@ -505,14 +504,6 @@ class FrankaPolicyExecutor:
                 "reason": "all incoming actions were already executed",
             }
         )
-        print(
-            "[TIMING] chunk filtered "
-            f"inflight={cleared_inflight_timestep} "
-            f"latency={format_optional_seconds(inflight_latency_s)} "
-            f"incoming={incoming_timesteps[:1]}..{incoming_timesteps[-1:] if incoming_timesteps else []} "
-            f"latest_executed={self.latest_executed_timestep}"
-        )
-
     def _log_action_executed(
         self,
         action: TimedAction,
@@ -656,8 +647,6 @@ class FrankaPolicyExecutor:
                     current_queue.pop(timestep, None)
 
             ordered_timesteps = sorted(current_queue)
-            if len(ordered_timesteps) != len(set(ordered_timesteps)):
-                print(f"[WARN] duplicate timesteps remained in action queue: {ordered_timesteps}")
             self.action_queue = deque(current_queue[timestep] for timestep in ordered_timesteps)
 
         return {
@@ -683,10 +672,6 @@ class FrankaPolicyExecutor:
                                 "inflight_latency_s": latency_s,
                                 "latest_executed_timestep": self.latest_executed_timestep,
                             }
-                        )
-                        print(
-                            "[TIMING] action request timeout "
-                            f"inflight={cleared_timestep} latency={format_optional_seconds(latency_s)}"
                         )
                     continue
 
@@ -718,20 +703,6 @@ class FrankaPolicyExecutor:
                     cleared_inflight_timestep,
                     inflight_latency_s,
                 )
-                incoming_timesteps = [action.get_timestep() for action in incoming_actions]
-                filtered_timesteps = [action.get_timestep() for action in filtered]
-                print(
-                    "[TIMING] chunk received "
-                    f"inflight={cleared_inflight_timestep} "
-                    f"latency={format_optional_seconds(inflight_latency_s)} "
-                    f"incoming={incoming_timesteps[0]}..{incoming_timesteps[-1]} "
-                    f"filtered={filtered_timesteps[0]}..{filtered_timesteps[-1]} "
-                    f"added={aggregate_stats['added']} "
-                    f"blended={aggregate_stats['blended']} "
-                    f"dropped={aggregate_stats['dropped']} "
-                    f"queue={aggregate_stats['first_timestep']}..{aggregate_stats['last_timestep']} "
-                    f"latest_executed={self.latest_executed_timestep}"
-                )
                 self.must_go_pending = True
             except self.grpc.RpcError:
                 cleared_timestep, latency_s = self._clear_observation_inflight()
@@ -744,13 +715,9 @@ class FrankaPolicyExecutor:
                             "latest_executed_timestep": self.latest_executed_timestep,
                         }
                     )
-                    print(
-                        "[TIMING] action request RPC error "
-                        f"inflight={cleared_timestep} latency={format_optional_seconds(latency_s)}"
-                    )
                 time.sleep(0.05)
             except Exception as exc:  # pragma: no cover
-                print(f"Action receiver error: {exc}")
+                self._write_log_record({"event": "action_receiver_error", "error": repr(exc)})
                 time.sleep(0.05)
 
     def setup_command_bridge(self, zmq_context: Any) -> None:
@@ -760,6 +727,17 @@ class FrankaPolicyExecutor:
         self.command_socket.setsockopt(import_zmq_runtime().SNDHWM, 1)
         self.command_socket.connect(f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}")
         print("Bridge command backend:", f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}")
+
+    def _recv_latest_packet(self, socket: Any) -> tuple[dict[str, Any], int]:
+        zmq = import_zmq_runtime()
+        packet = socket.recv_pyobj()
+        dropped = 0
+        while True:
+            try:
+                packet = socket.recv_pyobj(flags=zmq.NOBLOCK)
+                dropped += 1
+            except zmq.Again:
+                return packet, dropped
 
     def _command_payload_from_action(self, action: TimedAction) -> dict[str, Any]:
         split = split_action(np.asarray(action.get_action(), dtype=float))
@@ -818,6 +796,8 @@ class FrankaPolicyExecutor:
         print("Waiting for the first ZMQ packet to infer live observation features...")
 
         socket = context.socket(zmq.SUB)
+        socket.setsockopt(zmq.RCVHWM, 1)
+        socket.setsockopt(zmq.CONFLATE, 1)
         socket.connect(f"tcp://{self.args.zmq_host}:{self.args.zmq_port}")
         socket.setsockopt_string(zmq.SUBSCRIBE, "")
         socket.setsockopt(zmq.RCVTIMEO, 100)
@@ -850,7 +830,7 @@ class FrankaPolicyExecutor:
             while not self.shutdown_event.is_set():
                 loop_start = time.perf_counter()
                 try:
-                    current_packet = socket.recv_pyobj()
+                    current_packet, dropped_zmq_packets = self._recv_latest_packet(socket)
                 except zmq.Again:
                     continue
 
@@ -866,18 +846,15 @@ class FrankaPolicyExecutor:
                     )
                     try:
                         self.send_observation(observation)
-                        self._log_observation_sent(observation, current_packet, queue_snapshot)
+                        self._log_observation_sent(
+                            observation,
+                            current_packet,
+                            queue_snapshot,
+                            dropped_zmq_packets=dropped_zmq_packets,
+                        )
                     except Exception:
                         self._clear_observation_inflight()
                         raise
-                    print(
-                        "[TIMING] observation sent "
-                        f"timestep={observation_timestep} "
-                        f"queue_size={queue_snapshot['size']} "
-                        f"queue={queue_snapshot['first_timestep']}..{queue_snapshot['last_timestep']} "
-                        f"latest_executed={self.latest_executed_timestep} "
-                        f"must_go={observation.must_go}"
-                    )
                     self.must_go_pending = False
 
                 action, queue_before_pop, queue_after_pop = self.maybe_pop_action()
@@ -885,17 +862,6 @@ class FrankaPolicyExecutor:
                     payload = self._command_payload_from_action(action)
                     if self.args.execute:
                         self._send_bridge_command(payload)
-                    else:
-                        print(
-                            "Predicted action:",
-                            {
-                                "timestep": action.get_timestep(),
-                                "left_arm": np.round(np.asarray(split_action(action.get_action())["left_arm"]), 4).tolist(),
-                                "left_gripper": np.round(np.asarray(split_action(action.get_action())["left_gripper"]), 4).tolist(),
-                                "right_arm": np.round(np.asarray(split_action(action.get_action())["right_arm"]), 4).tolist(),
-                                "right_gripper": np.round(np.asarray(split_action(action.get_action())["right_gripper"]), 4).tolist(),
-                            },
-                        )
                     self._log_action_executed(
                         action,
                         current_packet,

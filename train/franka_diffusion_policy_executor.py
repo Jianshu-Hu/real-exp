@@ -74,10 +74,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--diffusion-chunk-size-threshold",
         type=float,
-        default=0.5,
+        default=1.0,
         help=(
             "Send a new observation when queue_size / actions_per_chunk is at or below this value "
-            "for diffusion deployment."
+            "for diffusion deployment. Defaults to 1.0 to refresh diffusion chunks as soon as "
+            "a full observation history is available."
         ),
     )
     parser.add_argument("--execute", action="store_true")
@@ -99,10 +100,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--diffusion-aggregate-ratio-old",
         type=float,
-        default=0.5,
+        default=0.8,
         help=(
             "Diffusion-only weight assigned to the queued action when aggregating overlapping timesteps. "
-            "The blended action is old_ratio * old + (1 - old_ratio) * new."
+            "The blended action is old_ratio * old + (1 - old_ratio) * new. Defaults to 0.8 "
+            "to favor already queued targets."
         ),
     )
     return parser.parse_args()
@@ -305,10 +307,6 @@ def default_run_name(args: argparse.Namespace) -> str:
     )
 
 
-def format_optional_seconds(value: float | None) -> str:
-    return "None" if value is None else f"{value:.3f}s"
-
-
 class FrankaPolicyExecutor:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -324,6 +322,14 @@ class FrankaPolicyExecutor:
                 "train/franka_diffusion_policy_executor.py only supports diffusion checkpoints, "
                 f"got {self.policy_type!r}."
             )
+        self.policy_config = local_policy_config
+        self.n_obs_steps = (
+            int(local_policy_config.get("n_obs_steps", 1))
+            if local_policy_config is not None
+            else None
+        )
+        self.min_history_for_inference = max(int(self.n_obs_steps or 2), 1)
+        self.observation_history_debug = deque(maxlen=self.min_history_for_inference)
 
         if args.actions_per_chunk <= 0:
             raise ValueError(f"--actions-per-chunk must be positive, got {args.actions_per_chunk}")
@@ -383,7 +389,6 @@ class FrankaPolicyExecutor:
         self.command_socket = None
         self.bridge_active = False
         self.latest_executed_timestep = -1
-        self.must_go_pending = True
         self.action_chunk_size = max(1, self.actions_per_chunk)
         self.inflight_observation_timestep: int | None = None
         self.log_file = None
@@ -391,6 +396,7 @@ class FrankaPolicyExecutor:
         self.log_started_monotonic = time.perf_counter()
         self.inflight_observation_sent_monotonic: float | None = None
         self.latest_streamed_observation_timestep = -1
+        self.last_sent_camera_bundle_sequence: int | None = None
         self.last_executed_action_array: np.ndarray | None = None
         self.last_executed_state_array: np.ndarray | None = None
         self.last_executed_wall_time: float | None = None
@@ -451,6 +457,76 @@ class FrankaPolicyExecutor:
         with self.inflight_observation_lock:
             return self.inflight_observation_timestep
 
+    def _packet_observation_debug(self, current_packet: dict[str, Any]) -> dict[str, Any]:
+        camera_stamps_s = {
+            camera_name: current_packet["cameras"][camera_name].get("stamp_s")
+            for camera_name in current_packet["camera_names"]
+        }
+        return {
+            "observation_timestep": self.latest_streamed_observation_timestep,
+            "observation_timestamp": time.time(),
+            "bridge_publish_s": current_packet.get("bridge_publish_s"),
+            "robot_state": np.asarray(current_packet["state"], dtype=float).tolist(),
+            "camera_names": list(current_packet["camera_names"]),
+            "camera_stamps_s": camera_stamps_s,
+            "camera_freshness": current_packet.get("camera_freshness"),
+            "camera_sync": current_packet.get("camera_sync"),
+        }
+
+    def _history_quality_summary(self) -> dict[str, Any]:
+        history = list(self.observation_history_debug)
+        required = self.min_history_for_inference
+        summary: dict[str, Any] = {
+            "history_len": len(history),
+            "required_history_len": required,
+            "ready": True,
+            "reasons": [],
+            "repeated_cameras": [],
+            "max_camera_age_s": None,
+            "camera_stamp_deltas_s": {},
+        }
+
+        if len(history) < required:
+            summary["ready"] = False
+            summary["reasons"].append("insufficient_history")
+            return summary
+
+        window = history[-required:]
+        max_camera_age = 0.0
+        for item in window:
+            freshness = item.get("camera_freshness") or {}
+            for camera_name, camera_info in freshness.items():
+                if not isinstance(camera_info, dict):
+                    continue
+                age = camera_info.get("age_s")
+                if age is None:
+                    continue
+                age = float(age)
+                max_camera_age = max(max_camera_age, age)
+        summary["max_camera_age_s"] = max_camera_age
+
+        first = window[0]
+        last = window[-1]
+        camera_names = sorted(
+            set(first.get("camera_stamps_s") or {}) | set(last.get("camera_stamps_s") or {})
+        )
+        repeated_cameras = []
+        stamp_deltas = {}
+        for camera_name in camera_names:
+            first_stamp = (first.get("camera_stamps_s") or {}).get(camera_name)
+            last_stamp = (last.get("camera_stamps_s") or {}).get(camera_name)
+            if first_stamp is not None and last_stamp is not None:
+                delta = float(last_stamp) - float(first_stamp)
+                stamp_deltas[camera_name] = delta
+                if abs(delta) < 1e-6:
+                    repeated_cameras.append(camera_name)
+        summary["camera_stamp_deltas_s"] = stamp_deltas
+        summary["repeated_cameras"] = repeated_cameras
+        if repeated_cameras:
+            summary["reasons"].append("repeated_camera_warn_only")
+
+        return summary
+
     def _init_log(self, first_packet: dict[str, Any], dataset_action_dim: int) -> None:
         run_name = self.args.run_name or default_run_name(self.args)
         log_dir = self.args.log_dir.expanduser().resolve() / run_name
@@ -473,6 +549,11 @@ class FrankaPolicyExecutor:
             "aggregate_ratio_old": self.aggregate_ratio_old,
             "diffusion_chunk_size_threshold": self.args.diffusion_chunk_size_threshold,
             "diffusion_aggregate_ratio_old": self.args.diffusion_aggregate_ratio_old,
+            "diffusion_observation_streaming": True,
+            "policy_n_obs_steps": self.n_obs_steps,
+            "diffusion_min_history_for_inference": self.min_history_for_inference,
+            "diffusion_require_full_observation_history": True,
+            "diffusion_repeated_camera_history_warn_only": True,
             "fps": self.args.fps,
             "task": self.args.task,
             "execute": self.args.execute,
@@ -503,11 +584,29 @@ class FrankaPolicyExecutor:
                 self.log_file.close()
                 self.log_file = None
 
+    def _observation_debug_metadata(
+        self,
+        observation: TimedObservation,
+        current_packet: dict[str, Any],
+    ) -> dict[str, Any]:
+        debug = self._packet_observation_debug(current_packet)
+        debug.update(
+            {
+                "observation_timestep": observation.get_timestep(),
+                "action_anchor_timestep": getattr(observation, "action_timestep", None),
+                "observation_timestamp": observation.get_timestamp(),
+                "must_go": observation.must_go,
+                "executor_send_s": time.time(),
+            }
+        )
+        return debug
+
     def _log_observation_sent(
         self,
         observation: TimedObservation,
         current_packet: dict[str, Any],
         queue_snapshot: dict[str, Any],
+        dropped_zmq_packets: int = 0,
     ) -> None:
         executor_receive_s = time.time()
         camera_stamps_s = {
@@ -529,6 +628,7 @@ class FrankaPolicyExecutor:
                 "queue": queue_snapshot,
                 "inflight_observation_timestep": self._get_inflight_observation_timestep(),
                 "latest_executed_timestep": self.latest_executed_timestep,
+                "dropped_zmq_packets": dropped_zmq_packets,
                 "executor_receive_s": executor_receive_s,
                 "bridge_publish_s": bridge_publish_s,
                 "bridge_to_executor_s": (
@@ -539,8 +639,50 @@ class FrankaPolicyExecutor:
                 "camera_stamps_s": camera_stamps_s,
                 "executor_wall_minus_camera_stamp_s": camera_wall_age_s,
                 "camera_freshness": current_packet.get("camera_freshness"),
+                "camera_sync": current_packet.get("camera_sync"),
+                "diffusion_history_quality": getattr(
+                    observation,
+                    "diffusion_history_quality",
+                    None,
+                ),
             }
         )
+
+    def _log_observation_skipped(
+        self,
+        current_packet: dict[str, Any],
+        queue_snapshot: dict[str, Any],
+        dropped_zmq_packets: int = 0,
+    ) -> None:
+        camera_sync = current_packet.get("camera_sync") or {}
+        self._write_log_record(
+            {
+                "event": "observation_skipped",
+                "reason": "camera_bundle_not_new",
+                "queue": queue_snapshot,
+                "latest_executed_timestep": self.latest_executed_timestep,
+                "dropped_zmq_packets": dropped_zmq_packets,
+                "camera_bundle_sequence": camera_sync.get("bundle_sequence"),
+                "camera_bundle_new": camera_sync.get("bundle_new"),
+                "camera_bundle_reuse_reason": camera_sync.get("bundle_reuse_reason"),
+                "camera_sync": camera_sync,
+                "bridge_publish_s": current_packet.get("bridge_publish_s"),
+            }
+        )
+
+    def _packet_has_new_camera_bundle(self, packet: dict[str, Any]) -> bool:
+        camera_sync = packet.get("camera_sync")
+        if not isinstance(camera_sync, dict):
+            return True
+
+        bundle_sequence = camera_sync.get("bundle_sequence")
+        if bundle_sequence is None:
+            return True
+        if not camera_sync.get("bundle_ready", True):
+            return False
+
+        bundle_sequence = int(bundle_sequence)
+        return bundle_sequence != self.last_sent_camera_bundle_sequence
 
     def _log_action_received(
         self,
@@ -617,14 +759,6 @@ class FrankaPolicyExecutor:
                 "reason": "all incoming actions were already executed",
             }
         )
-        print(
-            "[TIMING] chunk filtered "
-            f"inflight={cleared_inflight_timestep} "
-            f"latency={format_optional_seconds(inflight_latency_s)} "
-            f"incoming={incoming_timesteps[:1]}..{incoming_timesteps[-1:] if incoming_timesteps else []} "
-            f"latest_executed={self.latest_executed_timestep}"
-        )
-
     def _log_action_executed(
         self,
         action: TimedAction,
@@ -733,7 +867,17 @@ class FrankaPolicyExecutor:
             device=self.args.policy_device,
         )
         self.stub.Ready(self.services_pb2.Empty())
-        self.stub.SendPolicyInstructions(self.services_pb2.PolicySetup(data=pickle.dumps(policy_config)))  # nosec
+        try:
+            self.stub.SendPolicyInstructions(self.services_pb2.PolicySetup(data=pickle.dumps(policy_config)))  # nosec
+        except self.grpc.RpcError as exc:
+            details = exc.details() if hasattr(exc, "details") else str(exc)
+            raise RuntimeError(
+                "Policy server rejected the deployment setup. "
+                f"Server details: {details}\n"
+                "For diffusion checkpoints, --actions-per-chunk must not exceed the policy's "
+                "configured n_action_steps. For a horizon=32, n_obs_steps=2 policy, the maximum "
+                "usable chunk is 32 - 2 + 1 = 31."
+            ) from exc
 
     def send_observation(self, observation: TimedObservation) -> None:
         observation_bytes = pickle.dumps(observation)  # nosec
@@ -745,9 +889,6 @@ class FrankaPolicyExecutor:
         )
         self.stub.SendObservations(request_iterator)
 
-    def _ready_to_send_observation(self) -> bool:
-        return True
-
     def _make_stream_observation_timestep(self) -> int:
         self.latest_streamed_observation_timestep = max(
             self.latest_streamed_observation_timestep + 1,
@@ -755,8 +896,15 @@ class FrankaPolicyExecutor:
         )
         return self.latest_streamed_observation_timestep
 
-    def _prepare_diffusion_observation_send(self) -> tuple[int, int | None, dict[str, Any], bool]:
+    def _prepare_diffusion_observation_send(
+        self,
+        current_packet: dict[str, Any],
+    ) -> tuple[int, int | None, dict[str, Any], bool, dict[str, Any]]:
         stream_timestep = self._make_stream_observation_timestep()
+        packet_debug = self._packet_observation_debug(current_packet)
+        packet_debug["observation_timestep"] = stream_timestep
+        self.observation_history_debug.append(packet_debug)
+        history_quality = self._history_quality_summary()
         action_anchor_timestep = None
         with self.inflight_observation_lock:
             with self.action_queue_lock:
@@ -765,12 +913,13 @@ class FrankaPolicyExecutor:
                 must_go = (
                     queue_fraction <= self.chunk_size_threshold
                     and self.inflight_observation_timestep is None
+                    and history_quality["ready"]
                 )
                 if must_go:
                     action_anchor_timestep = self._next_action_anchor_timestep_unlocked()
                     self.inflight_observation_timestep = action_anchor_timestep
                     self.inflight_observation_sent_monotonic = time.perf_counter()
-        return stream_timestep, action_anchor_timestep, queue_snapshot, must_go
+        return stream_timestep, action_anchor_timestep, queue_snapshot, must_go, history_quality
 
     def _aggregate_action_queue(self, incoming_actions: list[TimedAction]) -> dict[str, Any]:
         with self.action_queue_lock:
@@ -815,8 +964,6 @@ class FrankaPolicyExecutor:
                     current_queue.pop(timestep, None)
 
             ordered_timesteps = sorted(current_queue)
-            if len(ordered_timesteps) != len(set(ordered_timesteps)):
-                print(f"[WARN] duplicate timesteps remained in action queue: {ordered_timesteps}")
             self.action_queue = deque(current_queue[timestep] for timestep in ordered_timesteps)
             ordered_actions = [
                 np.asarray(current_queue[timestep].get_action(), dtype=float)
@@ -850,10 +997,6 @@ class FrankaPolicyExecutor:
                                 "latest_executed_timestep": self.latest_executed_timestep,
                             }
                         )
-                        print(
-                            "[TIMING] action request timeout "
-                            f"inflight={cleared_timestep} latency={format_optional_seconds(latency_s)}"
-                        )
                     continue
 
                 incoming_actions: list[TimedAction] = pickle.loads(response.data)  # nosec
@@ -885,21 +1028,6 @@ class FrankaPolicyExecutor:
                     inflight_latency_s,
                 )
                 self._log_action_queue_updated(incoming_actions, filtered, aggregate_stats)
-                incoming_timesteps = [action.get_timestep() for action in incoming_actions]
-                filtered_timesteps = [action.get_timestep() for action in filtered]
-                print(
-                    "[TIMING] chunk received "
-                    f"inflight={cleared_inflight_timestep} "
-                    f"latency={format_optional_seconds(inflight_latency_s)} "
-                    f"incoming={incoming_timesteps[0]}..{incoming_timesteps[-1]} "
-                    f"filtered={filtered_timesteps[0]}..{filtered_timesteps[-1]} "
-                    f"added={aggregate_stats['added']} "
-                    f"blended={aggregate_stats['blended']} "
-                    f"dropped={aggregate_stats['dropped']} "
-                    f"queue={aggregate_stats['first_timestep']}..{aggregate_stats['last_timestep']} "
-                    f"latest_executed={self.latest_executed_timestep}"
-                )
-                self.must_go_pending = True
             except self.grpc.RpcError:
                 cleared_timestep, latency_s = self._clear_observation_inflight()
                 if cleared_timestep is not None:
@@ -911,13 +1039,9 @@ class FrankaPolicyExecutor:
                             "latest_executed_timestep": self.latest_executed_timestep,
                         }
                     )
-                    print(
-                        "[TIMING] action request RPC error "
-                        f"inflight={cleared_timestep} latency={format_optional_seconds(latency_s)}"
-                    )
                 time.sleep(0.05)
             except Exception as exc:  # pragma: no cover
-                print(f"Action receiver error: {exc}")
+                self._write_log_record({"event": "action_receiver_error", "error": repr(exc)})
                 time.sleep(0.05)
 
     def setup_command_bridge(self, zmq_context: Any) -> None:
@@ -927,6 +1051,17 @@ class FrankaPolicyExecutor:
         self.command_socket.setsockopt(import_zmq_runtime().SNDHWM, 1)
         self.command_socket.connect(f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}")
         print("Bridge command backend:", f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}")
+
+    def _recv_latest_packet(self, socket: Any) -> tuple[dict[str, Any], int]:
+        zmq = import_zmq_runtime()
+        packet = socket.recv_pyobj()
+        dropped = 0
+        while True:
+            try:
+                packet = socket.recv_pyobj(flags=zmq.NOBLOCK)
+                dropped += 1
+            except zmq.Again:
+                return packet, dropped
 
     def _command_payload_from_action(self, action: TimedAction) -> dict[str, Any]:
         split = split_action(np.asarray(action.get_action(), dtype=float))
@@ -978,52 +1113,64 @@ class FrankaPolicyExecutor:
         print(f"actions_per_chunk: {self.actions_per_chunk}")
         print(f"chunk_size_threshold: {self.chunk_size_threshold}")
         print(f"aggregate_ratio_old: {self.aggregate_ratio_old}")
+        print("observation_streaming: True")
+        print(f"policy_n_obs_steps: {self.n_obs_steps}")
+        print(f"min_history_for_inference: {self.min_history_for_inference}")
+        print("require_full_observation_history: True")
         print(f"execute: {self.args.execute}")
 
         context = zmq.Context()
-        self._set_bridge_active(True)
-        print("Waiting for the first ZMQ packet to infer live observation features...")
-
         socket = context.socket(zmq.SUB)
-        socket.connect(f"tcp://{self.args.zmq_host}:{self.args.zmq_port}")
-        socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        socket.setsockopt(zmq.RCVTIMEO, 100)
-
-        first_packet = None
-        while first_packet is None:
-            try:
-                first_packet = socket.recv_pyobj()
-            except zmq.Again:
-                continue
-
-        print("Received first packet from live bridge.")
-        print(
-            f"state_dim={first_packet['robot_state_dim']}, action_dim={first_packet['action_dim']}, "
-            f"cameras={list(first_packet['camera_names'])}"
-        )
-        if int(first_packet["action_dim"]) != dataset_action_dim:
-            raise ValueError(
-                f"Live bridge action_dim={first_packet['action_dim']} does not match dataset action_dim={dataset_action_dim}."
-            )
-
-        self._init_log(first_packet, dataset_action_dim)
-        self.connect_policy_server(first_packet)
-        self.setup_command_bridge(context)
-        receiver_thread = threading.Thread(target=self.receive_actions, daemon=True)
-        receiver_thread.start()
-
-        current_packet = first_packet
+        receiver_thread = None
         try:
-            while not self.shutdown_event.is_set():
-                loop_start = time.perf_counter()
+            self._set_bridge_active(True)
+            print("Waiting for the first ZMQ packet to infer live observation features...")
+
+            socket.setsockopt(zmq.RCVHWM, 1)
+            socket.setsockopt(zmq.CONFLATE, 1)
+            socket.connect(f"tcp://{self.args.zmq_host}:{self.args.zmq_port}")
+            socket.setsockopt_string(zmq.SUBSCRIBE, "")
+            socket.setsockopt(zmq.RCVTIMEO, 100)
+
+            first_packet = None
+            while first_packet is None:
                 try:
-                    current_packet = socket.recv_pyobj()
+                    first_packet = socket.recv_pyobj()
                 except zmq.Again:
                     continue
 
-                if self._ready_to_send_observation():
-                    observation_timestep, action_anchor_timestep, queue_snapshot, must_go = (
-                        self._prepare_diffusion_observation_send()
+            print("Received first packet from live bridge.")
+            print(
+                f"state_dim={first_packet['robot_state_dim']}, action_dim={first_packet['action_dim']}, "
+                f"cameras={list(first_packet['camera_names'])}"
+            )
+            if int(first_packet["action_dim"]) != dataset_action_dim:
+                raise ValueError(
+                    f"Live bridge action_dim={first_packet['action_dim']} does not match dataset action_dim={dataset_action_dim}."
+                )
+
+            self._init_log(first_packet, dataset_action_dim)
+            self.connect_policy_server(first_packet)
+            self.setup_command_bridge(context)
+            receiver_thread = threading.Thread(target=self.receive_actions, daemon=True)
+            receiver_thread.start()
+
+            while not self.shutdown_event.is_set():
+                loop_start = time.perf_counter()
+                try:
+                    current_packet, dropped_zmq_packets = self._recv_latest_packet(socket)
+                except zmq.Again:
+                    continue
+
+                if self._packet_has_new_camera_bundle(current_packet):
+                    (
+                        observation_timestep,
+                        action_anchor_timestep,
+                        queue_snapshot,
+                        must_go,
+                        history_quality,
+                    ) = (
+                        self._prepare_diffusion_observation_send(current_packet)
                     )
                     observation = TimedObservation(
                         timestamp=time.time(),
@@ -1031,41 +1178,41 @@ class FrankaPolicyExecutor:
                         timestep=observation_timestep,
                         must_go=must_go,
                     )
+                    observation.diffusion_history_quality = history_quality
                     if action_anchor_timestep is not None:
                         observation.action_timestep = action_anchor_timestep
+                    observation.deployment_debug = self._observation_debug_metadata(
+                        observation,
+                        current_packet,
+                    )
                     try:
                         self.send_observation(observation)
-                        self._log_observation_sent(observation, current_packet, queue_snapshot)
+                        camera_sync = current_packet.get("camera_sync") or {}
+                        bundle_sequence = camera_sync.get("bundle_sequence")
+                        if bundle_sequence is not None:
+                            self.last_sent_camera_bundle_sequence = int(bundle_sequence)
+                        self._log_observation_sent(
+                            observation,
+                            current_packet,
+                            queue_snapshot,
+                            dropped_zmq_packets=dropped_zmq_packets,
+                        )
                     except Exception:
                         self._clear_observation_inflight()
                         raise
-                    print(
-                        "[TIMING] observation sent "
-                        f"timestep={observation_timestep} "
-                        f"queue_size={queue_snapshot['size']} "
-                        f"queue={queue_snapshot['first_timestep']}..{queue_snapshot['last_timestep']} "
-                        f"latest_executed={self.latest_executed_timestep} "
-                        f"must_go={observation.must_go} "
-                        f"action_anchor={action_anchor_timestep}"
+                else:
+                    queue_snapshot = self._queue_snapshot()
+                    self._log_observation_skipped(
+                        current_packet,
+                        queue_snapshot,
+                        dropped_zmq_packets=dropped_zmq_packets,
                     )
-                    self.must_go_pending = False
 
                 action, queue_before_pop, queue_after_pop = self.maybe_pop_action()
                 if action is not None:
                     payload = self._command_payload_from_action(action)
                     if self.args.execute:
                         self._send_bridge_command(payload)
-                    else:
-                        print(
-                            "Predicted action:",
-                            {
-                                "timestep": action.get_timestep(),
-                                "left_arm": np.round(np.asarray(split_action(action.get_action())["left_arm"]), 4).tolist(),
-                                "left_gripper": np.round(np.asarray(split_action(action.get_action())["left_gripper"]), 4).tolist(),
-                                "right_arm": np.round(np.asarray(split_action(action.get_action())["right_arm"]), 4).tolist(),
-                                "right_gripper": np.round(np.asarray(split_action(action.get_action())["right_gripper"]), 4).tolist(),
-                            },
-                        )
                     self._log_action_executed(
                         action,
                         current_packet,
@@ -1081,7 +1228,8 @@ class FrankaPolicyExecutor:
         finally:
             self.shutdown_event.set()
             self.channel.close()
-            receiver_thread.join(timeout=1.0)
+            if receiver_thread is not None:
+                receiver_thread.join(timeout=1.0)
             self._set_bridge_active(False)
             if self.command_socket is not None:
                 self.command_socket.close(0)

@@ -53,20 +53,26 @@ def import_zmq_runtime():
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Robot-side Franka executor for a remote LeRobot policy server."
+        description="Robot-side Franka executor for a remote ACT LeRobot policy server."
     )
     parser.add_argument("--policy-path", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--server-address", default="127.0.0.1:8080")
     parser.add_argument("--policy-device", default="cuda")
-    parser.add_argument("--policy-type", default=None)
-    parser.add_argument("--actions-per-chunk", type=int, default=None)
+    parser.add_argument(
+        "--actions-per-chunk",
+        type=int,
+        default=None,
+        help=(
+            "Number of actions to request per deployment chunk. Defaults to the checkpoint chunk size."
+        ),
+    )
     parser.add_argument("--zmq-host", default="127.0.0.1")
     parser.add_argument("--zmq-port", type=int, default=5555)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--task", default="pick and place")
     parser.add_argument(
-        "--chunk-size-threshold",
+        "--act-chunk-size-threshold",
         type=float,
         default=0.9,
         help=(
@@ -91,11 +97,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional deployment log run name. Defaults to a timestamp plus policy/chunk settings.",
     )
     parser.add_argument(
-        "--aggregate-ration-old",
+        "--act-aggregate-ratio-old",
         type=float,
         default=0.8,
         help=(
-            "Weight assigned to the queued action when aggregating overlapping timesteps. "
+            "ACT-only weight assigned to the queued action when aggregating overlapping timesteps. "
             "The blended action is old_ratio * old + (1 - old_ratio) * new."
         ),
     )
@@ -204,15 +210,13 @@ def json_safe(value: Any) -> Any:
 def default_run_name(args: argparse.Namespace) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     policy_name = args.policy_path.expanduser().name
+    threshold = args.act_chunk_size_threshold
+    aggregate_ratio = args.act_aggregate_ratio_old
     return (
-        f"{timestamp}_{policy_name}_{args.policy_type or 'auto'}"
+        f"{timestamp}_{policy_name}_act"
         f"_apc{args.actions_per_chunk or 'auto'}"
-        f"_thr{args.chunk_size_threshold:g}_{args.aggregate_ration_old}"
+        f"_thr{threshold:g}_{aggregate_ratio}"
     )
-
-
-def format_optional_seconds(value: float | None) -> str:
-    return "None" if value is None else f"{value:.3f}s"
 
 
 class FrankaPolicyExecutor:
@@ -221,17 +225,18 @@ class FrankaPolicyExecutor:
         self.policy_path = args.policy_path.expanduser()
         self.dataset_root = args.dataset_root.resolve()
         local_policy_config = maybe_load_policy_config(self.policy_path)
-        if args.policy_type is not None:
-            self.policy_type = args.policy_type
-        elif local_policy_config is not None:
+        if local_policy_config is not None:
             self.policy_type = infer_policy_type(self.policy_path)
         else:
-            raise FileNotFoundError(
-                "Could not find a local policy config.json for --policy-path. "
-                "Pass --policy-type explicitly when the checkpoint only exists on the server."
+            self.policy_type = "act"
+        if self.policy_type != "act":
+            raise ValueError(
+                f"train/franka_act_policy_executor.py only supports ACT checkpoints, got {self.policy_type!r}."
             )
 
         if args.actions_per_chunk is not None:
+            if args.actions_per_chunk <= 0:
+                raise ValueError(f"--actions-per-chunk must be positive, got {args.actions_per_chunk}")
             self.actions_per_chunk = args.actions_per_chunk
         elif local_policy_config is not None:
             self.actions_per_chunk = infer_actions_per_chunk(self.policy_path, self.policy_type)
@@ -241,14 +246,26 @@ class FrankaPolicyExecutor:
                 "Pass --actions-per-chunk explicitly when the checkpoint only exists on the server."
             )
 
-        if not 0.0 <= args.chunk_size_threshold <= 1.0:
-            raise ValueError(f"--chunk-size-threshold must be between 0 and 1, got {args.chunk_size_threshold}")
-        if not 0.0 <= args.aggregate_ration_old <= 1.0:
-            raise ValueError(
-                f"--aggregate-ration-old must be between 0 and 1, got {args.aggregate_ration_old}"
-            )
+        if args.actions_per_chunk is not None and local_policy_config is not None:
+            max_actions_per_chunk = infer_actions_per_chunk(self.policy_path, self.policy_type)
+            if self.actions_per_chunk > max_actions_per_chunk:
+                raise ValueError(
+                    f"--actions-per-chunk ({self.actions_per_chunk}) cannot exceed the policy maximum "
+                    f"chunk size ({max_actions_per_chunk})."
+                )
 
-        self.aggregate_fn = get_aggregate_function(args.aggregate_ration_old)
+        if not 0.0 <= args.act_chunk_size_threshold <= 1.0:
+            raise ValueError(
+                f"--act-chunk-size-threshold must be between 0 and 1, got {args.act_chunk_size_threshold}"
+            )
+        if not 0.0 <= args.act_aggregate_ratio_old <= 1.0:
+            raise ValueError(
+                f"--act-aggregate-ratio-old must be between 0 and 1, got {args.act_aggregate_ratio_old}"
+            )
+        self.chunk_size_threshold = args.act_chunk_size_threshold
+        self.aggregate_ratio_old = args.act_aggregate_ratio_old
+
+        self.aggregate_fn = get_aggregate_function(self.aggregate_ratio_old)
         self.dataset_info = load_json(self.dataset_root / INFO_REL_PATH)
         action_config_path = self.dataset_root / ACTION_CONFIG_REL_PATH
         if not action_config_path.exists():
@@ -288,6 +305,7 @@ class FrankaPolicyExecutor:
         self.log_path: Path | None = None
         self.log_started_monotonic = time.perf_counter()
         self.inflight_observation_sent_monotonic: float | None = None
+        self.latest_streamed_observation_timestep = -1
 
     def _arm_action_representation(self) -> str:
         return str(
@@ -321,6 +339,11 @@ class FrankaPolicyExecutor:
                 return self.action_queue[0].get_timestep(), queue_snapshot
 
         return max(self.latest_executed_timestep + 1, 0), queue_snapshot
+
+    def _next_action_anchor_timestep_unlocked(self) -> int:
+        if self.action_queue:
+            return self.action_queue[0].get_timestep()
+        return max(self.latest_executed_timestep + 1, 0)
 
     def _mark_observation_inflight(self, timestep: int) -> None:
         with self.inflight_observation_lock:
@@ -358,8 +381,10 @@ class FrankaPolicyExecutor:
             "live_action_dim": int(first_packet["action_dim"]),
             "camera_names": list(first_packet["camera_names"]),
             "actions_per_chunk": self.actions_per_chunk,
-            "chunk_size_threshold": self.args.chunk_size_threshold,
-            "aggregate_ration_old": self.args.aggregate_ration_old,
+            "chunk_size_threshold": self.chunk_size_threshold,
+            "aggregate_ratio_old": self.aggregate_ratio_old,
+            "act_chunk_size_threshold": self.args.act_chunk_size_threshold,
+            "act_aggregate_ratio_old": self.args.act_aggregate_ratio_old,
             "fps": self.args.fps,
             "task": self.args.task,
             "execute": self.args.execute,
@@ -395,7 +420,19 @@ class FrankaPolicyExecutor:
         observation: TimedObservation,
         current_packet: dict[str, Any],
         queue_snapshot: dict[str, Any],
+        dropped_zmq_packets: int = 0,
     ) -> None:
+        executor_receive_s = time.time()
+        camera_stamps_s = {
+            camera_name: current_packet["cameras"][camera_name].get("stamp_s")
+            for camera_name in current_packet["camera_names"]
+        }
+        bridge_publish_s = current_packet.get("bridge_publish_s")
+        camera_wall_age_s = {
+            camera_name: executor_receive_s - stamp_s
+            for camera_name, stamp_s in camera_stamps_s.items()
+            if stamp_s is not None
+        }
         self._write_log_record(
             {
                 "event": "observation_sent",
@@ -404,12 +441,18 @@ class FrankaPolicyExecutor:
                 "queue": queue_snapshot,
                 "inflight_observation_timestep": self._get_inflight_observation_timestep(),
                 "latest_executed_timestep": self.latest_executed_timestep,
+                "dropped_zmq_packets": dropped_zmq_packets,
+                "executor_receive_s": executor_receive_s,
+                "bridge_publish_s": bridge_publish_s,
+                "bridge_to_executor_s": (
+                    executor_receive_s - bridge_publish_s if bridge_publish_s is not None else None
+                ),
                 "robot_state": np.asarray(current_packet["state"], dtype=float).tolist(),
                 "bridge_action": np.asarray(current_packet.get("action", []), dtype=float).tolist(),
-                "camera_stamps_s": {
-                    camera_name: current_packet["cameras"][camera_name].get("stamp_s")
-                    for camera_name in current_packet["camera_names"]
-                },
+                "camera_stamps_s": camera_stamps_s,
+                "executor_wall_minus_camera_stamp_s": camera_wall_age_s,
+                "camera_freshness": current_packet.get("camera_freshness"),
+                "camera_sync": current_packet.get("camera_sync"),
             }
         )
 
@@ -461,14 +504,6 @@ class FrankaPolicyExecutor:
                 "reason": "all incoming actions were already executed",
             }
         )
-        print(
-            "[TIMING] chunk filtered "
-            f"inflight={cleared_inflight_timestep} "
-            f"latency={format_optional_seconds(inflight_latency_s)} "
-            f"incoming={incoming_timesteps[:1]}..{incoming_timesteps[-1:] if incoming_timesteps else []} "
-            f"latest_executed={self.latest_executed_timestep}"
-        )
-
     def _log_action_executed(
         self,
         action: TimedAction,
@@ -574,36 +609,44 @@ class FrankaPolicyExecutor:
 
         with self.action_queue_lock:
             queue_fraction = len(self.action_queue) / float(max(self.action_chunk_size, 1))
-        return queue_fraction <= self.args.chunk_size_threshold
+        return queue_fraction <= self.chunk_size_threshold
 
     def _aggregate_action_queue(self, incoming_actions: list[TimedAction]) -> dict[str, Any]:
         with self.action_queue_lock:
             current_queue = {action.get_timestep(): action for action in self.action_queue}
+            latest_executed_timestep = self.latest_executed_timestep
 
-        added = 0
-        blended = 0
-        dropped = 0
-        for new_action in incoming_actions:
-            timestep = new_action.get_timestep()
-            if timestep <= self.latest_executed_timestep:
-                dropped += 1
-                continue
+            added = 0
+            blended = 0
+            dropped = 0
+            for new_action in incoming_actions:
+                timestep = new_action.get_timestep()
+                if timestep <= latest_executed_timestep:
+                    dropped += 1
+                    continue
 
-            if timestep not in current_queue:
+                if timestep not in current_queue:
+                    current_queue[timestep] = new_action
+                    added += 1
+                    continue
+
+                old_action = current_queue[timestep]
+                old_tensor = torch.as_tensor(np.asarray(old_action.get_action(), dtype=np.float32))
+                new_tensor = torch.as_tensor(np.asarray(new_action.get_action(), dtype=np.float32))
+                blended_tensor = self.aggregate_fn(old_tensor, new_tensor)
+                new_action.action = blended_tensor.detach().cpu().numpy()
                 current_queue[timestep] = new_action
-                added += 1
-                continue
+                blended += 1
 
-            old_action = current_queue[timestep]
-            old_tensor = torch.as_tensor(np.asarray(old_action.get_action(), dtype=np.float32))
-            new_tensor = torch.as_tensor(np.asarray(new_action.get_action(), dtype=np.float32))
-            blended_tensor = self.aggregate_fn(old_tensor, new_tensor)
-            new_action.action = blended_tensor.detach().cpu().numpy()
-            current_queue[timestep] = new_action
-            blended += 1
+            # Drop any stale timesteps again while still holding the queue lock, so an action
+            # executed concurrently with chunk reception cannot be reinserted into the queue.
+            stale_timesteps = [timestep for timestep in current_queue if timestep <= self.latest_executed_timestep]
+            if stale_timesteps:
+                dropped += len(stale_timesteps)
+                for timestep in stale_timesteps:
+                    current_queue.pop(timestep, None)
 
-        ordered_timesteps = sorted(current_queue)
-        with self.action_queue_lock:
+            ordered_timesteps = sorted(current_queue)
             self.action_queue = deque(current_queue[timestep] for timestep in ordered_timesteps)
 
         return {
@@ -629,10 +672,6 @@ class FrankaPolicyExecutor:
                                 "inflight_latency_s": latency_s,
                                 "latest_executed_timestep": self.latest_executed_timestep,
                             }
-                        )
-                        print(
-                            "[TIMING] action request timeout "
-                            f"inflight={cleared_timestep} latency={format_optional_seconds(latency_s)}"
                         )
                     continue
 
@@ -664,20 +703,6 @@ class FrankaPolicyExecutor:
                     cleared_inflight_timestep,
                     inflight_latency_s,
                 )
-                incoming_timesteps = [action.get_timestep() for action in incoming_actions]
-                filtered_timesteps = [action.get_timestep() for action in filtered]
-                print(
-                    "[TIMING] chunk received "
-                    f"inflight={cleared_inflight_timestep} "
-                    f"latency={format_optional_seconds(inflight_latency_s)} "
-                    f"incoming={incoming_timesteps[0]}..{incoming_timesteps[-1]} "
-                    f"filtered={filtered_timesteps[0]}..{filtered_timesteps[-1]} "
-                    f"added={aggregate_stats['added']} "
-                    f"blended={aggregate_stats['blended']} "
-                    f"dropped={aggregate_stats['dropped']} "
-                    f"queue={aggregate_stats['first_timestep']}..{aggregate_stats['last_timestep']} "
-                    f"latest_executed={self.latest_executed_timestep}"
-                )
                 self.must_go_pending = True
             except self.grpc.RpcError:
                 cleared_timestep, latency_s = self._clear_observation_inflight()
@@ -690,13 +715,9 @@ class FrankaPolicyExecutor:
                             "latest_executed_timestep": self.latest_executed_timestep,
                         }
                     )
-                    print(
-                        "[TIMING] action request RPC error "
-                        f"inflight={cleared_timestep} latency={format_optional_seconds(latency_s)}"
-                    )
                 time.sleep(0.05)
             except Exception as exc:  # pragma: no cover
-                print(f"Action receiver error: {exc}")
+                self._write_log_record({"event": "action_receiver_error", "error": repr(exc)})
                 time.sleep(0.05)
 
     def setup_command_bridge(self, zmq_context: Any) -> None:
@@ -706,6 +727,17 @@ class FrankaPolicyExecutor:
         self.command_socket.setsockopt(import_zmq_runtime().SNDHWM, 1)
         self.command_socket.connect(f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}")
         print("Bridge command backend:", f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}")
+
+    def _recv_latest_packet(self, socket: Any) -> tuple[dict[str, Any], int]:
+        zmq = import_zmq_runtime()
+        packet = socket.recv_pyobj()
+        dropped = 0
+        while True:
+            try:
+                packet = socket.recv_pyobj(flags=zmq.NOBLOCK)
+                dropped += 1
+            except zmq.Again:
+                return packet, dropped
 
     def _command_payload_from_action(self, action: TimedAction) -> dict[str, Any]:
         split = split_action(np.asarray(action.get_action(), dtype=float))
@@ -733,8 +765,8 @@ class FrankaPolicyExecutor:
             if not self.action_queue:
                 return None, queue_before, queue_before
             action = self.action_queue.popleft()
+            self.latest_executed_timestep = action.get_timestep()
             queue_after = self._queue_snapshot_unlocked()
-        self.latest_executed_timestep = action.get_timestep()
         return action, queue_before, queue_after
 
     def _queue_snapshot_unlocked(self) -> dict[str, Any]:
@@ -755,8 +787,8 @@ class FrankaPolicyExecutor:
         print(f"server_address: {self.args.server_address}")
         print(f"dataset_action_dim: {dataset_action_dim}")
         print(f"actions_per_chunk: {self.actions_per_chunk}")
-        print(f"chunk_size_threshold: {self.args.chunk_size_threshold}")
-        print(f"aggregate_ration_old: {self.args.aggregate_ration_old}")
+        print(f"chunk_size_threshold: {self.chunk_size_threshold}")
+        print(f"aggregate_ratio_old: {self.aggregate_ratio_old}")
         print(f"execute: {self.args.execute}")
 
         context = zmq.Context()
@@ -764,6 +796,8 @@ class FrankaPolicyExecutor:
         print("Waiting for the first ZMQ packet to infer live observation features...")
 
         socket = context.socket(zmq.SUB)
+        socket.setsockopt(zmq.RCVHWM, 1)
+        socket.setsockopt(zmq.CONFLATE, 1)
         socket.connect(f"tcp://{self.args.zmq_host}:{self.args.zmq_port}")
         socket.setsockopt_string(zmq.SUBSCRIBE, "")
         socket.setsockopt(zmq.RCVTIMEO, 100)
@@ -796,33 +830,31 @@ class FrankaPolicyExecutor:
             while not self.shutdown_event.is_set():
                 loop_start = time.perf_counter()
                 try:
-                    current_packet = socket.recv_pyobj()
+                    current_packet, dropped_zmq_packets = self._recv_latest_packet(socket)
                 except zmq.Again:
                     continue
 
                 if self._ready_to_send_observation():
                     observation_timestep, queue_snapshot = self._next_observation_timestep()
+                    must_go = True
                     self._mark_observation_inflight(observation_timestep)
                     observation = TimedObservation(
                         timestamp=time.time(),
                         observation=packet_to_raw_observation(current_packet, self.args.task),
                         timestep=observation_timestep,
-                        must_go=True,
+                        must_go=must_go,
                     )
                     try:
                         self.send_observation(observation)
-                        self._log_observation_sent(observation, current_packet, queue_snapshot)
+                        self._log_observation_sent(
+                            observation,
+                            current_packet,
+                            queue_snapshot,
+                            dropped_zmq_packets=dropped_zmq_packets,
+                        )
                     except Exception:
                         self._clear_observation_inflight()
                         raise
-                    print(
-                        "[TIMING] observation sent "
-                        f"timestep={observation_timestep} "
-                        f"queue_size={queue_snapshot['size']} "
-                        f"queue={queue_snapshot['first_timestep']}..{queue_snapshot['last_timestep']} "
-                        f"latest_executed={self.latest_executed_timestep} "
-                        f"must_go={observation.must_go}"
-                    )
                     self.must_go_pending = False
 
                 action, queue_before_pop, queue_after_pop = self.maybe_pop_action()
@@ -830,17 +862,6 @@ class FrankaPolicyExecutor:
                     payload = self._command_payload_from_action(action)
                     if self.args.execute:
                         self._send_bridge_command(payload)
-                    else:
-                        print(
-                            "Predicted action:",
-                            {
-                                "timestep": action.get_timestep(),
-                                "left_arm": np.round(np.asarray(split_action(action.get_action())["left_arm"]), 4).tolist(),
-                                "left_gripper": np.round(np.asarray(split_action(action.get_action())["left_gripper"]), 4).tolist(),
-                                "right_arm": np.round(np.asarray(split_action(action.get_action())["right_arm"]), 4).tolist(),
-                                "right_gripper": np.round(np.asarray(split_action(action.get_action())["right_gripper"]), 4).tolist(),
-                            },
-                        )
                     self._log_action_executed(
                         action,
                         current_packet,

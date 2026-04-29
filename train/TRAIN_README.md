@@ -4,7 +4,8 @@ This directory contains the repo-local training entrypoint for imitation learnin
 
 - `train/train_lerobot_policy.py`
 - `train/deploy_lerobot_policy.py`
-- `train/franka_policy_executor.py`
+- `train/franka_act_policy_executor.py`
+- `train/franka_diffusion_policy_executor.py`
 - `train/push_lerobot_policy.py`
 - `train/fetch_lerobot_policy.py`
 
@@ -65,7 +66,8 @@ python train/train_lerobot_policy.py \
   --batch-size 8 \
   --diffusion-horizon 16 \
   --diffusion-n-obs-steps 2 \
-  --diffusion-n-action-steps 8 \
+  --diffusion-noise-scheduler-type DDIM \
+  --diffusion-num-inference-steps 10 \
   --disable-wandb
 ```
 
@@ -133,7 +135,13 @@ Diffusion-specific options:
 
 - `--diffusion-horizon`
 - `--diffusion-n-obs-steps`
-- `--diffusion-n-action-steps`
+- `--diffusion-noise-scheduler-type`
+- `--diffusion-num-inference-steps`
+
+Default diffusion scheduler/inference settings in this repo:
+
+- `noise_scheduler_type = DDIM`
+- `num_inference_steps = 10`
 
 ## Notes About Policy Choice
 

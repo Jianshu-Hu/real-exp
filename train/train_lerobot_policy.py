@@ -350,9 +350,12 @@ def evaluate_validation_loss(
         if unwrapped_policy.name == "diffusion":
             inference_batch = {OBS_STATE: batch[OBS_STATE]}
             if unwrapped_policy.config.image_features:
+                for key in unwrapped_policy.config.image_features:
+                    if unwrapped_policy.config.n_obs_steps == 1 and batch[key].ndim == 4:
+                        batch[key] = batch[key].unsqueeze(1)
                 inference_batch[OBS_IMAGES] = torch.stack(
                     [batch[key] for key in unwrapped_policy.config.image_features],
-                    dim=2,
+                    dim=-4,
                 )
             if unwrapped_policy.config.env_state_feature:
                 inference_batch[OBS_ENV_STATE] = batch[OBS_ENV_STATE]

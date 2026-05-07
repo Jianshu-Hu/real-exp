@@ -166,12 +166,12 @@ The dataset currently records:
 The bridge expects:
 
 - Robot joint states on a topic like `/left/franka/joint_states`
-- Commanded Franka joint targets on a topic like `/left/franka/commanded_joint_states`
+- Arm-controller target joint states on a topic like `/left/franka/commanded_joint_states`
 - Robot gripper joint states on a topic like `/left/franka_gripper/joint_states`
 - Gripper commands on a topic like `/left/gripper/gripper_client/target_gripper_width_percent`
 - RGB image topics for three cameras
 
-By default the bridge publishes current measured robot joint states (`robot_state`) as both the observation state and the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
+By default the bridge publishes current measured robot joint states as `observation.state` and uses the arm-controller target topic (`/left|right/franka/commanded_joint_states`) as the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
 
 Launch the camera publisher from the ROS 2 workspace:
 

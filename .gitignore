@@ -212,3 +212,6 @@ __marimo__/
 lerobot_data
 data
 outputs
+
+.venv_robot_control/
+.venv_ai_server/

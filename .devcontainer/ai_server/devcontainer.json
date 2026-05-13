@@ -1,0 +1,32 @@
+{
+    "name": "AI Server (Cloud GPU)",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "runArgs": [
+        "--gpus", "all",
+        "--ipc=host",
+        "--network=host",
+        "--privileged",
+        "-v", "/dev:/dev"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "charliermarsh.ruff"
+            ],
+            "settings": {
+                // 告诉 VS Code 使用 AI 专属的虚拟环境
+                "python.defaultInterpreterPath": "${workspaceFolder}/.venv_ai_server/bin/python"
+            }
+        }
+    },
+    "workspaceFolder": "/workspace",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "remoteUser": "root",
+    // 【核心改进】创建独立命名的虚拟环境 .venv_ai_server
+    // "postCreateCommand": "uv venv .venv_ai_server && source .venv_ai_server/bin/activate && cd lerobot && uv pip install -e ."
+    "postCreateCommand": ["/bin/bash", "-c", "uv venv --clear .venv_ai_server && source .venv_ai_server/bin/activate && cd lerobot && uv pip install -e ."]
+}

@@ -211,13 +211,14 @@ __marimo__/
 .venv_ai_server/
 
 # Local AI / assistant context
-PROJECT_CONTEXT_FOR_AI.md
+# PROJECT_CONTEXT_FOR_AI.md
 
 # Runtime data and generated outputs
 data/
 lerobot_data/
 logs/
 outputs/
+docs/
 
 # Runtime/cache directories
 __pycache__/

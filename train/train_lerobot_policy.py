@@ -20,6 +20,7 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
 from lerobot.configs.default import DatasetConfig, WandBConfig
+from lerobot.configs.train import TRAIN_CONFIG_NAME
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -36,6 +37,7 @@ from lerobot.utils.train_utils import (
     update_last_checkpoint,
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK, PRETRAINED_MODEL_DIR
 from lerobot.utils.utils import init_logging
 
 from dataset_stats import ensure_dataset_stats
@@ -132,6 +134,15 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         action="store_true",
         help="Resume from an existing output dir containing a prior training run.",
+    )
+    parser.add_argument(
+        "--resume-config-path",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a checkpoint pretrained_model/train_config.json used for --resume. "
+            "Defaults to <output-dir>/checkpoints/last/pretrained_model/train_config.json."
+        ),
     )
 
     parser.add_argument(
@@ -243,6 +254,77 @@ def resolve_output_dir(args: argparse.Namespace) -> Path:
     if args.output_dir is not None:
         return args.output_dir.resolve()
     return (DEFAULT_OUTPUT_ROOT / f"{args.dataset_root.name}_{args.policy_type}").resolve()
+
+
+def resolve_resume_config_path(args: argparse.Namespace, output_dir: Path) -> Path:
+    if args.resume_config_path is not None:
+        return args.resume_config_path.expanduser().resolve()
+    return (
+        output_dir
+        / CHECKPOINTS_DIR
+        / LAST_CHECKPOINT_LINK
+        / PRETRAINED_MODEL_DIR
+        / TRAIN_CONFIG_NAME
+    ).resolve()
+
+
+def load_resume_train_config(
+    args: argparse.Namespace,
+    output_dir: Path,
+    train_dataset_cfg: DatasetConfig,
+    wandb_cfg: WandBConfig,
+) -> TrainPipelineConfig:
+    resume_config_path = resolve_resume_config_path(args, output_dir)
+    if not resume_config_path.exists():
+        raise FileNotFoundError(
+            f"Resume config not found: {resume_config_path}. "
+            "Pass --resume-config-path explicitly or check that "
+            "<output-dir>/checkpoints/last/pretrained_model/train_config.json exists."
+        )
+
+    cfg = TrainPipelineConfig.from_pretrained(resume_config_path)
+    cfg.resume = True
+    if cfg.policy is None:
+        raise ValueError(f"Resume config does not define a policy: {resume_config_path}")
+    if cfg.policy.type != args.policy_type:
+        raise ValueError(
+            f"--policy-type {args.policy_type!r} does not match resumed checkpoint policy "
+            f"type {cfg.policy.type!r} from {resume_config_path}."
+        )
+
+    # Keep the optimizer/scheduler/policy config from the checkpoint, but allow the current command
+    # to describe the migrated run location and continuation settings.
+    cfg.dataset = train_dataset_cfg
+    cfg.output_dir = output_dir
+    cfg.job_name = f"{args.dataset_root.name}_{args.policy_type}"
+    cfg.seed = args.seed
+    cfg.num_workers = args.num_workers
+    cfg.batch_size = args.batch_size
+    cfg.steps = args.steps
+    cfg.eval_freq = 0
+    cfg.log_freq = args.log_freq
+    cfg.save_freq = args.save_freq
+    cfg.wandb = wandb_cfg
+
+    if args.device is not None:
+        cfg.policy.device = args.device
+    cfg.policy.push_to_hub = args.push_to_hub
+    cfg.policy.repo_id = args.policy_repo_id
+
+    policy_dir = resume_config_path.parent
+    cfg.policy.pretrained_path = policy_dir
+    cfg.checkpoint_path = policy_dir.parent
+    if not (cfg.checkpoint_path / "training_state").is_dir():
+        raise NotADirectoryError(
+            f"Resume checkpoint is missing training_state: {cfg.checkpoint_path / 'training_state'}"
+        )
+
+    if cfg.optimizer is None:
+        raise ValueError(f"Resume config does not define an optimizer: {resume_config_path}")
+    if cfg.policy.push_to_hub and not cfg.policy.repo_id:
+        raise ValueError("--policy-repo-id is required when --push-to-hub is set.")
+
+    return cfg
 
 
 def resolve_episode_split(args: argparse.Namespace, total_episodes: int) -> tuple[list[int], list[int]]:
@@ -433,7 +515,6 @@ def main() -> None:
         raise ValueError("Validation is enabled but validation split is empty.")
 
     output_dir = resolve_output_dir(args)
-    policy_cfg = build_policy_config(args)
     wandb_cfg = WandBConfig(
         enable=not args.disable_wandb,
         project=args.wandb_project,
@@ -444,23 +525,32 @@ def main() -> None:
         dataset_root,
         train_episodes,
     )
-
-    cfg = TrainPipelineConfig(
-        dataset=train_dataset_cfg,
-        policy=policy_cfg,
-        output_dir=output_dir,
-        job_name=f"{args.dataset_root.name}_{args.policy_type}",
-        resume=args.resume,
-        seed=args.seed,
-        num_workers=args.num_workers,
-        batch_size=args.batch_size,
-        steps=args.steps,
-        eval_freq=0,
-        log_freq=args.log_freq,
-        save_freq=args.save_freq,
-        wandb=wandb_cfg,
-    )
-    cfg.validate()
+    if args.resume:
+        cfg = load_resume_train_config(
+            args=args,
+            output_dir=output_dir,
+            train_dataset_cfg=train_dataset_cfg,
+            wandb_cfg=wandb_cfg,
+        )
+        policy_cfg = cfg.policy
+    else:
+        policy_cfg = build_policy_config(args)
+        cfg = TrainPipelineConfig(
+            dataset=train_dataset_cfg,
+            policy=policy_cfg,
+            output_dir=output_dir,
+            job_name=f"{args.dataset_root.name}_{args.policy_type}",
+            resume=False,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size,
+            steps=args.steps,
+            eval_freq=0,
+            log_freq=args.log_freq,
+            save_freq=args.save_freq,
+            wandb=wandb_cfg,
+        )
+        cfg.validate()
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     force_cpu = cfg.policy.device == "cpu"

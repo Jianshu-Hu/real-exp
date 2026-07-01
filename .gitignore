@@ -228,4 +228,7 @@ __pycache__/
 # Vscode
 .vscode/
 
+# Local reference files for experiments / Codex context
+external_reference/
+
 yxw_real_exp_train.tar.gz

@@ -42,9 +42,12 @@ from lerobot.utils.utils import init_logging
 
 from dataset_stats import ensure_dataset_stats
 from image_preprocessing import (
+    CameraMaskConfig,
     ResizePadConfig,
+    apply_camera_mask_to_batch,
     apply_resize_pad_to_feature_specs,
     make_resize_pad_transform,
+    validate_camera_mask_config,
 )
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
@@ -104,6 +107,39 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Constant fill value used for padded image regions.",
+    )
+    parser.add_argument(
+        "--camera-mask-mode",
+        choices=("off", "single"),
+        default="off",
+        help=(
+            "Optional training-only camera masking. 'off' keeps current behavior. "
+            "'single' samples at most one masked camera per training sample."
+        ),
+    )
+    parser.add_argument(
+        "--camera-mask-left-prob",
+        type=float,
+        default=0.0,
+        help="Probability of masking observation.images.cam_left in --camera-mask-mode single.",
+    )
+    parser.add_argument(
+        "--camera-mask-front-prob",
+        type=float,
+        default=0.0,
+        help="Probability of masking observation.images.cam_front in --camera-mask-mode single.",
+    )
+    parser.add_argument(
+        "--camera-mask-right-prob",
+        type=float,
+        default=0.0,
+        help="Probability of masking observation.images.cam_right in --camera-mask-mode single.",
+    )
+    parser.add_argument(
+        "--camera-mask-fill",
+        type=float,
+        default=0.0,
+        help="Fill value used for masked camera images. Default 0.0 gives black images.",
     )
     parser.add_argument(
         "--device",
@@ -280,6 +316,32 @@ def resolve_resize_pad_config(args: argparse.Namespace) -> ResizePadConfig:
         size=max(1, args.image_resize_pad_size),
         fill=args.image_resize_pad_fill,
     )
+
+
+def resolve_camera_mask_config(args: argparse.Namespace) -> CameraMaskConfig:
+    config = CameraMaskConfig(
+        mode=args.camera_mask_mode,
+        left_prob=args.camera_mask_left_prob,
+        front_prob=args.camera_mask_front_prob,
+        right_prob=args.camera_mask_right_prob,
+        fill=args.camera_mask_fill,
+    )
+    validate_camera_mask_config(config)
+    return config
+
+
+def validate_camera_mask_dataset_features(
+    feature_specs: dict[str, dict],
+    camera_mask_config: CameraMaskConfig,
+) -> None:
+    if not camera_mask_config.enabled:
+        return
+    missing_keys = [key for key in camera_mask_config.camera_keys if key not in feature_specs]
+    if missing_keys:
+        raise KeyError(
+            "Camera mask is enabled but the dataset metadata is missing camera keys: "
+            + ", ".join(missing_keys)
+        )
 
 
 def resolve_output_dir(args: argparse.Namespace) -> Path:
@@ -632,7 +694,9 @@ def main() -> None:
     total_episodes = int(dataset_info["total_episodes"])
     train_episodes, val_episodes = resolve_episode_split(args, total_episodes)
     resize_pad_config = resolve_resize_pad_config(args)
+    camera_mask_config = resolve_camera_mask_config(args)
     apply_resize_pad_to_feature_specs(dataset_info["features"], resize_pad_config)
+    validate_camera_mask_dataset_features(dataset_info["features"], camera_mask_config)
 
     if not train_episodes:
         raise ValueError("Training split is empty.")
@@ -703,6 +767,18 @@ def main() -> None:
             f"arm={action_config.get('arm_action_representation')}, "
             f"gripper={action_config.get('gripper_action_representation')}"
         )
+        if camera_mask_config.enabled:
+            print(
+                "Camera mask augmentation: "
+                f"mode={camera_mask_config.mode}, "
+                f"left={camera_mask_config.left_prob:g}, "
+                f"front={camera_mask_config.front_prob:g}, "
+                f"right={camera_mask_config.right_prob:g}, "
+                f"none={camera_mask_config.none_prob:g}, "
+                f"fill={camera_mask_config.fill:g}"
+            )
+        else:
+            print("Camera mask augmentation: off")
 
     train_dataset = make_dataset(cfg)
     apply_dataset_image_transform(train_dataset, resize_pad_config)
@@ -806,6 +882,7 @@ def main() -> None:
         except StopIteration:
             train_iter = iter(train_dataloader)
             batch = next(train_iter)
+        batch = apply_camera_mask_to_batch(batch, camera_mask_config)
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 

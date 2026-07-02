@@ -146,6 +146,38 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--train-episodes",
+        default=None,
+        help=(
+            "Comma/whitespace-separated candidate training episodes, supporting inclusive ranges "
+            "like 0,1,4-8,12. Defaults to all dataset episodes."
+        ),
+    )
+    parser.add_argument(
+        "--train-episodes-file",
+        type=Path,
+        default=None,
+        help=(
+            "File containing candidate training episodes. Supports commas, whitespace, inclusive ranges, "
+            "and # comments. Combined with --train-episodes when both are set."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-episodes",
+        default=None,
+        help="Episodes to remove from the candidate set, supporting inclusive ranges like 3,10-12.",
+    )
+    parser.add_argument(
+        "--max-train-episodes",
+        type=int,
+        default=None,
+        help=(
+            "Cap the final training split to the first N episode ids after optional validation split. "
+            "Validation episodes are selected before this cap."
+        ),
+    )
+
+    parser.add_argument(
         "--val-ratio",
         type=float,
         default=0.0,
@@ -327,24 +359,117 @@ def load_resume_train_config(
     return cfg
 
 
+def parse_episode_selection(text: str, source: str) -> list[int]:
+    normalized_text = text.replace(",", " ")
+    tokens = [token.strip() for token in normalized_text.split() if token.strip()]
+    if not tokens:
+        raise ValueError(f"No episode indices found in {source}.")
+
+    episode_indices: set[int] = set()
+    for token in tokens:
+        if token.isdigit():
+            episode_indices.add(int(token))
+            continue
+
+        if "-" in token:
+            range_parts = token.split("-")
+            if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
+                start = int(range_parts[0])
+                end = int(range_parts[1])
+                if start > end:
+                    raise ValueError(
+                        f"Invalid episode range {token!r} in {source}: start must be <= end."
+                    )
+                episode_indices.update(range(start, end + 1))
+                continue
+
+        raise ValueError(
+            f"Invalid episode token {token!r} in {source}. "
+            "Use non-negative integers or inclusive ranges like 4-8."
+        )
+
+    return sorted(episode_indices)
+
+
+def load_episode_selection_file(path: Path) -> list[int]:
+    selection_path = path.expanduser()
+    if not selection_path.exists():
+        raise FileNotFoundError(f"Episode selection file not found: {selection_path}")
+    if not selection_path.is_file():
+        raise FileNotFoundError(f"Episode selection path is not a file: {selection_path}")
+
+    content_lines = []
+    for line in selection_path.read_text().splitlines():
+        content_lines.append(line.split("#", 1)[0])
+    return parse_episode_selection(" ".join(content_lines), str(selection_path))
+
+
+def validate_episode_selection(indices: list[int], total_episodes: int, source: str) -> None:
+    invalid = [index for index in indices if index < 0 or index >= total_episodes]
+    if invalid:
+        raise ValueError(
+            f"Episode indices out of range in {source}: {invalid}. "
+            f"Dataset contains {total_episodes} episodes indexed 0 to {total_episodes - 1}."
+        )
+
+
+def resolve_candidate_episodes(args: argparse.Namespace, total_episodes: int) -> list[int]:
+    if total_episodes <= 0:
+        raise ValueError("Dataset contains no episodes.")
+
+    selected_episodes: set[int] | None = None
+    if args.train_episodes is not None:
+        parsed = parse_episode_selection(args.train_episodes, "--train-episodes")
+        validate_episode_selection(parsed, total_episodes, "--train-episodes")
+        selected_episodes = set(parsed)
+
+    if args.train_episodes_file is not None:
+        parsed = load_episode_selection_file(args.train_episodes_file)
+        validate_episode_selection(parsed, total_episodes, str(args.train_episodes_file))
+        if selected_episodes is None:
+            selected_episodes = set(parsed)
+        else:
+            selected_episodes.update(parsed)
+
+    if selected_episodes is None:
+        selected_episodes = set(range(total_episodes))
+
+    if args.exclude_episodes is not None:
+        excluded = parse_episode_selection(args.exclude_episodes, "--exclude-episodes")
+        validate_episode_selection(excluded, total_episodes, "--exclude-episodes")
+        selected_episodes.difference_update(excluded)
+
+    candidate_episodes = sorted(selected_episodes)
+    if not candidate_episodes:
+        raise ValueError("Episode selection is empty after applying filters.")
+    return candidate_episodes
+
+
 def resolve_episode_split(args: argparse.Namespace, total_episodes: int) -> tuple[list[int], list[int]]:
-    all_episodes = list(range(total_episodes))
+    candidate_episodes = resolve_candidate_episodes(args, total_episodes)
 
     if args.val_ratio <= 0:
-        return all_episodes, []
+        train_episodes = candidate_episodes
+        val_episodes: list[int] = []
+    else:
+        if not 0 < args.val_ratio < 1:
+            raise ValueError("--val-ratio must be in (0, 1) when provided.")
 
-    if not 0 < args.val_ratio < 1:
-        raise ValueError("--val-ratio must be in (0, 1) when provided.")
+        val_count = max(1, int(math.ceil(len(candidate_episodes) * args.val_ratio)))
+        if val_count >= len(candidate_episodes):
+            raise ValueError("Validation split would consume all selected episodes.")
 
-    val_count = max(1, int(math.ceil(total_episodes * args.val_ratio)))
-    if val_count >= total_episodes:
-        raise ValueError("Validation split would consume all episodes.")
+        shuffled_episodes = candidate_episodes.copy()
+        random.Random(args.seed).shuffle(shuffled_episodes)
+        val_episode_set = set(shuffled_episodes[:val_count])
+        train_episodes = [episode for episode in candidate_episodes if episode not in val_episode_set]
+        val_episodes = [episode for episode in candidate_episodes if episode in val_episode_set]
 
-    shuffled_episodes = all_episodes.copy()
-    random.Random(args.seed).shuffle(shuffled_episodes)
-    val_episode_set = set(shuffled_episodes[:val_count])
-    train_episodes = [episode for episode in all_episodes if episode not in val_episode_set]
-    val_episodes = [episode for episode in all_episodes if episode in val_episode_set]
+    if args.max_train_episodes is not None:
+        if args.max_train_episodes <= 0:
+            raise ValueError("--max-train-episodes must be a positive integer.")
+        train_episodes = train_episodes[: args.max_train_episodes]
+
     return train_episodes, val_episodes
 
 

@@ -82,7 +82,7 @@ Verify that:
 - `dataset_state_dim` is `16`
 - `dataset_action_dim` is `16`
 - `dataset_image_keys` are `observation.images.cam_left`, `observation.images.cam_front`, `observation.images.cam_right`
-- `dataset_action_representation` says `arm=absolute_joint_position, gripper=binary_open_close`
+- `dataset_action_representation` says `arm=absolute_joint_position, gripper=absolute_width`
 
 ### 2. Start the camera publisher
 
@@ -180,6 +180,8 @@ The bridge republishes policy actions to these existing topics:
 - `/right/gripper/gripper_client/target_gripper_width_percent`
 
 This lets the existing ROS 2 consumers be reused during deployment.
+By default, gripper actions are continuous open-width percentages in `[0, 1]`.
+To switch back to latched binary gripper commands, update both `GRIPPER_COMMAND_MODE` in `gello_publisher.py` and `GRIPPER_ACTION_REPRESENTATION` in `lerobot_data_bridge.py` to `binary_open_close` before collecting or deploying matching data.
 
 ### 6. Start the executor in dry-run mode
 

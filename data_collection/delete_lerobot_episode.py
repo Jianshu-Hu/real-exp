@@ -41,10 +41,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--episode-indices",
-        type=int,
         nargs="+",
         default=None,
-        help="Space-separated episode indices to delete.",
+        help=(
+            "Comma/whitespace-separated episode indices to delete, supporting "
+            "inclusive ranges like 0,1,4-8,12."
+        ),
     )
     parser.add_argument(
         "--repo-id",
@@ -110,12 +112,47 @@ def load_action_config(dataset_root: Path) -> dict | None:
         return json.load(f)
 
 
+def parse_episode_selection(text: str, source: str) -> list[int]:
+    normalized_text = text.replace(",", " ")
+    tokens = [token.strip() for token in normalized_text.split() if token.strip()]
+    if not tokens:
+        raise ValueError(f"No episode indices found in {source}.")
+
+    episode_indices: set[int] = set()
+    for token in tokens:
+        if token.isdigit():
+            episode_indices.add(int(token))
+            continue
+
+        if token.startswith("-") and token[1:].isdigit():
+            raise ValueError(f"Episode indices must be non-negative in {source}: {token!r}.")
+
+        if "-" in token:
+            range_parts = token.split("-")
+            if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
+                start = int(range_parts[0])
+                end = int(range_parts[1])
+                if start > end:
+                    raise ValueError(
+                        f"Invalid episode range {token!r} in {source}: start must be <= end."
+                    )
+                episode_indices.update(range(start, end + 1))
+                continue
+
+        raise ValueError(
+            f"Invalid episode token {token!r} in {source}. "
+            "Use non-negative integers or inclusive ranges like 4-8."
+        )
+
+    return sorted(episode_indices)
+
+
 def collect_episode_indices(args: argparse.Namespace) -> list[int]:
     indices: list[int] = []
     if args.episode_indices_single:
         indices.extend(args.episode_indices_single)
     if args.episode_indices:
-        indices.extend(args.episode_indices)
+        indices.extend(parse_episode_selection(" ".join(args.episode_indices), "--episode-indices"))
 
     if not indices:
         raise ValueError("At least one episode index must be provided.")

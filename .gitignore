@@ -224,6 +224,7 @@ docs/
 __pycache__/
 .hf-cache/
 .codex/
+.continue/
 
 # Vscode
 .vscode/

@@ -218,6 +218,7 @@ data/
 lerobot_data/
 logs/
 outputs/
+reports/
 docs/
 
 # Runtime/cache directories

@@ -12,8 +12,8 @@
     ],
     // 【新增】挂载一个持久化的 volume 用于保存 uv 的下载缓存
     "mounts": [
-        "source=uv-cache,target=/root/.cache/uv,type=volume",
-        "source=${localEnv:HOME}/.codex,target=/root/.codex,type=bind"
+        "source=uv-cache,target=/home/vscode/.cache/uv,type=volume",
+        "source=${localEnv:HOME}/.codex,target=/home/vscode/.codex,type=bind"
     ],
     "customizations": {
         "vscode": {
@@ -32,9 +32,17 @@
     },
     "workspaceFolder": "/workspace",
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
-    "remoteUser": "root",
+    "remoteUser": "vscode",
+    "updateRemoteUserUID": true,
+    "remoteEnv": {
+        "CODEX_SQLITE_HOME": "/home/vscode/.cache/codex-sqlite"
+    },
     // 【核心改进】创建独立命名的虚拟环境 .venv_ai_server
     // "postCreateCommand": "uv venv .venv_ai_server && source .venv_ai_server/bin/activate && cd lerobot && uv pip install -e ."
     // 【修改】去掉了 --clear，改为智能判断：如果不存在则创建，如果存在则直接激活并增量安装
-    "postCreateCommand": ["/bin/bash", "-c", "if [ ! -d '.venv_ai_server' ]; then uv venv .venv_ai_server; fi && source .venv_ai_server/bin/activate && cd lerobot && uv pip install -e ."]
+    "postCreateCommand": [
+        "/bin/bash",
+        "-lc",
+        "if [ ! -d '.venv_ai_server' ]; then uv venv .venv_ai_server; fi && source .venv_ai_server/bin/activate && cd lerobot && uv pip install -e '.[training,diffusion,grpcio-dep,pyzmq-dep]'"
+    ]
 }

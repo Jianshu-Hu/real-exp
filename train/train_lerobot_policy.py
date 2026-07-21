@@ -26,11 +26,11 @@ from lerobot.datasets.factory import make_dataset
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_policy_config, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.rl.wandb_utils import WandBLogger
+from lerobot.common.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_train import update_policy
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
-from lerobot.utils.train_utils import (
+from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     load_training_state,
     save_checkpoint,
@@ -395,7 +395,7 @@ def load_resume_train_config(
     cfg.num_workers = args.num_workers
     cfg.batch_size = args.batch_size
     cfg.steps = args.steps
-    cfg.eval_freq = 0
+    cfg.env_eval_freq = 0
     cfg.log_freq = args.log_freq
     cfg.save_freq = args.save_freq
     cfg.wandb = wandb_cfg
@@ -734,7 +734,7 @@ def main() -> None:
             num_workers=args.num_workers,
             batch_size=args.batch_size,
             steps=args.steps,
-            eval_freq=0,
+            env_eval_freq=0,
             log_freq=args.log_freq,
             save_freq=args.save_freq,
             wandb=wandb_cfg,
@@ -798,7 +798,7 @@ def main() -> None:
             num_workers=args.num_workers,
             batch_size=args.batch_size,
             steps=args.steps,
-            eval_freq=0,
+            env_eval_freq=0,
             log_freq=args.log_freq,
             save_freq=args.save_freq,
             wandb=wandb_cfg,
@@ -855,12 +855,16 @@ def main() -> None:
         wandb_logger = None
 
     train_metrics = {
-        "loss": AverageMeter("loss", ":.3f"),
+        "loss": AverageMeter("loss", ":.3f", reduction="mean"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
-        "update_s": AverageMeter("updt_s", ":.3f"),
-        "dataloading_s": AverageMeter("data_s", ":.3f"),
+        "update_s": AverageMeter("updt_s", ":.3f", reduction="max"),
+        "dataloading_s": AverageMeter("data_s", ":.3f", reduction="max"),
     }
+
+    if torch.cuda.is_available():
+        train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
+
     train_tracker = MetricsTracker(
         cfg.batch_size,
         train_dataset.num_frames,

@@ -1,0 +1,43 @@
+{
+    "name": "Robot Control (ROS2 Edge)",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "runArgs": [
+        "--privileged",
+        "--network=host",
+        "--ipc=host",
+        "-v", "/dev:/dev",
+        "-v", "/sys:/sys",
+        "-v", "/tmp/.X11-unix:/tmp/.X11-unix",
+        "-e", "DISPLAY=${env:DISPLAY}",
+        "-e", "QT_X11_NO_MITSHM=1"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-iot.vscode-ros",
+                "twxs.cmake",
+                "ms-vscode.cpptools"
+            ],
+            "settings": {
+                // 告诉 VS Code 使用我们专属的 Python 3.12 虚拟环境
+                "python.defaultInterpreterPath": "${workspaceFolder}/.venv_robot_control/bin/python",
+                "ros.distro": "humble"
+            }
+        }
+    },
+    "workspaceFolder": "/workspace",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "remoteUser": "root",
+    // 【核心改进】
+    // 1. 移除 --system-site-packages，彻底隔离系统 ROS 2 的 Python 3.10。
+    // 2. 增加 --python 3.12，uv (版本>=0.2) 非常强大，如果系统没有 3.12，它会自动下载一个独立的 Python 3.12 解释器。
+    // 3. 增加 uv pip install roslibpy，这是 AI 环境用来和 ROS 2 通信的纯 Python 库。
+    "postCreateCommand": [
+        "/bin/bash", 
+        "-c", 
+        "uv venv --python 3.12 --clear .venv_robot_control && source .venv_robot_control/bin/activate && cd lerobot && uv pip install -e . && uv pip install roslibpy"
+    ]
+}

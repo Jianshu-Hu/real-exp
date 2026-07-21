@@ -71,6 +71,40 @@ python train/train_lerobot_policy.py \
   --disable-wandb
 ```
 
+## Camera Mask Training Augmentation
+
+The training script can optionally mask one camera stream per training sample. This is intended to reduce over-reliance on a single camera while keeping the deployment contract unchanged.
+
+By default this is disabled, so existing training commands behave the same as before.
+
+Enable four-state single-camera masking:
+
+```bash
+python train/train_lerobot_policy.py \
+  --policy-type act \
+  --steps 100000 \
+  --batch-size 8 \
+  --camera-mask-mode single \
+  --camera-mask-left-prob 0.15 \
+  --camera-mask-front-prob 0.15 \
+  --camera-mask-right-prob 0.15
+```
+
+With the example above, each training sample is drawn from exactly one of these states:
+
+- no camera masked, probability `0.55`
+- `observation.images.cam_left` masked, probability `0.15`
+- `observation.images.cam_front` masked, probability `0.15`
+- `observation.images.cam_right` masked, probability `0.15`
+
+The three mask probabilities must each be in `[0, 1]` and their sum must be `<= 1`. The remaining probability is the no-mask state. Masked images are filled with `0.0` by default, which corresponds to a black image after the dataset image transform.
+
+Camera masking is training-only:
+
+- validation loss is computed with all cameras visible
+- policy input features and checkpoint structure are unchanged
+- deployment still uses the normal three-camera observation
+
 ## Useful Flags
 
 ```bash
@@ -94,6 +128,11 @@ Important options:
 - `--val-freq`: run validation every N training steps, defaulting to `--save-freq`
 - `--val-batch-size`: validation batch size, defaulting to `--batch-size`
 - `--max-val-batches`: optionally cap validation batches per evaluation pass
+- `--camera-mask-mode {off,single}`: optionally enable training-only camera masking
+- `--camera-mask-left-prob`: probability of masking `observation.images.cam_left`
+- `--camera-mask-front-prob`: probability of masking `observation.images.cam_front`
+- `--camera-mask-right-prob`: probability of masking `observation.images.cam_right`
+- `--camera-mask-fill`: fill value for masked images, defaulting to `0.0`
 
 ## Train/Validation Split
 

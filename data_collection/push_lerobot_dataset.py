@@ -5,6 +5,16 @@ import json
 import sys
 from pathlib import Path
 
+# ==========================================
+# 新增：自动修复代理环境变量，解决 httpx 报错问题
+# 将不规范的 socks:// 替换为兼容性更好的 http://
+# ==========================================
+import os
+for _proxy_var in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']:
+    if _proxy_var in os.environ and os.environ[_proxy_var].startswith('socks://'):
+        os.environ[_proxy_var] = os.environ[_proxy_var].replace('socks://', 'http://')
+# ==========================================
+
 from huggingface_hub import HfApi
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

@@ -23,6 +23,7 @@ DEFAULT_REPLAY_POSITION_TRACKING_GAIN_PER_S = 2.0
 INITIAL_POSE_TRACKING_GAIN_PER_S = 1.5
 HOLD_POSE_TRACKING_GAIN_PER_S = 1.5
 REPLAY_START_BLEND_TIME_S = 0.20
+ABORT_JOIN_GRACE_PERIOD_S = 3.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -271,6 +272,42 @@ def abort_playback(abort_event: threading.Event) -> None:
     abort_event.set()
 
 
+def consume_replay_commands(
+    commands: Queue[str],
+    abort_event: Any,
+    ready_event: Any,
+    start_event: Any,
+    *,
+    allow_start: bool,
+) -> bool:
+    """Process queued keyboard commands.
+
+    Returns True when start was requested. A queued abort always wakes workers so
+    they can leave their wait loops.
+    """
+    abort_requested = False
+    start_requested = False
+    while True:
+        try:
+            command = commands.get_nowait()
+        except Empty:
+            if abort_requested:
+                print("Abort requested by user.")
+                abort_playback(abort_event)
+                ready_event.set()
+                start_event.set()
+            return start_requested
+
+        if command == "q":
+            abort_requested = True
+            continue
+        if command == "s":
+            if allow_start:
+                start_requested = True
+            continue
+        print("Unknown command. Use: s or q")
+
+
 def duration_to_seconds(time_step: object) -> float:
     if hasattr(time_step, "to_sec"):
         return time_step.to_sec()
@@ -381,6 +418,7 @@ def move_arm_to_initial_pose(
         commanded_velocity = limit_velocity_command(commanded_velocity, target_velocity, dt)
         control.writeOnce(pylibfranka.JointVelocities(commanded_velocity.tolist()))
 
+    ramp_joint_velocity_to_zero(control, commanded_velocity, abort_event)
     raise RuntimeError("Playback aborted while moving to the initial pose.")
 
 
@@ -395,6 +433,7 @@ def hold_position_until_start(
     print(f"[{arm_name}] Initial pose reached. Waiting for synchronized playback start...")
     while not start_event.is_set():
         if abort_event.is_set():
+            ramp_joint_velocity_to_zero(control, commanded_velocity, abort_event)
             raise RuntimeError("Playback aborted while waiting for synchronized start.")
         state, time_step = control.readOnce()
         dt = duration_to_seconds(time_step)
@@ -497,7 +536,12 @@ def replay_arm_deltas_as_velocities(
                 f"max_abs_joint_error={max_abs_joint_error:.6f} rad): {exc}"
             ) from exc
 
-    raise RuntimeError("Playback aborted while replaying arm actions.")
+    ramp_joint_velocity_to_zero(control, commanded_velocity, abort_event)
+    print(f"[{arm_name}] Playback aborted by request.")
+    return {
+        "sum_abs_error": summed_abs_error,
+        "num_error_samples": float(sample_count),
+    }
 
 
 def replay_arm_targets_as_velocities(
@@ -563,7 +607,12 @@ def replay_arm_targets_as_velocities(
                 f"max_abs_joint_error={max_abs_joint_error:.6f} rad): {exc}"
             ) from exc
 
-    raise RuntimeError("Playback aborted while replaying arm targets.")
+    ramp_joint_velocity_to_zero(control, commanded_velocity, abort_event)
+    print(f"[{arm_name}] Playback aborted by request.")
+    return {
+        "sum_abs_error": summed_abs_error,
+        "num_error_samples": float(sample_count),
+    }
 
 
 def register_worker_ready(
@@ -730,31 +779,139 @@ def wait_for_manual_start(
     start_event: Any,
 ) -> None:
     print("Waiting for all arms and grippers to reach the initial state...")
+    start_requested = False
     while not ready_event.is_set():
         if abort_event.is_set():
             return
+        start_requested = (
+            consume_replay_commands(
+                commands,
+                abort_event,
+                ready_event,
+                start_event,
+                allow_start=True,
+            )
+            or start_requested
+        )
         time.sleep(0.05)
 
     if abort_event.is_set():
         return
 
     print("All workers are holding the initial state.")
+    if start_requested:
+        start_event.set()
+        return
+
     print("Type `s` + Enter to start replay, or `q` + Enter to abort.")
 
     while not abort_event.is_set():
-        try:
-            command = commands.get(timeout=0.1)
-        except Empty:
-            continue
+        if consume_replay_commands(
+            commands,
+            abort_event,
+            ready_event,
+            start_event,
+            allow_start=True,
+        ):
+            start_event.set()
+            return
+        if start_event.is_set() or abort_event.is_set():
+            return
+        time.sleep(0.05)
 
-        if command == "s":
-            start_event.set()
+
+def wait_for_replay_workers(
+    commands: Queue[str],
+    abort_event: Any,
+    ready_event: Any,
+    start_event: Any,
+    arm_processes: list[mp.Process],
+    gripper_threads: list[threading.Thread],
+) -> None:
+    try:
+        while True:
+            consume_replay_commands(
+                commands,
+                abort_event,
+                ready_event,
+                start_event,
+                allow_start=False,
+            )
+
+            any_alive = False
+            for process in arm_processes:
+                process.join(timeout=0.01)
+                if process.exitcode not in (0, None):
+                    abort_playback(abort_event)
+                    ready_event.set()
+                    start_event.set()
+                any_alive = process.is_alive() or any_alive
+
+            any_alive = any(thread.is_alive() for thread in gripper_threads) or any_alive
+            if not any_alive:
+                return
+
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("Abort requested by KeyboardInterrupt.")
+        abort_playback(abort_event)
+        ready_event.set()
+        start_event.set()
+    finally:
+        cleanup_replay_workers(abort_event, ready_event, start_event, arm_processes, gripper_threads)
+
+
+def cleanup_replay_workers(
+    abort_event: Any,
+    ready_event: Any,
+    start_event: Any,
+    arm_processes: list[mp.Process],
+    gripper_threads: list[threading.Thread],
+) -> None:
+    if abort_event.is_set():
+        deadline = time.monotonic() + ABORT_JOIN_GRACE_PERIOD_S
+    else:
+        deadline = None
+
+    while True:
+        if abort_event.is_set() and deadline is None:
+            deadline = time.monotonic() + ABORT_JOIN_GRACE_PERIOD_S
+
+        any_alive = False
+        for process in arm_processes:
+            process.join(timeout=0.05)
+            if process.exitcode not in (0, None):
+                abort_playback(abort_event)
+                ready_event.set()
+                start_event.set()
+            any_alive = process.is_alive() or any_alive
+
+        for thread in gripper_threads:
+            thread.join(timeout=0.05)
+            any_alive = thread.is_alive() or any_alive
+
+        if not any_alive:
             return
-        if command == "q":
-            abort_playback(abort_event)
-            start_event.set()
-            return
-        print("Unknown command. Use: s or q")
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+
+    stuck_processes = [process for process in arm_processes if process.is_alive()]
+    if stuck_processes:
+        print(
+            "Warning: some arm replay processes did not exit after abort; "
+            "terminating them from the parent process."
+        )
+    for process in stuck_processes:
+        process.terminate()
+    for process in stuck_processes:
+        process.join(timeout=1.0)
+
+    stuck_threads = [thread.name for thread in gripper_threads if thread.is_alive()]
+    if stuck_threads:
+        print(
+            "Warning: some gripper replay threads are still blocked after abort "
+            f"({', '.join(stuck_threads)}). They will exit when the blocking gripper call returns."
+        )
 
 
 def split_dual_arm_data(states: np.ndarray, actions: np.ndarray) -> dict[str, Any]:
@@ -940,16 +1097,29 @@ def replay_dual_trajectory(
     for thread in gripper_threads:
         thread.start()
 
-    wait_for_manual_start(commands, abort_event, ready_event, start_event)
-
-    for process in arm_processes:
-        process.join()
-        if process.exitcode not in (0, None):
-            abort_playback(abort_event)
-            ready_event.set()
-            start_event.set()
-    for thread in gripper_threads:
-        thread.join()
+    try:
+        wait_for_manual_start(commands, abort_event, ready_event, start_event)
+        wait_for_replay_workers(
+            commands,
+            abort_event,
+            ready_event,
+            start_event,
+            arm_processes,
+            gripper_threads,
+        )
+    except KeyboardInterrupt:
+        print("Abort requested by KeyboardInterrupt.")
+        abort_playback(abort_event)
+        ready_event.set()
+        start_event.set()
+        wait_for_replay_workers(
+            commands,
+            abort_event,
+            ready_event,
+            start_event,
+            arm_processes,
+            gripper_threads,
+        )
 
     replay_error_summaries: list[dict[str, float | str]] = []
     while not result_queue.empty():

@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--policy-type",
-        choices=("act", "diffusion"),
+        choices=("act", "diffusion", "pi05"),
         default="act",
         help="Imitation-learning policy family to train.",
     )
@@ -262,6 +262,39 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Reverse diffusion steps recorded in the diffusion policy config.",
     )
+
+    # Pi0.5-specific knobs. Keep the first wrapper version intentionally small.
+    parser.add_argument(
+        "--pi05-pretrained-path",
+        type=Path,
+        default=None,
+        help=(
+            "Local Pi0.5 pretrained checkpoint directory. Required for --policy-type pi05; "
+            "download lerobot/pi05_base locally first."
+        ),
+    )
+    parser.add_argument(
+        "--pi05-dtype",
+        choices=("bfloat16", "float32"),
+        default="bfloat16",
+        help="Pi0.5 model dtype. bfloat16 is recommended on A100-class GPUs.",
+    )
+    parser.add_argument(
+        "--pi05-gradient-checkpointing",
+        action="store_true",
+        help="Enable Pi0.5 gradient checkpointing to reduce peak GPU memory.",
+    )
+    parser.add_argument(
+        "--pi05-train-expert-only",
+        action="store_true",
+        help="Freeze the Pi0.5 VLM and train only the action expert/projection modules.",
+    )
+    parser.add_argument(
+        "--pi05-chunk-size",
+        type=int,
+        default=None,
+        help="Optional Pi0.5 action chunk size override. Defaults to the official value 50.",
+    )
     return parser.parse_args()
 
 
@@ -307,7 +340,68 @@ def build_policy_config(args: argparse.Namespace):
             **common_kwargs,
         )
 
+    if args.policy_type == "pi05":
+        pi05_kwargs = {
+            "pretrained_path": args.pi05_pretrained_path,
+            "dtype": args.pi05_dtype,
+            "gradient_checkpointing": args.pi05_gradient_checkpointing,
+            "train_expert_only": args.pi05_train_expert_only,
+            "use_relative_actions": False,
+            **common_kwargs,
+        }
+        if args.pi05_chunk_size is not None:
+            if args.pi05_chunk_size <= 0:
+                raise ValueError("--pi05-chunk-size must be a positive integer when provided.")
+            pi05_kwargs["chunk_size"] = args.pi05_chunk_size
+            pi05_kwargs["n_action_steps"] = args.pi05_chunk_size
+        return make_policy_config("pi05", **pi05_kwargs)
+
     raise ValueError(f"Unsupported policy type: {args.policy_type}")
+
+
+def validate_pi05_first_version_args(args: argparse.Namespace, val_freq: int) -> None:
+    if args.policy_type != "pi05":
+        return
+
+    if args.pi05_pretrained_path is None:
+        raise ValueError(
+            "--pi05-pretrained-path is required for --policy-type pi05. "
+            "Pi0.5 should be fine-tuned from a local pretrained checkpoint, not initialized from scratch."
+        )
+
+    pretrained_path = args.pi05_pretrained_path.expanduser()
+    if not pretrained_path.exists() or not pretrained_path.is_dir():
+        raise FileNotFoundError(
+            f"Pi0.5 pretrained checkpoint directory not found: {pretrained_path}. "
+            "First-wrapper Pi0.5 training only supports a local checkpoint directory; "
+            "download lerobot/pi05_base locally and pass that path."
+        )
+
+    missing_files = [
+        filename
+        for filename in ("config.json", "model.safetensors")
+        if not (pretrained_path / filename).is_file()
+    ]
+    if missing_files:
+        raise FileNotFoundError(
+            f"Pi0.5 pretrained checkpoint is incomplete: {pretrained_path}. "
+            f"Missing required file(s): {', '.join(missing_files)}. "
+            "Failing early avoids silently training a randomly initialized Pi0.5 model."
+        )
+
+    if val_freq > 0:
+        raise ValueError(
+            "Pi0.5 validation inference is not implemented in this wrapper version. "
+            "Use --val-freq 0 for B-stage training smoke tests."
+        )
+
+    if args.camera_mask_mode != "off":
+        raise ValueError(
+            "Pi0.5 B-stage training wrapper keeps camera masking disabled. "
+            "Use --camera-mask-mode off."
+        )
+
+    args.pi05_pretrained_path = pretrained_path.resolve()
 
 
 def resolve_resize_pad_config(args: argparse.Namespace) -> ResizePadConfig:
@@ -592,6 +686,39 @@ def apply_dataset_image_transform(dataset, resize_pad_config: ResizePadConfig) -
         dataset.set_image_transforms(transform)
 
 
+def build_processor_kwargs(
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    train_dataset,
+    device: torch.device,
+) -> dict[str, Any]:
+    processor_kwargs: dict[str, Any] = {}
+    processor_pretrained_path = cfg.policy.pretrained_path
+
+    if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
+        processor_kwargs["dataset_stats"] = train_dataset.meta.stats
+
+    if cfg.policy.type == "pi05" and processor_pretrained_path is not None and not cfg.resume:
+        processor_kwargs["preprocessor_overrides"] = {
+            "device_processor": {"device": device.type},
+            "normalizer_processor": {
+                "stats": train_dataset.meta.stats,
+                "features": {**policy.config.input_features, **policy.config.output_features},
+                "norm_map": policy.config.normalization_mapping,
+            },
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
+        }
+        processor_kwargs["postprocessor_overrides"] = {
+            "unnormalizer_processor": {
+                "stats": train_dataset.meta.stats,
+                "features": policy.config.output_features,
+                "norm_map": policy.config.normalization_mapping,
+            },
+        }
+
+    return processor_kwargs
+
+
 def evaluate_validation_loss(
     policy: PreTrainedPolicy,
     dataloader,
@@ -674,6 +801,7 @@ def main() -> None:
     args = parse_args()
     ensure_runtime_env()
     val_freq = args.save_freq if args.val_freq is None else args.val_freq
+    validate_pi05_first_version_args(args, val_freq)
 
     dataset_root = args.dataset_root.resolve()
     if not dataset_root.exists():
@@ -808,16 +936,12 @@ def main() -> None:
 
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta, rename_map=cfg.rename_map)
 
-    processor_kwargs: dict[str, Any] = {}
-    postprocessor_kwargs: dict[str, Any] = {}
-    if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
-        processor_kwargs["dataset_stats"] = train_dataset.meta.stats
+    processor_kwargs = build_processor_kwargs(cfg, policy, train_dataset, device)
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
         **processor_kwargs,
-        **postprocessor_kwargs,
     )
 
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)

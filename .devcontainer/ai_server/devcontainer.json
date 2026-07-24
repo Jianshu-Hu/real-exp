@@ -43,6 +43,6 @@
     "postCreateCommand": [
         "/bin/bash",
         "-lc",
-        "if [ ! -d '.venv_ai_server' ]; then uv venv .venv_ai_server; fi && source .venv_ai_server/bin/activate && cd lerobot && uv pip install -e '.[training,diffusion,grpcio-dep,pyzmq-dep]'"
+        "if [ ! -d '.venv_ai_server' ]; then uv venv .venv_ai_server; fi && source .venv_ai_server/bin/activate && cd lerobot && uv pip install -e '.[training,diffusion,grpcio-dep,pyzmq-dep,pi]'"
     ]
 }

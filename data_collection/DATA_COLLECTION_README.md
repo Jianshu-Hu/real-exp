@@ -160,7 +160,7 @@ The recording path is split into two pieces:
 The dataset currently records:
 
 - `observation.state`: actual robot joint positions, plus gripper width if enabled
-- `action`: absolute arm joint targets for the next sample, plus gripper command if enabled
+- `action`: absolute arm joint targets for the next sample, plus continuous gripper open-width command if enabled
 - `observation.images.cam_left`, `observation.images.cam_front`, `observation.images.cam_right`: RGB video streams
 
 The bridge expects:
@@ -171,7 +171,8 @@ The bridge expects:
 - Gripper commands on a topic like `/left/gripper/gripper_client/target_gripper_width_percent`
 - RGB image topics for three cameras
 
-By default the bridge publishes current measured robot joint states as `observation.state` and uses the arm-controller target topic (`/left|right/franka/commanded_joint_states`) as the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
+By default the bridge publishes current measured robot joint states as `observation.state` and uses the arm-controller target topic (`/left|right/franka/commanded_joint_states`) as the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position` and `gripper_action_representation=absolute_width`.
+To switch back to latched binary gripper commands, update both `GRIPPER_COMMAND_MODE` in `gello_publisher.py` and `GRIPPER_ACTION_REPRESENTATION` in `lerobot_data_bridge.py` to `binary_open_close` before collecting matching data.
 
 Launch the camera publisher from the ROS 2 workspace:
 

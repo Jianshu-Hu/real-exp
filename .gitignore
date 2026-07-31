@@ -186,7 +186,7 @@ cython_debug/
 #  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
 #  and can be added to the global gitignore or merged into this file. However, if you prefer, 
 #  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+.vscode/
 
 # Ruff stuff:
 .ruff_cache/
@@ -206,9 +206,31 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-.codex
-.hf-cache
+# docker venv
+.venv_robot_control/
+.venv_ai_server/
 
-lerobot_data
-data
-outputs
+# Local AI / assistant context
+# PROJECT_CONTEXT_FOR_AI.md
+
+# Runtime data and generated outputs
+data/
+lerobot_data/
+logs/
+outputs/
+reports/
+docs/
+
+# Runtime/cache directories
+__pycache__/
+.hf-cache/
+.codex/
+.continue/
+
+# Vscode
+.vscode/
+
+# Local reference files for experiments / Codex context
+external_reference/
+
+yxw_real_exp_train.tar.gz

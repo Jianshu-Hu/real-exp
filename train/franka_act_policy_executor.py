@@ -105,6 +105,32 @@ def parse_args() -> argparse.Namespace:
             "The blended action is old_ratio * old + (1 - old_ratio) * new."
         ),
     )
+    parser.add_argument(
+        "--action-fusion-mode",
+        choices=("fixed-ratio", "linear-ramp"),
+        default="fixed-ratio",
+        help=(
+            "How to fuse new action chunks with queued overlapping timesteps. "
+            "'fixed-ratio' keeps the existing aggregate-ratio behavior; "
+            "'linear-ramp' gradually transitions from old to new actions over --fusion-horizon."
+        ),
+    )
+    parser.add_argument(
+        "--fusion-horizon",
+        type=int,
+        default=3,
+        help="Number of overlapping timesteps used for linear-ramp action fusion.",
+    )
+    parser.add_argument(
+        "--buffer-horizon",
+        type=int,
+        default=3,
+        help=(
+            "Live execution only: when the action queue is empty while a request is in flight, "
+            "repeat the last command for at most this many control steps before switching "
+            "the deployment bridge to standby."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -115,6 +141,27 @@ def load_json(path: Path) -> dict[str, Any]:
 def get_aggregate_function(old_ration: float) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Build an aggregate function from the queued-action ratio."""
     return lambda old, new: old_ration * old + (1.0 - old_ration) * new
+
+
+def fuse_overlapping_action(
+    old_action: np.ndarray,
+    new_action: np.ndarray,
+    *,
+    fusion_mode: str,
+    aggregate_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    overlap_index: int,
+    fusion_horizon: int,
+) -> np.ndarray:
+    if fusion_mode == "fixed-ratio":
+        old_tensor = torch.as_tensor(old_action, dtype=torch.float32)
+        new_tensor = torch.as_tensor(new_action, dtype=torch.float32)
+        return aggregate_fn(old_tensor, new_tensor).detach().cpu().numpy()
+
+    if fusion_mode == "linear-ramp":
+        alpha = min(1.0, float(overlap_index + 1) / float(fusion_horizon))
+        return ((1.0 - alpha) * old_action + alpha * new_action).astype(np.float32)
+
+    raise ValueError(f"Unsupported action fusion mode: {fusion_mode}")
 
 
 def infer_policy_type(policy_path: Path) -> str:
@@ -262,8 +309,15 @@ class FrankaPolicyExecutor:
             raise ValueError(
                 f"--act-aggregate-ratio-old must be between 0 and 1, got {args.act_aggregate_ratio_old}"
             )
+        if args.fusion_horizon <= 0:
+            raise ValueError(f"--fusion-horizon must be positive, got {args.fusion_horizon}")
+        if args.buffer_horizon < 0:
+            raise ValueError(f"--buffer-horizon must be non-negative, got {args.buffer_horizon}")
         self.chunk_size_threshold = args.act_chunk_size_threshold
         self.aggregate_ratio_old = args.act_aggregate_ratio_old
+        self.action_fusion_mode = args.action_fusion_mode
+        self.fusion_horizon = args.fusion_horizon
+        self.buffer_horizon = args.buffer_horizon
 
         self.aggregate_fn = get_aggregate_function(self.aggregate_ratio_old)
         self.dataset_info = load_json(self.dataset_root / INFO_REL_PATH)
@@ -306,6 +360,10 @@ class FrankaPolicyExecutor:
         self.log_started_monotonic = time.perf_counter()
         self.inflight_observation_sent_monotonic: float | None = None
         self.latest_streamed_observation_timestep = -1
+        self.last_command_payload: dict[str, Any] | None = None
+        self.last_command_action: TimedAction | None = None
+        self.empty_queue_hold_count = 0
+        self.queue_starvation_halted = False
 
     def _arm_action_representation(self) -> str:
         return str(
@@ -385,6 +443,10 @@ class FrankaPolicyExecutor:
             "aggregate_ratio_old": self.aggregate_ratio_old,
             "act_chunk_size_threshold": self.args.act_chunk_size_threshold,
             "act_aggregate_ratio_old": self.args.act_aggregate_ratio_old,
+            "action_fusion_mode": self.action_fusion_mode,
+            "fusion_horizon": self.fusion_horizon,
+            "buffer_horizon": self.buffer_horizon,
+            "empty_queue_behavior": "hold_last_then_standby",
             "fps": self.args.fps,
             "task": self.args.task,
             "execute": self.args.execute,
@@ -504,6 +566,47 @@ class FrankaPolicyExecutor:
                 "reason": "all incoming actions were already executed",
             }
         )
+
+    def _log_action_hold_last(
+        self,
+        queue_snapshot: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        self._write_log_record(
+            {
+                "event": "action_hold_last",
+                "hold_count": self.empty_queue_hold_count,
+                "buffer_horizon": self.buffer_horizon,
+                "queue": queue_snapshot,
+                "inflight_observation_timestep": self._get_inflight_observation_timestep(),
+                "latest_executed_timestep": self.latest_executed_timestep,
+                "last_action_timestep": (
+                    self.last_command_action.get_timestep()
+                    if self.last_command_action is not None
+                    else None
+                ),
+                "command_payload": payload,
+            }
+        )
+
+    def _log_action_queue_starvation_halt(self, queue_snapshot: dict[str, Any]) -> None:
+        self._write_log_record(
+            {
+                "event": "action_queue_starvation_halt",
+                "hold_count": self.empty_queue_hold_count,
+                "buffer_horizon": self.buffer_horizon,
+                "queue": queue_snapshot,
+                "inflight_observation_timestep": self._get_inflight_observation_timestep(),
+                "latest_executed_timestep": self.latest_executed_timestep,
+                "last_action_timestep": (
+                    self.last_command_action.get_timestep()
+                    if self.last_command_action is not None
+                    else None
+                ),
+                "reason": "action queue empty while waiting for policy response",
+            }
+        )
+
     def _log_action_executed(
         self,
         action: TimedAction,
@@ -557,10 +660,10 @@ class FrankaPolicyExecutor:
             return max(0.0, min(1.0, float(value)))
         raise ValueError(f"Unsupported gripper action representation '{representation}' for bridge execution.")
 
-    def _set_bridge_active(self, active: bool) -> None:
-        if self.args.no_auto_activate_bridge:
+    def _set_bridge_active(self, active: bool, *, force: bool = False) -> None:
+        if self.args.no_auto_activate_bridge and not force:
             return
-        if self.bridge_active == active:
+        if self.bridge_active == active and not force:
             return
 
         state = "true" if active else "false"
@@ -615,6 +718,19 @@ class FrankaPolicyExecutor:
         with self.action_queue_lock:
             current_queue = {action.get_timestep(): action for action in self.action_queue}
             latest_executed_timestep = self.latest_executed_timestep
+            overlap_indices = {
+                timestep: index
+                for index, timestep in enumerate(
+                    sorted(
+                        {
+                            action.get_timestep()
+                            for action in incoming_actions
+                            if action.get_timestep() > latest_executed_timestep
+                            and action.get_timestep() in current_queue
+                        }
+                    )
+                )
+            }
 
             added = 0
             blended = 0
@@ -631,10 +747,16 @@ class FrankaPolicyExecutor:
                     continue
 
                 old_action = current_queue[timestep]
-                old_tensor = torch.as_tensor(np.asarray(old_action.get_action(), dtype=np.float32))
-                new_tensor = torch.as_tensor(np.asarray(new_action.get_action(), dtype=np.float32))
-                blended_tensor = self.aggregate_fn(old_tensor, new_tensor)
-                new_action.action = blended_tensor.detach().cpu().numpy()
+                old_array = np.asarray(old_action.get_action(), dtype=np.float32)
+                new_array = np.asarray(new_action.get_action(), dtype=np.float32)
+                new_action.action = fuse_overlapping_action(
+                    old_array,
+                    new_array,
+                    fusion_mode=self.action_fusion_mode,
+                    aggregate_fn=self.aggregate_fn,
+                    overlap_index=overlap_indices[timestep],
+                    fusion_horizon=self.fusion_horizon,
+                )
                 current_queue[timestep] = new_action
                 blended += 1
 
@@ -656,6 +778,8 @@ class FrankaPolicyExecutor:
             "queue_size": len(ordered_timesteps),
             "first_timestep": ordered_timesteps[0] if ordered_timesteps else None,
             "last_timestep": ordered_timesteps[-1] if ordered_timesteps else None,
+            "fusion_mode": self.action_fusion_mode,
+            "fusion_horizon": self.fusion_horizon,
         }
 
     def receive_actions(self) -> None:
@@ -759,6 +883,34 @@ class FrankaPolicyExecutor:
         self._set_bridge_active(True)
         self.command_socket.send_pyobj(payload)
 
+    def _record_sent_command(self, action: TimedAction, payload: dict[str, Any]) -> None:
+        self.last_command_action = action
+        self.last_command_payload = json_safe(payload)
+        self.empty_queue_hold_count = 0
+
+    def _handle_empty_action_queue(self, queue_snapshot: dict[str, Any]) -> bool:
+        if not self.args.execute:
+            return False
+        if self._get_inflight_observation_timestep() is None:
+            self.empty_queue_hold_count = 0
+            return False
+        if self.last_command_payload is None:
+            return False
+        if self.empty_queue_hold_count < self.buffer_horizon:
+            self.empty_queue_hold_count += 1
+            self.latest_executed_timestep = max(self.latest_executed_timestep + 1, 0)
+            payload = dict(self.last_command_payload)
+            payload["timestamp"] = time.time()
+            self._send_bridge_command(payload)
+            self._log_action_hold_last(queue_snapshot, payload)
+            return False
+
+        self._log_action_queue_starvation_halt(queue_snapshot)
+        self.queue_starvation_halted = True
+        self._set_bridge_active(False, force=True)
+        self.shutdown_event.set()
+        return True
+
     def maybe_pop_action(self) -> tuple[TimedAction | None, dict[str, Any], dict[str, Any]]:
         with self.action_queue_lock:
             queue_before = self._queue_snapshot_unlocked()
@@ -789,6 +941,9 @@ class FrankaPolicyExecutor:
         print(f"actions_per_chunk: {self.actions_per_chunk}")
         print(f"chunk_size_threshold: {self.chunk_size_threshold}")
         print(f"aggregate_ratio_old: {self.aggregate_ratio_old}")
+        print(f"action_fusion_mode: {self.action_fusion_mode}")
+        print(f"fusion_horizon: {self.fusion_horizon}")
+        print(f"buffer_horizon: {self.buffer_horizon}")
         print(f"execute: {self.args.execute}")
 
         context = zmq.Context()
@@ -862,6 +1017,7 @@ class FrankaPolicyExecutor:
                     payload = self._command_payload_from_action(action)
                     if self.args.execute:
                         self._send_bridge_command(payload)
+                        self._record_sent_command(action, payload)
                     self._log_action_executed(
                         action,
                         current_packet,
@@ -869,6 +1025,8 @@ class FrankaPolicyExecutor:
                         queue_before_pop,
                         queue_after_pop,
                     )
+                elif self._handle_empty_action_queue(queue_before_pop):
+                    break
 
                 sleep_time = max(0.0, (1.0 / self.args.fps) - (time.perf_counter() - loop_start))
                 time.sleep(sleep_time)

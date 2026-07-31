@@ -20,29 +20,34 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
 from lerobot.configs.default import DatasetConfig, WandBConfig
+from lerobot.configs.train import TRAIN_CONFIG_NAME
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_policy_config, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.rl.wandb_utils import WandBLogger
+from lerobot.common.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_train import update_policy
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
-from lerobot.utils.train_utils import (
+from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     load_training_state,
     save_checkpoint,
     update_last_checkpoint,
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK, PRETRAINED_MODEL_DIR
 from lerobot.utils.utils import init_logging
 
 from dataset_stats import ensure_dataset_stats
 from image_preprocessing import (
+    CameraMaskConfig,
     ResizePadConfig,
+    apply_camera_mask_to_batch,
     apply_resize_pad_to_feature_specs,
     make_resize_pad_transform,
+    validate_camera_mask_config,
 )
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
@@ -75,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--policy-type",
-        choices=("act", "diffusion"),
+        choices=("act", "diffusion", "pi05"),
         default="act",
         help="Imitation-learning policy family to train.",
     )
@@ -102,6 +107,39 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Constant fill value used for padded image regions.",
+    )
+    parser.add_argument(
+        "--camera-mask-mode",
+        choices=("off", "single"),
+        default="off",
+        help=(
+            "Optional training-only camera masking. 'off' keeps current behavior. "
+            "'single' samples at most one masked camera per training sample."
+        ),
+    )
+    parser.add_argument(
+        "--camera-mask-left-prob",
+        type=float,
+        default=0.0,
+        help="Probability of masking observation.images.cam_left in --camera-mask-mode single.",
+    )
+    parser.add_argument(
+        "--camera-mask-front-prob",
+        type=float,
+        default=0.0,
+        help="Probability of masking observation.images.cam_front in --camera-mask-mode single.",
+    )
+    parser.add_argument(
+        "--camera-mask-right-prob",
+        type=float,
+        default=0.0,
+        help="Probability of masking observation.images.cam_right in --camera-mask-mode single.",
+    )
+    parser.add_argument(
+        "--camera-mask-fill",
+        type=float,
+        default=0.0,
+        help="Fill value used for masked camera images. Default 0.0 gives black images.",
     )
     parser.add_argument(
         "--device",
@@ -132,6 +170,47 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         action="store_true",
         help="Resume from an existing output dir containing a prior training run.",
+    )
+    parser.add_argument(
+        "--resume-config-path",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a checkpoint pretrained_model/train_config.json used for --resume. "
+            "Defaults to <output-dir>/checkpoints/last/pretrained_model/train_config.json."
+        ),
+    )
+
+    parser.add_argument(
+        "--train-episodes",
+        default=None,
+        help=(
+            "Comma/whitespace-separated candidate training episodes, supporting inclusive ranges "
+            "like 0,1,4-8,12. Defaults to all dataset episodes."
+        ),
+    )
+    parser.add_argument(
+        "--train-episodes-file",
+        type=Path,
+        default=None,
+        help=(
+            "File containing candidate training episodes. Supports commas, whitespace, inclusive ranges, "
+            "and # comments. Combined with --train-episodes when both are set."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-episodes",
+        default=None,
+        help="Episodes to remove from the candidate set, supporting inclusive ranges like 3,10-12.",
+    )
+    parser.add_argument(
+        "--max-train-episodes",
+        type=int,
+        default=None,
+        help=(
+            "Cap the final training split to the first N episode ids after optional validation split. "
+            "Validation episodes are selected before this cap."
+        ),
     )
 
     parser.add_argument(
@@ -183,6 +262,39 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Reverse diffusion steps recorded in the diffusion policy config.",
     )
+
+    # Pi0.5-specific knobs. Keep the first wrapper version intentionally small.
+    parser.add_argument(
+        "--pi05-pretrained-path",
+        type=Path,
+        default=None,
+        help=(
+            "Local Pi0.5 pretrained checkpoint directory. Required for --policy-type pi05; "
+            "download lerobot/pi05_base locally first."
+        ),
+    )
+    parser.add_argument(
+        "--pi05-dtype",
+        choices=("bfloat16", "float32"),
+        default="bfloat16",
+        help="Pi0.5 model dtype. bfloat16 is recommended on A100-class GPUs.",
+    )
+    parser.add_argument(
+        "--pi05-gradient-checkpointing",
+        action="store_true",
+        help="Enable Pi0.5 gradient checkpointing to reduce peak GPU memory.",
+    )
+    parser.add_argument(
+        "--pi05-train-expert-only",
+        action="store_true",
+        help="Freeze the Pi0.5 VLM and train only the action expert/projection modules.",
+    )
+    parser.add_argument(
+        "--pi05-chunk-size",
+        type=int,
+        default=None,
+        help="Optional Pi0.5 action chunk size override. Defaults to the official value 50.",
+    )
     return parser.parse_args()
 
 
@@ -228,7 +340,68 @@ def build_policy_config(args: argparse.Namespace):
             **common_kwargs,
         )
 
+    if args.policy_type == "pi05":
+        pi05_kwargs = {
+            "pretrained_path": args.pi05_pretrained_path,
+            "dtype": args.pi05_dtype,
+            "gradient_checkpointing": args.pi05_gradient_checkpointing,
+            "train_expert_only": args.pi05_train_expert_only,
+            "use_relative_actions": False,
+            **common_kwargs,
+        }
+        if args.pi05_chunk_size is not None:
+            if args.pi05_chunk_size <= 0:
+                raise ValueError("--pi05-chunk-size must be a positive integer when provided.")
+            pi05_kwargs["chunk_size"] = args.pi05_chunk_size
+            pi05_kwargs["n_action_steps"] = args.pi05_chunk_size
+        return make_policy_config("pi05", **pi05_kwargs)
+
     raise ValueError(f"Unsupported policy type: {args.policy_type}")
+
+
+def validate_pi05_first_version_args(args: argparse.Namespace, val_freq: int) -> None:
+    if args.policy_type != "pi05":
+        return
+
+    if args.pi05_pretrained_path is None:
+        raise ValueError(
+            "--pi05-pretrained-path is required for --policy-type pi05. "
+            "Pi0.5 should be fine-tuned from a local pretrained checkpoint, not initialized from scratch."
+        )
+
+    pretrained_path = args.pi05_pretrained_path.expanduser()
+    if not pretrained_path.exists() or not pretrained_path.is_dir():
+        raise FileNotFoundError(
+            f"Pi0.5 pretrained checkpoint directory not found: {pretrained_path}. "
+            "First-wrapper Pi0.5 training only supports a local checkpoint directory; "
+            "download lerobot/pi05_base locally and pass that path."
+        )
+
+    missing_files = [
+        filename
+        for filename in ("config.json", "model.safetensors")
+        if not (pretrained_path / filename).is_file()
+    ]
+    if missing_files:
+        raise FileNotFoundError(
+            f"Pi0.5 pretrained checkpoint is incomplete: {pretrained_path}. "
+            f"Missing required file(s): {', '.join(missing_files)}. "
+            "Failing early avoids silently training a randomly initialized Pi0.5 model."
+        )
+
+    if val_freq > 0:
+        raise ValueError(
+            "Pi0.5 validation inference is not implemented in this wrapper version. "
+            "Use --val-freq 0 for B-stage training smoke tests."
+        )
+
+    if args.camera_mask_mode != "off":
+        raise ValueError(
+            "Pi0.5 B-stage training wrapper keeps camera masking disabled. "
+            "Use --camera-mask-mode off."
+        )
+
+    args.pi05_pretrained_path = pretrained_path.resolve()
 
 
 def resolve_resize_pad_config(args: argparse.Namespace) -> ResizePadConfig:
@@ -239,30 +412,220 @@ def resolve_resize_pad_config(args: argparse.Namespace) -> ResizePadConfig:
     )
 
 
+def resolve_camera_mask_config(args: argparse.Namespace) -> CameraMaskConfig:
+    config = CameraMaskConfig(
+        mode=args.camera_mask_mode,
+        left_prob=args.camera_mask_left_prob,
+        front_prob=args.camera_mask_front_prob,
+        right_prob=args.camera_mask_right_prob,
+        fill=args.camera_mask_fill,
+    )
+    validate_camera_mask_config(config)
+    return config
+
+
+def validate_camera_mask_dataset_features(
+    feature_specs: dict[str, dict],
+    camera_mask_config: CameraMaskConfig,
+) -> None:
+    if not camera_mask_config.enabled:
+        return
+    missing_keys = [key for key in camera_mask_config.camera_keys if key not in feature_specs]
+    if missing_keys:
+        raise KeyError(
+            "Camera mask is enabled but the dataset metadata is missing camera keys: "
+            + ", ".join(missing_keys)
+        )
+
+
 def resolve_output_dir(args: argparse.Namespace) -> Path:
     if args.output_dir is not None:
         return args.output_dir.resolve()
     return (DEFAULT_OUTPUT_ROOT / f"{args.dataset_root.name}_{args.policy_type}").resolve()
 
 
+def resolve_resume_config_path(args: argparse.Namespace, output_dir: Path) -> Path:
+    if args.resume_config_path is not None:
+        return args.resume_config_path.expanduser().resolve()
+    return (
+        output_dir
+        / CHECKPOINTS_DIR
+        / LAST_CHECKPOINT_LINK
+        / PRETRAINED_MODEL_DIR
+        / TRAIN_CONFIG_NAME
+    ).resolve()
+
+
+def load_resume_train_config(
+    args: argparse.Namespace,
+    output_dir: Path,
+    train_dataset_cfg: DatasetConfig,
+    wandb_cfg: WandBConfig,
+) -> TrainPipelineConfig:
+    resume_config_path = resolve_resume_config_path(args, output_dir)
+    if not resume_config_path.exists():
+        raise FileNotFoundError(
+            f"Resume config not found: {resume_config_path}. "
+            "Pass --resume-config-path explicitly or check that "
+            "<output-dir>/checkpoints/last/pretrained_model/train_config.json exists."
+        )
+
+    cfg = TrainPipelineConfig.from_pretrained(resume_config_path)
+    cfg.resume = True
+    if cfg.policy is None:
+        raise ValueError(f"Resume config does not define a policy: {resume_config_path}")
+    if cfg.policy.type != args.policy_type:
+        raise ValueError(
+            f"--policy-type {args.policy_type!r} does not match resumed checkpoint policy "
+            f"type {cfg.policy.type!r} from {resume_config_path}."
+        )
+
+    # Keep the optimizer/scheduler/policy config from the checkpoint, but allow the current command
+    # to describe the migrated run location and continuation settings.
+    cfg.dataset = train_dataset_cfg
+    cfg.output_dir = output_dir
+    cfg.job_name = f"{args.dataset_root.name}_{args.policy_type}"
+    cfg.seed = args.seed
+    cfg.num_workers = args.num_workers
+    cfg.batch_size = args.batch_size
+    cfg.steps = args.steps
+    cfg.env_eval_freq = 0
+    cfg.log_freq = args.log_freq
+    cfg.save_freq = args.save_freq
+    cfg.wandb = wandb_cfg
+
+    if args.device is not None:
+        cfg.policy.device = args.device
+    cfg.policy.push_to_hub = args.push_to_hub
+    cfg.policy.repo_id = args.policy_repo_id
+
+    policy_dir = resume_config_path.parent
+    cfg.policy.pretrained_path = policy_dir
+    cfg.checkpoint_path = policy_dir.parent
+    if not (cfg.checkpoint_path / "training_state").is_dir():
+        raise NotADirectoryError(
+            f"Resume checkpoint is missing training_state: {cfg.checkpoint_path / 'training_state'}"
+        )
+
+    if cfg.optimizer is None:
+        raise ValueError(f"Resume config does not define an optimizer: {resume_config_path}")
+    if cfg.policy.push_to_hub and not cfg.policy.repo_id:
+        raise ValueError("--policy-repo-id is required when --push-to-hub is set.")
+
+    return cfg
+
+
+def parse_episode_selection(text: str, source: str) -> list[int]:
+    normalized_text = text.replace(",", " ")
+    tokens = [token.strip() for token in normalized_text.split() if token.strip()]
+    if not tokens:
+        raise ValueError(f"No episode indices found in {source}.")
+
+    episode_indices: set[int] = set()
+    for token in tokens:
+        if token.isdigit():
+            episode_indices.add(int(token))
+            continue
+
+        if "-" in token:
+            range_parts = token.split("-")
+            if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
+                start = int(range_parts[0])
+                end = int(range_parts[1])
+                if start > end:
+                    raise ValueError(
+                        f"Invalid episode range {token!r} in {source}: start must be <= end."
+                    )
+                episode_indices.update(range(start, end + 1))
+                continue
+
+        raise ValueError(
+            f"Invalid episode token {token!r} in {source}. "
+            "Use non-negative integers or inclusive ranges like 4-8."
+        )
+
+    return sorted(episode_indices)
+
+
+def load_episode_selection_file(path: Path) -> list[int]:
+    selection_path = path.expanduser()
+    if not selection_path.exists():
+        raise FileNotFoundError(f"Episode selection file not found: {selection_path}")
+    if not selection_path.is_file():
+        raise FileNotFoundError(f"Episode selection path is not a file: {selection_path}")
+
+    content_lines = []
+    for line in selection_path.read_text().splitlines():
+        content_lines.append(line.split("#", 1)[0])
+    return parse_episode_selection(" ".join(content_lines), str(selection_path))
+
+
+def validate_episode_selection(indices: list[int], total_episodes: int, source: str) -> None:
+    invalid = [index for index in indices if index < 0 or index >= total_episodes]
+    if invalid:
+        raise ValueError(
+            f"Episode indices out of range in {source}: {invalid}. "
+            f"Dataset contains {total_episodes} episodes indexed 0 to {total_episodes - 1}."
+        )
+
+
+def resolve_candidate_episodes(args: argparse.Namespace, total_episodes: int) -> list[int]:
+    if total_episodes <= 0:
+        raise ValueError("Dataset contains no episodes.")
+
+    selected_episodes: set[int] | None = None
+    if args.train_episodes is not None:
+        parsed = parse_episode_selection(args.train_episodes, "--train-episodes")
+        validate_episode_selection(parsed, total_episodes, "--train-episodes")
+        selected_episodes = set(parsed)
+
+    if args.train_episodes_file is not None:
+        parsed = load_episode_selection_file(args.train_episodes_file)
+        validate_episode_selection(parsed, total_episodes, str(args.train_episodes_file))
+        if selected_episodes is None:
+            selected_episodes = set(parsed)
+        else:
+            selected_episodes.update(parsed)
+
+    if selected_episodes is None:
+        selected_episodes = set(range(total_episodes))
+
+    if args.exclude_episodes is not None:
+        excluded = parse_episode_selection(args.exclude_episodes, "--exclude-episodes")
+        validate_episode_selection(excluded, total_episodes, "--exclude-episodes")
+        selected_episodes.difference_update(excluded)
+
+    candidate_episodes = sorted(selected_episodes)
+    if not candidate_episodes:
+        raise ValueError("Episode selection is empty after applying filters.")
+    return candidate_episodes
+
+
 def resolve_episode_split(args: argparse.Namespace, total_episodes: int) -> tuple[list[int], list[int]]:
-    all_episodes = list(range(total_episodes))
+    candidate_episodes = resolve_candidate_episodes(args, total_episodes)
 
     if args.val_ratio <= 0:
-        return all_episodes, []
+        train_episodes = candidate_episodes
+        val_episodes: list[int] = []
+    else:
+        if not 0 < args.val_ratio < 1:
+            raise ValueError("--val-ratio must be in (0, 1) when provided.")
 
-    if not 0 < args.val_ratio < 1:
-        raise ValueError("--val-ratio must be in (0, 1) when provided.")
+        val_count = max(1, int(math.ceil(len(candidate_episodes) * args.val_ratio)))
+        if val_count >= len(candidate_episodes):
+            raise ValueError("Validation split would consume all selected episodes.")
 
-    val_count = max(1, int(math.ceil(total_episodes * args.val_ratio)))
-    if val_count >= total_episodes:
-        raise ValueError("Validation split would consume all episodes.")
+        shuffled_episodes = candidate_episodes.copy()
+        random.Random(args.seed).shuffle(shuffled_episodes)
+        val_episode_set = set(shuffled_episodes[:val_count])
+        train_episodes = [episode for episode in candidate_episodes if episode not in val_episode_set]
+        val_episodes = [episode for episode in candidate_episodes if episode in val_episode_set]
 
-    shuffled_episodes = all_episodes.copy()
-    random.Random(args.seed).shuffle(shuffled_episodes)
-    val_episode_set = set(shuffled_episodes[:val_count])
-    train_episodes = [episode for episode in all_episodes if episode not in val_episode_set]
-    val_episodes = [episode for episode in all_episodes if episode in val_episode_set]
+    if args.max_train_episodes is not None:
+        if args.max_train_episodes <= 0:
+            raise ValueError("--max-train-episodes must be a positive integer.")
+        train_episodes = train_episodes[: args.max_train_episodes]
+
     return train_episodes, val_episodes
 
 
@@ -321,6 +684,39 @@ def apply_dataset_image_transform(dataset, resize_pad_config: ResizePadConfig) -
     transform = make_resize_pad_transform(resize_pad_config)
     if transform is not None:
         dataset.set_image_transforms(transform)
+
+
+def build_processor_kwargs(
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    train_dataset,
+    device: torch.device,
+) -> dict[str, Any]:
+    processor_kwargs: dict[str, Any] = {}
+    processor_pretrained_path = cfg.policy.pretrained_path
+
+    if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
+        processor_kwargs["dataset_stats"] = train_dataset.meta.stats
+
+    if cfg.policy.type == "pi05" and processor_pretrained_path is not None and not cfg.resume:
+        processor_kwargs["preprocessor_overrides"] = {
+            "device_processor": {"device": device.type},
+            "normalizer_processor": {
+                "stats": train_dataset.meta.stats,
+                "features": {**policy.config.input_features, **policy.config.output_features},
+                "norm_map": policy.config.normalization_mapping,
+            },
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
+        }
+        processor_kwargs["postprocessor_overrides"] = {
+            "unnormalizer_processor": {
+                "stats": train_dataset.meta.stats,
+                "features": policy.config.output_features,
+                "norm_map": policy.config.normalization_mapping,
+            },
+        }
+
+    return processor_kwargs
 
 
 def evaluate_validation_loss(
@@ -405,6 +801,7 @@ def main() -> None:
     args = parse_args()
     ensure_runtime_env()
     val_freq = args.save_freq if args.val_freq is None else args.val_freq
+    validate_pi05_first_version_args(args, val_freq)
 
     dataset_root = args.dataset_root.resolve()
     if not dataset_root.exists():
@@ -425,7 +822,9 @@ def main() -> None:
     total_episodes = int(dataset_info["total_episodes"])
     train_episodes, val_episodes = resolve_episode_split(args, total_episodes)
     resize_pad_config = resolve_resize_pad_config(args)
+    camera_mask_config = resolve_camera_mask_config(args)
     apply_resize_pad_to_feature_specs(dataset_info["features"], resize_pad_config)
+    validate_camera_mask_dataset_features(dataset_info["features"], camera_mask_config)
 
     if not train_episodes:
         raise ValueError("Training split is empty.")
@@ -433,7 +832,6 @@ def main() -> None:
         raise ValueError("Validation is enabled but validation split is empty.")
 
     output_dir = resolve_output_dir(args)
-    policy_cfg = build_policy_config(args)
     wandb_cfg = WandBConfig(
         enable=not args.disable_wandb,
         project=args.wandb_project,
@@ -444,23 +842,32 @@ def main() -> None:
         dataset_root,
         train_episodes,
     )
-
-    cfg = TrainPipelineConfig(
-        dataset=train_dataset_cfg,
-        policy=policy_cfg,
-        output_dir=output_dir,
-        job_name=f"{args.dataset_root.name}_{args.policy_type}",
-        resume=args.resume,
-        seed=args.seed,
-        num_workers=args.num_workers,
-        batch_size=args.batch_size,
-        steps=args.steps,
-        eval_freq=0,
-        log_freq=args.log_freq,
-        save_freq=args.save_freq,
-        wandb=wandb_cfg,
-    )
-    cfg.validate()
+    if args.resume:
+        cfg = load_resume_train_config(
+            args=args,
+            output_dir=output_dir,
+            train_dataset_cfg=train_dataset_cfg,
+            wandb_cfg=wandb_cfg,
+        )
+        policy_cfg = cfg.policy
+    else:
+        policy_cfg = build_policy_config(args)
+        cfg = TrainPipelineConfig(
+            dataset=train_dataset_cfg,
+            policy=policy_cfg,
+            output_dir=output_dir,
+            job_name=f"{args.dataset_root.name}_{args.policy_type}",
+            resume=False,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size,
+            steps=args.steps,
+            env_eval_freq=0,
+            log_freq=args.log_freq,
+            save_freq=args.save_freq,
+            wandb=wandb_cfg,
+        )
+        cfg.validate()
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     force_cpu = cfg.policy.device == "cpu"
@@ -488,6 +895,18 @@ def main() -> None:
             f"arm={action_config.get('arm_action_representation')}, "
             f"gripper={action_config.get('gripper_action_representation')}"
         )
+        if camera_mask_config.enabled:
+            print(
+                "Camera mask augmentation: "
+                f"mode={camera_mask_config.mode}, "
+                f"left={camera_mask_config.left_prob:g}, "
+                f"front={camera_mask_config.front_prob:g}, "
+                f"right={camera_mask_config.right_prob:g}, "
+                f"none={camera_mask_config.none_prob:g}, "
+                f"fill={camera_mask_config.fill:g}"
+            )
+        else:
+            print("Camera mask augmentation: off")
 
     train_dataset = make_dataset(cfg)
     apply_dataset_image_transform(train_dataset, resize_pad_config)
@@ -507,7 +926,7 @@ def main() -> None:
             num_workers=args.num_workers,
             batch_size=args.batch_size,
             steps=args.steps,
-            eval_freq=0,
+            env_eval_freq=0,
             log_freq=args.log_freq,
             save_freq=args.save_freq,
             wandb=wandb_cfg,
@@ -517,16 +936,12 @@ def main() -> None:
 
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta, rename_map=cfg.rename_map)
 
-    processor_kwargs: dict[str, Any] = {}
-    postprocessor_kwargs: dict[str, Any] = {}
-    if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
-        processor_kwargs["dataset_stats"] = train_dataset.meta.stats
+    processor_kwargs = build_processor_kwargs(cfg, policy, train_dataset, device)
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
         **processor_kwargs,
-        **postprocessor_kwargs,
     )
 
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -564,12 +979,16 @@ def main() -> None:
         wandb_logger = None
 
     train_metrics = {
-        "loss": AverageMeter("loss", ":.3f"),
+        "loss": AverageMeter("loss", ":.3f", reduction="mean"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
-        "update_s": AverageMeter("updt_s", ":.3f"),
-        "dataloading_s": AverageMeter("data_s", ":.3f"),
+        "update_s": AverageMeter("updt_s", ":.3f", reduction="max"),
+        "dataloading_s": AverageMeter("data_s", ":.3f", reduction="max"),
     }
+
+    if torch.cuda.is_available():
+        train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
+
     train_tracker = MetricsTracker(
         cfg.batch_size,
         train_dataset.num_frames,
@@ -591,6 +1010,7 @@ def main() -> None:
         except StopIteration:
             train_iter = iter(train_dataloader)
             batch = next(train_iter)
+        batch = apply_camera_mask_to_batch(batch, camera_mask_config)
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 

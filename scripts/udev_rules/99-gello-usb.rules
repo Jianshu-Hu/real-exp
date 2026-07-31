@@ -1,0 +1,5 @@
+# Bind Right Arm to physical port 3-2
+SUBSYSTEM=="tty", KERNELS=="3-2:1.0", SYMLINK+="ttyUSB_right", MODE="0666"
+
+# Bind Left Arm to physical port 3-3
+SUBSYSTEM=="tty", KERNELS=="3-3:1.0", SYMLINK+="ttyUSB_left", MODE="0666"

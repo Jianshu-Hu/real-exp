@@ -4,6 +4,7 @@
 ## Overview
 - `lerobot_collection.py`: Minimal script for recording synchronized RealSense images and robot state/action data into a LeRobot dataset.
 - `gello_recording_home.py`: Internal ROS helper used by the recorder's optional GELLO reset-and-hold mode.
+- `../scripts/start_collection_duo.sh --safe-mode`: Optional collection-time q-goal monitoring or enforcement in the Franka controller.
 - `replay_pylibfranka.py`: Replay a recorded LeRobot episode on the real Franka arms using `pylibfranka`, with optional `--dry-run` inspection before motion.
 - `reset_pylibfranka.py`: Reset both Franka arms to the hardcoded initial state copied from `data/pick_and_place_test` episode 0, without reading dataset parquet files at runtime.
 - `initialize_franka_for_deployment.py`: Preview and safely initialize both Franka arms from a dataset episode start or a postprocessed absolute policy action before deployment.
@@ -301,6 +302,57 @@ source ~/anaconda3/bin/activate && conda activate lerobot
 python data_collection/lerobot_collection.py
 ```
 
+### Optional collection q-goal safe mode
+
+The one-command collection stack accepts a controller safety mode. Omitting the
+option preserves the original direct GELLO-to-Franka behavior:
+
+```bash
+cd <REAL_EXP_REPO>
+bash scripts/start_collection_duo.sh --safe-mode <off|monitor|enforce>
+```
+
+The modes are:
+
+- `off` (default): execute the mapped GELLO joint target unchanged
+- `monitor`: execute the unchanged target, while computing and publishing the
+  target that safe mode would have used
+- `enforce`: execute a stateful target limited by FR3 joint position, q-goal
+  velocity, q-goal acceleration, and maximum q-goal-to-measured-state error
+
+Safe mode runs inside the 1000 Hz joint-impedance controller. It does not change
+the GELLO-to-Franka mapping or restart a trajectory for every 25 Hz GELLO sample.
+If the GELLO command stream becomes stale or invalid, `monitor` and `enforce`
+hold the measured Franka position until fresh finite commands return.
+In `enforce`, `/left|right/franka/commanded_joint_states` contains the actual
+limited q-goal. The existing bridge therefore records that same safe q-goal as
+the arm action; no report or auxiliary file is placed in the dataset.
+
+Use `monitor` for the first hardware trial. Compare these optional diagnostics:
+
+```bash
+ros2 topic echo /left/franka/raw_commanded_joint_states
+ros2 topic echo /left/franka/safe_commanded_joint_states
+```
+
+Equivalent right-arm topics are under `/right`. Defaults are a `0.02 rad`
+position margin, 80% of FR3 maximum joint velocity, `8 rad/s^2` q-goal
+acceleration, and per-joint tracking-error caps of
+`[0.12, 0.12, 0.12, 0.12, 0.20, 0.25, 0.30] rad`. They are configured in
+`franka_fr3_arm_controllers/config/controllers.yaml`.
+
+After changing this controller, rebuild and source the ROS overlay before use:
+
+```bash
+cd <REAL_EXP_REPO>/gello_software/ros2
+colcon build --packages-select franka_fr3_arm_controllers --symlink-install
+source install/setup.bash
+```
+
+This q-goal layer complements rather than replaces Franka's native torque,
+collision, Cartesian, and reflex protections. Stop immediately if `monitor`
+shows repeated large interventions or the robot motion is unexpected.
+
 ### Optional GELLO reset and powered hold
 
 The recorder behaves exactly as before unless `--gello-reset-hold` is present. To
@@ -377,7 +429,6 @@ python3 data_collection/validate_dataset.py \
   --dataset-root data/pick_and_place_test \
   --skip-video-frames
 ```
-
 
 ## Additional Documentation
 

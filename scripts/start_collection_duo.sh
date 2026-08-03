@@ -23,6 +23,7 @@ COLLECTION_ZMQ_PORT="${COLLECTION_ZMQ_PORT:-5555}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="${COLLECTION_LOG_DIR:-${REPO_ROOT}/log/collection/${RUN_ID}}"
 LOCK_FILE="${COLLECTION_LOCK_FILE:-/tmp/real-exp-collection-duo.lock}"
+SAFE_MODE="off"
 
 declare -a COMPONENT_NAMES=()
 declare -a COMPONENT_PIDS=()
@@ -35,6 +36,46 @@ log() {
 fail() {
   log "ERROR: $*" >&2
   exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: bash scripts/start_collection_duo.sh [--safe-mode off|monitor|enforce]
+
+Collection q-goal safety modes:
+  off      Preserve the original direct GELLO-to-Franka behavior (default).
+  monitor  Publish safe-target diagnostics without changing Franka commands.
+  enforce  Execute and record position-, velocity-, acceleration-, and
+           tracking-error-limited joint targets.
+EOF
+}
+
+parse_args() {
+  while (( $# > 0 )); do
+    case "$1" in
+      --safe-mode)
+        (( $# >= 2 )) || fail "--safe-mode requires off, monitor, or enforce"
+        SAFE_MODE="$2"
+        shift 2
+        ;;
+      --safe-mode=*)
+        SAFE_MODE="${1#*=}"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "unknown argument: $1 (use --help for usage)"
+        ;;
+    esac
+  done
+
+  case "${SAFE_MODE}" in
+    off|monitor|enforce) ;;
+    *) fail "--safe-mode must be off, monitor, or enforce" ;;
+  esac
 }
 
 require_file() {
@@ -305,6 +346,8 @@ monitor_components() {
 }
 
 main() {
+  parse_args "$@"
+
   for required_command in flock stdbuf sed tee awk timeout setsid ps tr grep; do
     require_command "${required_command}"
   done
@@ -319,6 +362,8 @@ main() {
   if [[ -n "${CONDA_PREFIX:-}" ]]; then
     log "WARN: a Conda environment is active (${CONDA_PREFIX}). ROS nodes should normally use the system ROS environment."
   fi
+
+  log "Collection safe mode: ${SAFE_MODE}"
 
   trap on_exit EXIT
   trap 'exit 130' INT
@@ -335,7 +380,8 @@ main() {
   # deployment_mode:=true here.
   start_component arms \
     ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py \
-    robot_config_file:=example_fr3_duo_config.yaml
+    robot_config_file:=example_fr3_duo_config.yaml \
+    safe_mode:="${SAFE_MODE}"
   wait_for_topic_message arms /left/franka/joint_states
   wait_for_topic_message arms /right/franka/joint_states
 

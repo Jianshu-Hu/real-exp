@@ -52,6 +52,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional task string to override the task name coming from the ROS 2 bridge.",
     )
+    parser.add_argument(
+        "--gello-reset-hold",
+        action="store_true",
+        help=(
+            "Enable r + Enter to actively reset both GELLOs to INITIAL_STATE and "
+            "hold them until recording starts and real GELLO motion is detected."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -296,6 +304,11 @@ def packet_pair_to_frame(
 
 def main() -> None:
     args = parse_args()
+    gello_home_controller: Any | None = None
+    if args.gello_reset_hold:
+        from gello_recording_home import GelloRecordingHomeController
+
+        gello_home_controller = GelloRecordingHomeController(REPO_ROOT)
 
     dataset_root = Path(args.local_dir).expanduser()
     dataset_root.parent.mkdir(parents=True, exist_ok=True)
@@ -327,9 +340,13 @@ def main() -> None:
     print("  e + Enter: end and save the current episode")
     print("  d + Enter: discard the current episode")
     print("  q + Enter: quit the recorder")
+    if gello_home_controller is not None:
+        print("  r + Enter: reset both GELLOs to INITIAL_STATE and hold")
 
     try:
         while True:
+            if gello_home_controller is not None:
+                gello_home_controller.poll()
             try:
                 while True:
                     command = commands.get_nowait()
@@ -342,6 +359,14 @@ def main() -> None:
                         pending_packet = None
                         recording_active = True
                         print("Recording started.")
+                        if (
+                            gello_home_controller is not None
+                            and gello_home_controller.arm_release_after_motion()
+                        ):
+                            print(
+                                "GELLO hold armed: torque will turn off when "
+                                "real joint motion is detected."
+                            )
                     elif command == "e":
                         if dataset is None or not dataset.has_pending_frames():
                             recording_active = False
@@ -361,10 +386,27 @@ def main() -> None:
                             print("Current episode discarded.")
                         else:
                             print("No buffered episode to discard.")
+                    elif command == "r" and gello_home_controller is not None:
+                        if recording_active:
+                            print("Cannot reset GELLO while recording. Use e or d first.")
+                            continue
+                        try:
+                            status = gello_home_controller.start_and_hold()
+                            print(
+                                "GELLO hold active: "
+                                f"max initial-state error={status['max_error_deg']:.2f} deg."
+                            )
+                        except Exception as exc:
+                            print(f"GELLO reset failed: {exc}")
                     elif command == "q":
+                        if gello_home_controller is not None:
+                            gello_home_controller.stop("q + Enter")
                         raise KeyboardInterrupt
                     else:
-                        print("Unknown command. Use: s, e, d, q")
+                        available = "s, e, d, q"
+                        if gello_home_controller is not None:
+                            available += ", r"
+                        print(f"Unknown command. Use: {available}")
             except Empty:
                 pass
 
@@ -408,6 +450,8 @@ def main() -> None:
                     pending_packet = packet
 
     except KeyboardInterrupt:
+        if gello_home_controller is not None:
+            gello_home_controller.stop("recorder exit")
         print("\nStopping collection...")
         if dataset is None or not dataset.has_pending_frames():
             print("No samples received. Nothing was saved.")
@@ -420,6 +464,8 @@ def main() -> None:
         if dataset is not None:
             finalize_dataset(dataset, args.repo_id)
     finally:
+        if gello_home_controller is not None:
+            gello_home_controller.stop("recorder cleanup")
         socket.close(0)
         context.term()
 

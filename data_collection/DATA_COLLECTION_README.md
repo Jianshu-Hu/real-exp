@@ -3,8 +3,11 @@
 
 ## Overview
 - `lerobot_collection.py`: Minimal script for recording synchronized RealSense images and robot state/action data into a LeRobot dataset.
+- `gello_recording_home.py`: Internal ROS helper used by the recorder's optional GELLO reset-and-hold mode.
+- `../scripts/start_collection_duo.sh --safe-mode`: Optional collection-time q-goal monitoring or enforcement in the Franka controller.
 - `replay_pylibfranka.py`: Replay a recorded LeRobot episode on the real Franka arms using `pylibfranka`, with optional `--dry-run` inspection before motion.
 - `reset_pylibfranka.py`: Reset both Franka arms to the hardcoded initial state copied from `data/pick_and_place_test` episode 0, without reading dataset parquet files at runtime.
+- `initialize_franka_for_deployment.py`: Preview and safely initialize both Franka arms from a dataset episode start or a postprocessed absolute policy action before deployment.
 - `delete_lerobot_episode.py`: Remove one or more episodes from a local LeRobot dataset while preserving the remaining metadata, videos, and parquet data.
 - `validate_dataset.py`: Validate a local LeRobot dataset and print dataset-level and per-episode consistency information.
 
@@ -97,6 +100,107 @@ python data_collection/reset_pylibfranka.py \
   --episode 0 \
   --frame-index 0
 ```
+
+## Deployment Initialization
+
+For the normal ROS deployment flow, use `--policy-start` or
+`--episode-start [INDEX]` directly on `franka_act_policy_executor.py` or
+`franka_diffusion_policy_executor.py`. Those two mutually exclusive options share
+the running deployment bridge/controller path, so the four ROS deployment launch
+groups stay running.
+
+`initialize_franka_for_deployment.py` is a standalone direct-`pylibfranka`
+maintenance tool, not the normal executor startup path. It validates
+all arm targets against the FR3 joint limits with a safety margin before opening a robot
+connection. Movement is preview-only unless both `--execute` and the confirmation phrase
+are supplied. Stop the ROS arm controller and any other Franka command source before using
+this direct `pylibfranka` command.
+
+Choose a random dataset episode start and preview it:
+
+```bash
+python3 data_collection/initialize_franka_for_deployment.py \
+  --episode \
+  --dataset-root data/L3_drawer_swap_20260630_trim_start_3s
+```
+
+Use a deterministic random selection:
+
+```bash
+python3 data_collection/initialize_franka_for_deployment.py \
+  --episode \
+  --random-seed 7 \
+  --dataset-root data/L3_drawer_swap_20260630_trim_start_3s
+```
+
+Choose a specific episode:
+
+```bash
+python3 data_collection/initialize_franka_for_deployment.py \
+  --episode 12 \
+  --dataset-root data/L3_drawer_swap_20260630_trim_start_3s
+```
+
+After reviewing the preview, add the execution confirmation:
+
+```bash
+python3 data_collection/initialize_franka_for_deployment.py \
+  --episode 12 \
+  --dataset-root data/L3_drawer_swap_20260630_trim_start_3s \
+  --execute \
+  --confirm INITIALIZE_FRANKA_FOR_DEPLOYMENT
+```
+
+Policy mode consumes a policy's already postprocessed absolute action, not a checkpoint
+directory. A checkpoint has no single static initial pose because its output depends on the
+live images and robot state. Pass 14 arm values directly, or pass 16 values when the action
+also contains both gripper commands:
+
+```bash
+python3 data_collection/initialize_franka_for_deployment.py \
+  --policy LEFT_Q1 LEFT_Q2 LEFT_Q3 LEFT_Q4 LEFT_Q5 LEFT_Q6 LEFT_Q7 \
+           LEFT_GRIPPER \
+           RIGHT_Q1 RIGHT_Q2 RIGHT_Q3 RIGHT_Q4 RIGHT_Q5 RIGHT_Q6 RIGHT_Q7 \
+           RIGHT_GRIPPER
+```
+
+The policy target may instead be a JSON array or a JSON file containing `policy_action`,
+`action`, `initial_state`, or `target`:
+
+```bash
+python3 data_collection/initialize_franka_for_deployment.py \
+  --policy outputs/policy_initial_action.json
+```
+
+The default policy gripper representation is `binary_open_close`; values below `0.5` close
+the gripper and values at or above `0.5` open it to `0.08 m`. For policies trained with
+absolute gripper widths, add:
+
+```bash
+--policy-gripper-representation absolute_width
+```
+
+Add `--skip-grippers` to either mode to leave the grippers unchanged. A 14-D policy target
+also leaves both grippers unchanged automatically.
+
+## Automated Dual-Arm Collection Stack
+
+From the repository root, start the five ROS 2 process groups required for
+dual-arm collection:
+
+```bash
+bash scripts/start_collection_duo.sh
+```
+
+The launcher starts and monitors the GELLO publisher, Franka controllers,
+gripper clients, camera publishers, and collection bridge in dependency order.
+It checks the ROS overlays, ZMQ port, required topics, and process health, then
+stops all children in reverse order on Ctrl-C. The LeRobot recorder intentionally
+runs in a separate Conda terminal so episode commands remain interactive.
+
+Use `COLLECTION_ZMQ_PORT`, `READY_TIMEOUT`, or the documented setup-path
+environment variables at the top of the script when the local installation uses
+non-default paths or ports.
 
 ## Teleoperation Quick Start
 
@@ -195,8 +299,99 @@ Then run the LeRobot recorder from the repo root:
 
 ```bash
 source ~/anaconda3/bin/activate && conda activate lerobot
-python lerobot_collection.py
+python data_collection/lerobot_collection.py
 ```
+
+### Optional collection q-goal safe mode
+
+The one-command collection stack accepts a controller safety mode. Omitting the
+option preserves the original direct GELLO-to-Franka behavior:
+
+```bash
+cd <REAL_EXP_REPO>
+bash scripts/start_collection_duo.sh --safe-mode <off|monitor|enforce>
+```
+
+The modes are:
+
+- `off` (default): execute the mapped GELLO joint target unchanged
+- `monitor`: execute the unchanged target, while computing and publishing the
+  target that safe mode would have used
+- `enforce`: execute a stateful target limited by FR3 joint position, q-goal
+  velocity, q-goal acceleration, and maximum q-goal-to-measured-state error
+
+Safe mode runs inside the 1000 Hz joint-impedance controller. It does not change
+the GELLO-to-Franka mapping or restart a trajectory for every 25 Hz GELLO sample.
+If the GELLO command stream becomes stale or invalid, `monitor` and `enforce`
+hold the measured Franka position until fresh finite commands return.
+In `enforce`, `/left|right/franka/commanded_joint_states` contains the actual
+limited q-goal. The existing bridge therefore records that same safe q-goal as
+the arm action; no report or auxiliary file is placed in the dataset.
+
+Use `monitor` for the first hardware trial. Compare these optional diagnostics:
+
+```bash
+ros2 topic echo /left/franka/raw_commanded_joint_states
+ros2 topic echo /left/franka/safe_commanded_joint_states
+```
+
+Equivalent right-arm topics are under `/right`. Defaults are a `0.02 rad`
+position margin, 80% of FR3 maximum joint velocity, `8 rad/s^2` q-goal
+acceleration, and per-joint tracking-error caps of
+`[0.12, 0.12, 0.12, 0.12, 0.20, 0.25, 0.30] rad`. They are configured in
+`franka_fr3_arm_controllers/config/controllers.yaml`.
+
+After changing this controller, rebuild and source the ROS overlay before use:
+
+```bash
+cd <REAL_EXP_REPO>/gello_software/ros2
+colcon build --packages-select franka_fr3_arm_controllers --symlink-install
+source install/setup.bash
+```
+
+This q-goal layer complements rather than replaces Franka's native torque,
+collision, Cartesian, and reflex protections. Stop immediately if `monitor`
+shows repeated large interventions or the robot motion is unexpected.
+
+### Optional GELLO reset and powered hold
+
+The recorder behaves exactly as before unless `--gello-reset-hold` is present. To
+enable the integrated dual-GELLO reset key:
+
+```bash
+cd ~/real-exp
+source ~/anaconda3/bin/activate && conda activate lerobot
+python data_collection/lerobot_collection.py \
+  --gello-reset-hold \
+  --repo-id local/franka_gello_teleop \
+  --local-dir ./lerobot_data
+```
+
+The GELLO publishers and their ROS parameter services must already be running from
+the rebuilt `gello_software/ros2` workspace. The recorder automatically launches
+its homing helper with ROS Humble's system Python, so the LeRobot environment does
+not need to provide `rclpy`.
+
+Additional control in this mode:
+
+- `r + Enter`: actively reset both GELLOs to
+  `reset_pylibfranka.INITIAL_STATE`, then keep all arm joints powered at the target
+- `s + Enter`: start recording normally and arm automatic torque release
+- moving either GELLO joint by about `0.75 deg` after `s` restores the original
+  gains/current settings and turns off both GELLO arm torques
+- `q + Enter` or Ctrl-C: turn off GELLO torque first, then use the recorder's
+  existing save/finalize path
+
+Do not press `r` during an episode; the recorder rejects that command until the
+episode is saved or discarded. If `s` is followed by `e` or `d` without any GELLO
+movement, the hold remains active as requested and can be released by movement
+after a later `s`, or by `q`.
+
+This mode uses the settings previously validated with one USB connection per
+GELLO: groups of at most three joints per side use `100 mA` while homing, and
+other joints use `15 mA`; after homing, every arm joint holds at `15 mA`. It does
+not enable the gripper motor. Keep the two GELLO workspaces clear while pressing
+`r`, and use Ctrl-C if the motion is not as expected.
 
 ## Dataset Validation
 
@@ -234,7 +429,6 @@ python3 data_collection/validate_dataset.py \
   --dataset-root data/pick_and_place_test \
   --skip-video-frames
 ```
-
 
 ## Additional Documentation
 

@@ -15,8 +15,17 @@ from typing import Any
 import numpy as np
 import torch
 
+from deployment_start_target import EpisodeStartTarget, load_episode_start_target
+
 # from lerobot.async_inference.configs import get_aggregate_function
 from lerobot.async_inference.helpers import RemotePolicyConfig, TimedAction, TimedObservation
+from policy_action_limiter import (
+    LimitedActionPlan,
+    LimitedArmStep,
+    PolicyActionLimiter,
+    PolicyStartAligner,
+    add_policy_action_limit_arguments,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +79,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zmq-host", default="127.0.0.1")
     parser.add_argument("--zmq-port", type=int, default=5555)
     parser.add_argument("--fps", type=int, default=15)
+    add_policy_action_limit_arguments(parser)
+    startup_source = parser.add_mutually_exclusive_group()
+    startup_source.add_argument(
+        "--policy-start",
+        "--initialize-to-policy-start",
+        dest="policy_start",
+        action="store_true",
+        help=(
+            "Before normal execution, use the first live policy prediction as an "
+            "alignment target, move to it conservatively, discard the stale chunk, "
+            "and re-run inference from the aligned live state."
+        ),
+    )
+    startup_source.add_argument(
+        "--episode-start",
+        nargs="?",
+        const="random",
+        default=None,
+        metavar="INDEX",
+        help=(
+            "Before normal execution, align through the running deployment bridge to "
+            "observation.state at frame 0 of a dataset episode. Omit INDEX to select "
+            "an episode randomly."
+        ),
+    )
+    parser.add_argument(
+        "--episode-start-frame-index",
+        type=int,
+        default=0,
+        help="Episode-local frame used by --episode-start (default: 0).",
+    )
+    parser.add_argument(
+        "--episode-start-random-seed",
+        type=int,
+        default=None,
+        help="Optional reproducible random seed for --episode-start without INDEX.",
+    )
     parser.add_argument("--task", default="pick and place")
     parser.add_argument(
         "--act-chunk-size-threshold",
@@ -105,6 +151,32 @@ def parse_args() -> argparse.Namespace:
             "The blended action is old_ratio * old + (1 - old_ratio) * new."
         ),
     )
+    parser.add_argument(
+        "--action-fusion-mode",
+        choices=("fixed-ratio", "linear-ramp"),
+        default="fixed-ratio",
+        help=(
+            "How to fuse new action chunks with queued overlapping timesteps. "
+            "'fixed-ratio' keeps the existing aggregate-ratio behavior; "
+            "'linear-ramp' gradually transitions from old to new actions over --fusion-horizon."
+        ),
+    )
+    parser.add_argument(
+        "--fusion-horizon",
+        type=int,
+        default=3,
+        help="Number of overlapping timesteps used for linear-ramp action fusion.",
+    )
+    parser.add_argument(
+        "--buffer-horizon",
+        type=int,
+        default=3,
+        help=(
+            "Live execution only: when the action queue is empty while a request is in flight, "
+            "repeat the last command for at most this many control steps before switching "
+            "the deployment bridge to standby."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -115,6 +187,27 @@ def load_json(path: Path) -> dict[str, Any]:
 def get_aggregate_function(old_ration: float) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Build an aggregate function from the queued-action ratio."""
     return lambda old, new: old_ration * old + (1.0 - old_ration) * new
+
+
+def fuse_overlapping_action(
+    old_action: np.ndarray,
+    new_action: np.ndarray,
+    *,
+    fusion_mode: str,
+    aggregate_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    overlap_index: int,
+    fusion_horizon: int,
+) -> np.ndarray:
+    if fusion_mode == "fixed-ratio":
+        old_tensor = torch.as_tensor(old_action, dtype=torch.float32)
+        new_tensor = torch.as_tensor(new_action, dtype=torch.float32)
+        return aggregate_fn(old_tensor, new_tensor).detach().cpu().numpy()
+
+    if fusion_mode == "linear-ramp":
+        alpha = min(1.0, float(overlap_index + 1) / float(fusion_horizon))
+        return ((1.0 - alpha) * old_action + alpha * new_action).astype(np.float32)
+
+    raise ValueError(f"Unsupported action fusion mode: {fusion_mode}")
 
 
 def infer_policy_type(policy_path: Path) -> str:
@@ -262,8 +355,31 @@ class FrankaPolicyExecutor:
             raise ValueError(
                 f"--act-aggregate-ratio-old must be between 0 and 1, got {args.act_aggregate_ratio_old}"
             )
+        if args.fusion_horizon <= 0:
+            raise ValueError(f"--fusion-horizon must be positive, got {args.fusion_horizon}")
+        if args.buffer_horizon < 0:
+            raise ValueError(f"--buffer-horizon must be non-negative, got {args.buffer_horizon}")
+        startup_alignment_enabled = (
+            args.policy_start or args.episode_start is not None
+        )
+        if startup_alignment_enabled and not args.execute:
+            raise ValueError("--policy-start and --episode-start require --execute.")
+        self.startup_alignment_mode = (
+            "policy"
+            if args.policy_start
+            else "episode"
+            if args.episode_start is not None
+            else None
+        )
         self.chunk_size_threshold = args.act_chunk_size_threshold
         self.aggregate_ratio_old = args.act_aggregate_ratio_old
+        self.action_fusion_mode = args.action_fusion_mode
+        self.fusion_horizon = args.fusion_horizon
+        self.buffer_horizon = args.buffer_horizon
+        self.action_limiter = PolicyActionLimiter(args.fps) if args.limit else None
+        self.startup_aligner = (
+            PolicyStartAligner(args.fps) if startup_alignment_enabled else None
+        )
 
         self.aggregate_fn = get_aggregate_function(self.aggregate_ratio_old)
         self.dataset_info = load_json(self.dataset_root / INFO_REL_PATH)
@@ -279,6 +395,16 @@ class FrankaPolicyExecutor:
                 "Deployment expects absolute_joint_position arm actions. "
                 "Record and train a new absolute-target dataset before executing this policy."
             )
+        self.episode_start_target: EpisodeStartTarget | None = None
+        if args.episode_start is not None:
+            self.episode_start_target = load_episode_start_target(
+                self.dataset_root,
+                args.episode_start,
+                frame_index=args.episode_start_frame_index,
+                random_seed=args.episode_start_random_seed,
+                action_dim=int(self.dataset_info["features"]["action"]["shape"][0]),
+                gripper_action_representation=self._gripper_action_representation(),
+            )
 
         grpc, services_pb2, services_pb2_grpc, grpc_channel_options, send_bytes_in_chunks = import_grpc_runtime()
         self.grpc = grpc
@@ -292,6 +418,8 @@ class FrankaPolicyExecutor:
 
         self.action_queue: deque[TimedAction] = deque()
         self.action_queue_lock = threading.Lock()
+        self.policy_generation = 0
+        self.policy_generation_lock = threading.Lock()
         self.inflight_observation_lock = threading.Lock()
         self.log_lock = threading.Lock()
         self.shutdown_event = threading.Event()
@@ -306,6 +434,21 @@ class FrankaPolicyExecutor:
         self.log_started_monotonic = time.perf_counter()
         self.inflight_observation_sent_monotonic: float | None = None
         self.latest_streamed_observation_timestep = -1
+        self.last_command_payload: dict[str, Any] | None = None
+        self.last_command_action: TimedAction | None = None
+        self.empty_queue_hold_count = 0
+        self.queue_starvation_halted = False
+        self.limited_action_steps: deque[LimitedArmStep] = deque()
+        self.limited_source_action: TimedAction | None = None
+        self.limited_action_plan: LimitedActionPlan | None = None
+        self.limited_queue_before_pop: dict[str, Any] | None = None
+        self.limited_queue_after_pop: dict[str, Any] | None = None
+        self.startup_source_action: TimedAction | None = None
+        self.startup_alignment_target_action: np.ndarray | None = (
+            self.episode_start_target.action_target.copy()
+            if self.episode_start_target is not None
+            else None
+        )
 
     def _arm_action_representation(self) -> str:
         return str(
@@ -385,6 +528,33 @@ class FrankaPolicyExecutor:
             "aggregate_ratio_old": self.aggregate_ratio_old,
             "act_chunk_size_threshold": self.args.act_chunk_size_threshold,
             "act_aggregate_ratio_old": self.args.act_aggregate_ratio_old,
+            "action_fusion_mode": self.action_fusion_mode,
+            "fusion_horizon": self.fusion_horizon,
+            "buffer_horizon": self.buffer_horizon,
+            "empty_queue_behavior": "hold_last_then_standby",
+            "policy_action_limiter": (
+                self.action_limiter.config_dict()
+                if self.action_limiter is not None
+                else {"enabled": False}
+            ),
+            "startup_alignment": {
+                **(
+                    self.startup_aligner.config_dict()
+                    if self.startup_aligner is not None
+                    else {"enabled": False}
+                ),
+                "mode": self.startup_alignment_mode,
+                "episode_index": (
+                    self.episode_start_target.episode_index
+                    if self.episode_start_target is not None
+                    else None
+                ),
+                "episode_frame_index": (
+                    self.episode_start_target.frame_index
+                    if self.episode_start_target is not None
+                    else None
+                ),
+            },
             "fps": self.args.fps,
             "task": self.args.task,
             "execute": self.args.execute,
@@ -504,6 +674,47 @@ class FrankaPolicyExecutor:
                 "reason": "all incoming actions were already executed",
             }
         )
+
+    def _log_action_hold_last(
+        self,
+        queue_snapshot: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        self._write_log_record(
+            {
+                "event": "action_hold_last",
+                "hold_count": self.empty_queue_hold_count,
+                "buffer_horizon": self.buffer_horizon,
+                "queue": queue_snapshot,
+                "inflight_observation_timestep": self._get_inflight_observation_timestep(),
+                "latest_executed_timestep": self.latest_executed_timestep,
+                "last_action_timestep": (
+                    self.last_command_action.get_timestep()
+                    if self.last_command_action is not None
+                    else None
+                ),
+                "command_payload": payload,
+            }
+        )
+
+    def _log_action_queue_starvation_halt(self, queue_snapshot: dict[str, Any]) -> None:
+        self._write_log_record(
+            {
+                "event": "action_queue_starvation_halt",
+                "hold_count": self.empty_queue_hold_count,
+                "buffer_horizon": self.buffer_horizon,
+                "queue": queue_snapshot,
+                "inflight_observation_timestep": self._get_inflight_observation_timestep(),
+                "latest_executed_timestep": self.latest_executed_timestep,
+                "last_action_timestep": (
+                    self.last_command_action.get_timestep()
+                    if self.last_command_action is not None
+                    else None
+                ),
+                "reason": "action queue empty while waiting for policy response",
+            }
+        )
+
     def _log_action_executed(
         self,
         action: TimedAction,
@@ -557,10 +768,10 @@ class FrankaPolicyExecutor:
             return max(0.0, min(1.0, float(value)))
         raise ValueError(f"Unsupported gripper action representation '{representation}' for bridge execution.")
 
-    def _set_bridge_active(self, active: bool) -> None:
-        if self.args.no_auto_activate_bridge:
+    def _set_bridge_active(self, active: bool, *, force: bool = False) -> None:
+        if self.args.no_auto_activate_bridge and not force:
             return
-        if self.bridge_active == active:
+        if self.bridge_active == active and not force:
             return
 
         state = "true" if active else "false"
@@ -572,7 +783,7 @@ class FrankaPolicyExecutor:
             "std_srvs/srv/SetBool",
             f"{{data: {state}}}",
         ]
-        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=5.0)  # nosec B603
+        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=15.0)  # nosec B603
         if result.returncode != 0 or "success=True" not in result.stdout:
             raise RuntimeError(
                 f"Failed to {'activate' if active else 'deactivate'} bridge via "
@@ -615,6 +826,19 @@ class FrankaPolicyExecutor:
         with self.action_queue_lock:
             current_queue = {action.get_timestep(): action for action in self.action_queue}
             latest_executed_timestep = self.latest_executed_timestep
+            overlap_indices = {
+                timestep: index
+                for index, timestep in enumerate(
+                    sorted(
+                        {
+                            action.get_timestep()
+                            for action in incoming_actions
+                            if action.get_timestep() > latest_executed_timestep
+                            and action.get_timestep() in current_queue
+                        }
+                    )
+                )
+            }
 
             added = 0
             blended = 0
@@ -631,10 +855,16 @@ class FrankaPolicyExecutor:
                     continue
 
                 old_action = current_queue[timestep]
-                old_tensor = torch.as_tensor(np.asarray(old_action.get_action(), dtype=np.float32))
-                new_tensor = torch.as_tensor(np.asarray(new_action.get_action(), dtype=np.float32))
-                blended_tensor = self.aggregate_fn(old_tensor, new_tensor)
-                new_action.action = blended_tensor.detach().cpu().numpy()
+                old_array = np.asarray(old_action.get_action(), dtype=np.float32)
+                new_array = np.asarray(new_action.get_action(), dtype=np.float32)
+                new_action.action = fuse_overlapping_action(
+                    old_array,
+                    new_array,
+                    fusion_mode=self.action_fusion_mode,
+                    aggregate_fn=self.aggregate_fn,
+                    overlap_index=overlap_indices[timestep],
+                    fusion_horizon=self.fusion_horizon,
+                )
                 current_queue[timestep] = new_action
                 blended += 1
 
@@ -656,54 +886,68 @@ class FrankaPolicyExecutor:
             "queue_size": len(ordered_timesteps),
             "first_timestep": ordered_timesteps[0] if ordered_timesteps else None,
             "last_timestep": ordered_timesteps[-1] if ordered_timesteps else None,
+            "fusion_mode": self.action_fusion_mode,
+            "fusion_horizon": self.fusion_horizon,
         }
 
     def receive_actions(self) -> None:
         while not self.shutdown_event.is_set():
             try:
+                with self.policy_generation_lock:
+                    request_generation = self.policy_generation
                 response = self.stub.GetActions(self.services_pb2.Empty())
-                if len(response.data) == 0:
-                    cleared_timestep, latency_s = self._clear_observation_inflight()
-                    if cleared_timestep is not None:
+                with self.policy_generation_lock:
+                    if request_generation != self.policy_generation:
                         self._write_log_record(
                             {
-                                "event": "action_request_timeout",
-                                "cleared_inflight_observation_timestep": cleared_timestep,
-                                "inflight_latency_s": latency_s,
-                                "latest_executed_timestep": self.latest_executed_timestep,
+                                "event": "stale_action_response_discarded",
+                                "response_generation": request_generation,
+                                "current_generation": self.policy_generation,
                             }
                         )
-                    continue
+                        continue
+                    if len(response.data) == 0:
+                        cleared_timestep, latency_s = self._clear_observation_inflight()
+                        if cleared_timestep is not None:
+                            self._write_log_record(
+                                {
+                                    "event": "action_request_timeout",
+                                    "cleared_inflight_observation_timestep": cleared_timestep,
+                                    "inflight_latency_s": latency_s,
+                                    "latest_executed_timestep": self.latest_executed_timestep,
+                                }
+                            )
+                        continue
 
-                incoming_actions: list[TimedAction] = pickle.loads(response.data)  # nosec
-                if not incoming_actions:
-                    self._clear_observation_inflight()
-                    continue
+                    incoming_actions: list[TimedAction] = pickle.loads(response.data)  # nosec
+                    if not incoming_actions:
+                        self._clear_observation_inflight()
+                        continue
 
-                self.action_chunk_size = max(self.action_chunk_size, len(incoming_actions))
-                cleared_inflight_timestep, inflight_latency_s = self._clear_observation_inflight()
-                filtered = [
-                    action
-                    for action in incoming_actions
-                    if action.get_timestep() > self.latest_executed_timestep
-                ]
-                if not filtered:
-                    self._log_action_chunk_filtered(
+                    self.action_chunk_size = max(self.action_chunk_size, len(incoming_actions))
+                    cleared_inflight_timestep, inflight_latency_s = self._clear_observation_inflight()
+                    filtered = [
+                        action
+                        for action in incoming_actions
+                        if action.get_timestep() > self.latest_executed_timestep
+                    ]
+                    if not filtered:
+                        self._log_action_chunk_filtered(
+                            incoming_actions,
+                            cleared_inflight_timestep,
+                            inflight_latency_s,
+                        )
+                        continue
+
+                    aggregate_stats = self._aggregate_action_queue(filtered)
+                    self._log_action_received(
                         incoming_actions,
+                        filtered,
+                        aggregate_stats,
                         cleared_inflight_timestep,
                         inflight_latency_s,
                     )
-                    continue
-
-                aggregate_stats = self._aggregate_action_queue(filtered)
-                self._log_action_received(
-                    incoming_actions,
-                    filtered,
-                    aggregate_stats,
-                    cleared_inflight_timestep,
-                    inflight_latency_s,
-                )
-                self.must_go_pending = True
+                    self.must_go_pending = True
             except self.grpc.RpcError:
                 cleared_timestep, latency_s = self._clear_observation_inflight()
                 if cleared_timestep is not None:
@@ -752,12 +996,319 @@ class FrankaPolicyExecutor:
             "right_gripper_command": right_gripper_command,
         }
 
+    def _command_payload_from_limited_step(
+        self,
+        action: TimedAction,
+        step: LimitedArmStep,
+    ) -> dict[str, Any]:
+        split = split_action(np.asarray(action.get_action(), dtype=float))
+        return {
+            "timestamp": time.time(),
+            "left_joint_target": step.left_joint_target,
+            "right_joint_target": step.right_joint_target,
+            "left_gripper_command": (
+                self._gripper_command_from_action(split["left_gripper"])
+                if step.is_final
+                else None
+            ),
+            "right_gripper_command": (
+                self._gripper_command_from_action(split["right_gripper"])
+                if step.is_final
+                else None
+            ),
+        }
+
+    def _take_startup_policy_action(
+        self,
+    ) -> tuple[TimedAction | None, dict[str, Any]]:
+        with self.action_queue_lock:
+            queue_before = self._queue_snapshot_unlocked()
+            if not self.action_queue:
+                return None, queue_before
+            action = self.action_queue[0]
+            self.action_queue.clear()
+        return action, queue_before
+
+    def _startup_command_payload(
+        self,
+        step: LimitedArmStep,
+        *,
+        send_grippers: bool,
+    ) -> dict[str, Any]:
+        if self.startup_alignment_target_action is None:
+            raise RuntimeError("Startup alignment target action is missing.")
+        split = split_action(self.startup_alignment_target_action)
+        return {
+            "timestamp": time.time(),
+            "left_joint_target": step.left_joint_target,
+            "right_joint_target": step.right_joint_target,
+            "left_gripper_command": (
+                self._gripper_command_from_action(split["left_gripper"])
+                if send_grippers
+                else None
+            ),
+            "right_gripper_command": (
+                self._gripper_command_from_action(split["right_gripper"])
+                if send_grippers
+                else None
+            ),
+        }
+
+    def _reset_for_startup_replan(self) -> None:
+        with self.policy_generation_lock:
+            self.policy_generation += 1
+            generation = self.policy_generation
+            with self.action_queue_lock:
+                self.action_queue.clear()
+            cleared_timestep, inflight_latency_s = self._clear_observation_inflight()
+            self.latest_executed_timestep = -1
+            self.latest_streamed_observation_timestep = -1
+            self.must_go_pending = True
+            self.last_command_payload = None
+            self.last_command_action = None
+            self.empty_queue_hold_count = 0
+            self.queue_starvation_halted = False
+            self.limited_action_steps.clear()
+            self.limited_source_action = None
+            self.limited_action_plan = None
+            self.limited_queue_before_pop = None
+            self.limited_queue_after_pop = None
+            self.stub.Ready(self.services_pb2.Empty())
+        self._write_log_record(
+            {
+                "event": "startup_alignment_replan_requested",
+                "startup_alignment_mode": self.startup_alignment_mode,
+                "policy_generation": generation,
+                "cleared_inflight_observation_timestep": cleared_timestep,
+                "inflight_latency_s": inflight_latency_s,
+            }
+        )
+
+    def _handle_startup_alignment(
+        self,
+        current_packet: dict[str, Any],
+    ) -> bool:
+        aligner = self.startup_aligner
+        if aligner is None or not aligner.blocks_normal_execution:
+            return False
+
+        if aligner.phase == PolicyStartAligner.WAITING_FIRST_ACTION:
+            if self.episode_start_target is not None:
+                with self.action_queue_lock:
+                    queue_before = self._queue_snapshot_unlocked()
+                    self.action_queue.clear()
+                source_timestep = None
+                target_action = self.episode_start_target.action_target.copy()
+                source_description = (
+                    f"dataset episode {self.episode_start_target.episode_index}, "
+                    f"frame {self.episode_start_target.frame_index}"
+                )
+            else:
+                source_action, queue_before = self._take_startup_policy_action()
+                if source_action is None:
+                    return True
+                self.startup_source_action = source_action
+                source_timestep = source_action.get_timestep()
+                target_action = np.asarray(source_action.get_action(), dtype=float)
+                source_description = "first live policy action"
+
+            self.startup_alignment_target_action = target_action
+            plan = aligner.start(
+                np.asarray(current_packet["state"], dtype=float),
+                target_action,
+            )
+            self._write_log_record(
+                {
+                    "event": "startup_alignment_started",
+                    "startup_alignment_mode": self.startup_alignment_mode,
+                    "source_description": source_description,
+                    "source_action_timestep": source_timestep,
+                    "target_action": target_action.tolist(),
+                    "discarded_initial_chunk_size": queue_before["size"],
+                    "trajectory_steps": len(plan.steps),
+                    "trajectory_duration_s": plan.limited_duration_s,
+                    "max_velocity_ratio": plan.max_velocity_ratio,
+                    "max_acceleration_ratio": plan.max_acceleration_ratio,
+                }
+            )
+            print(
+                f"{self.startup_alignment_mode.capitalize()}-start alignment: "
+                f"using {source_description}; "
+                f"planned {len(plan.steps)} conservative steps "
+                f"({plan.limited_duration_s:.2f}s)."
+            )
+
+        if aligner.phase == PolicyStartAligner.WAITING_REPLAN:
+            with self.action_queue_lock:
+                fresh_action_ready = bool(self.action_queue)
+            if fresh_action_ready:
+                aligner.mark_replan_received()
+                self.startup_source_action = None
+                self.startup_alignment_target_action = None
+                self._write_log_record(
+                    {
+                        "event": "startup_alignment_replan_received",
+                        "startup_alignment_mode": self.startup_alignment_mode,
+                        "queue": self._queue_snapshot(),
+                    }
+                )
+                print(
+                    "Startup alignment complete; fresh policy actions are ready."
+                )
+                return True
+
+        update = aligner.update(
+            np.asarray(current_packet["state"], dtype=float)
+        )
+        payload = self._startup_command_payload(
+            update.step,
+            send_grippers=update.send_grippers,
+        )
+        self._send_bridge_command(payload)
+        self._write_log_record(
+            {
+                "event": "startup_alignment_step",
+                "startup_alignment_mode": self.startup_alignment_mode,
+                "phase": aligner.phase,
+                "interpolation_step": update.step.step_index,
+                "interpolation_steps": update.step.step_count,
+                "max_position_error_rad": update.max_position_error_rad,
+                "command_payload": payload,
+            }
+        )
+        if update.alignment_finished:
+            print(
+                "Startup target reached; clearing the initial chunk and "
+                "requesting fresh inference."
+            )
+            self._reset_for_startup_replan()
+        return True
+
+    def _begin_limited_action(
+        self,
+        action: TimedAction,
+        current_packet: dict[str, Any],
+        queue_before_pop: dict[str, Any],
+        queue_after_pop: dict[str, Any],
+    ) -> None:
+        if self.action_limiter is None:
+            raise RuntimeError("Policy action limiter is not enabled.")
+        plan = self.action_limiter.plan(
+            np.asarray(current_packet["state"], dtype=float),
+            np.asarray(action.get_action(), dtype=float),
+        )
+        self.limited_source_action = action
+        self.limited_action_plan = plan
+        self.limited_action_steps.extend(plan.steps)
+        self.limited_queue_before_pop = queue_before_pop
+        self.limited_queue_after_pop = queue_after_pop
+        if plan.was_stretched:
+            print(
+                "Limited policy action "
+                f"t={action.get_timestep()}: 1 -> {len(plan.steps)} control steps "
+                f"({plan.limited_duration_s:.3f}s)."
+            )
+
+    def _log_limited_action_step(
+        self,
+        action: TimedAction,
+        step: LimitedArmStep,
+        plan: LimitedActionPlan,
+        payload: dict[str, Any],
+    ) -> None:
+        self._write_log_record(
+            {
+                "event": "action_limit_step",
+                "action_timestep": action.get_timestep(),
+                "interpolation_step": step.step_index,
+                "interpolation_steps": step.step_count,
+                "source_duration_s": plan.source_duration_s,
+                "limited_duration_s": plan.limited_duration_s,
+                "was_stretched": plan.was_stretched,
+                "max_velocity_ratio": plan.max_velocity_ratio,
+                "max_acceleration_ratio": plan.max_acceleration_ratio,
+                "command_payload": payload,
+            }
+        )
+
+    def _run_limited_action_step(
+        self,
+        current_packet: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        if self.limited_source_action is None:
+            action, queue_before_pop, queue_after_pop = self.maybe_pop_action()
+            if action is None:
+                return False, queue_before_pop
+            self._begin_limited_action(
+                action,
+                current_packet,
+                queue_before_pop,
+                queue_after_pop,
+            )
+
+        action = self.limited_source_action
+        plan = self.limited_action_plan
+        if action is None or plan is None or not self.limited_action_steps:
+            raise RuntimeError("Policy action limiter entered an inconsistent state.")
+
+        step = self.limited_action_steps.popleft()
+        payload = self._command_payload_from_limited_step(action, step)
+        if self.args.execute:
+            self._send_bridge_command(payload)
+            self._record_sent_command(action, payload)
+        self._log_limited_action_step(action, step, plan, payload)
+
+        if step.is_final:
+            if self.limited_queue_before_pop is None or self.limited_queue_after_pop is None:
+                raise RuntimeError("Policy action limiter queue snapshots are missing.")
+            self._log_action_executed(
+                action,
+                current_packet,
+                payload if self.args.execute else None,
+                self.limited_queue_before_pop,
+                self.limited_queue_after_pop,
+            )
+            self.limited_source_action = None
+            self.limited_action_plan = None
+            self.limited_queue_before_pop = None
+            self.limited_queue_after_pop = None
+
+        return True, self._queue_snapshot()
+
     def _send_bridge_command(self, payload: dict[str, Any]) -> None:
         if self.command_socket is None:
             raise RuntimeError("Bridge command socket is not initialized.")
 
         self._set_bridge_active(True)
         self.command_socket.send_pyobj(payload)
+
+    def _record_sent_command(self, action: TimedAction, payload: dict[str, Any]) -> None:
+        self.last_command_action = action
+        self.last_command_payload = json_safe(payload)
+        self.empty_queue_hold_count = 0
+
+    def _handle_empty_action_queue(self, queue_snapshot: dict[str, Any]) -> bool:
+        if not self.args.execute:
+            return False
+        if self._get_inflight_observation_timestep() is None:
+            self.empty_queue_hold_count = 0
+            return False
+        if self.last_command_payload is None:
+            return False
+        if self.empty_queue_hold_count < self.buffer_horizon:
+            self.empty_queue_hold_count += 1
+            self.latest_executed_timestep = max(self.latest_executed_timestep + 1, 0)
+            payload = dict(self.last_command_payload)
+            payload["timestamp"] = time.time()
+            self._send_bridge_command(payload)
+            self._log_action_hold_last(queue_snapshot, payload)
+            return False
+
+        self._log_action_queue_starvation_halt(queue_snapshot)
+        self.queue_starvation_halted = True
+        self._set_bridge_active(False, force=True)
+        self.shutdown_event.set()
+        return True
 
     def maybe_pop_action(self) -> tuple[TimedAction | None, dict[str, Any], dict[str, Any]]:
         with self.action_queue_lock:
@@ -784,11 +1335,16 @@ class FrankaPolicyExecutor:
         print("----------------------")
         print(f"policy_path: {self.policy_path}")
         print(f"policy_type: {self.policy_type}")
+        print(f"limit: {self.action_limiter is not None}")
+        print(f"startup_alignment: {self.startup_alignment_mode or 'disabled'}")
         print(f"server_address: {self.args.server_address}")
         print(f"dataset_action_dim: {dataset_action_dim}")
         print(f"actions_per_chunk: {self.actions_per_chunk}")
         print(f"chunk_size_threshold: {self.chunk_size_threshold}")
         print(f"aggregate_ratio_old: {self.aggregate_ratio_old}")
+        print(f"action_fusion_mode: {self.action_fusion_mode}")
+        print(f"fusion_horizon: {self.fusion_horizon}")
+        print(f"buffer_horizon: {self.buffer_horizon}")
         print(f"execute: {self.args.execute}")
 
         context = zmq.Context()
@@ -834,7 +1390,11 @@ class FrankaPolicyExecutor:
                 except zmq.Again:
                     continue
 
-                if self._ready_to_send_observation():
+                observations_allowed = (
+                    self.startup_aligner is None
+                    or self.startup_aligner.allows_observations
+                )
+                if observations_allowed and self._ready_to_send_observation():
                     observation_timestep, queue_snapshot = self._next_observation_timestep()
                     must_go = True
                     self._mark_observation_inflight(observation_timestep)
@@ -857,18 +1417,30 @@ class FrankaPolicyExecutor:
                         raise
                     self.must_go_pending = False
 
-                action, queue_before_pop, queue_after_pop = self.maybe_pop_action()
-                if action is not None:
-                    payload = self._command_payload_from_action(action)
-                    if self.args.execute:
-                        self._send_bridge_command(payload)
-                    self._log_action_executed(
-                        action,
-                        current_packet,
-                        payload if self.args.execute else None,
-                        queue_before_pop,
-                        queue_after_pop,
+                if self._handle_startup_alignment(current_packet):
+                    pass
+                elif self.action_limiter is not None:
+                    handled_action, queue_snapshot = self._run_limited_action_step(
+                        current_packet
                     )
+                    if not handled_action and self._handle_empty_action_queue(queue_snapshot):
+                        break
+                else:
+                    action, queue_before_pop, queue_after_pop = self.maybe_pop_action()
+                    if action is not None:
+                        payload = self._command_payload_from_action(action)
+                        if self.args.execute:
+                            self._send_bridge_command(payload)
+                            self._record_sent_command(action, payload)
+                        self._log_action_executed(
+                            action,
+                            current_packet,
+                            payload if self.args.execute else None,
+                            queue_before_pop,
+                            queue_after_pop,
+                        )
+                    elif self._handle_empty_action_queue(queue_before_pop):
+                        break
 
                 sleep_time = max(0.0, (1.0 / self.args.fps) - (time.perf_counter() - loop_start))
                 time.sleep(sleep_time)

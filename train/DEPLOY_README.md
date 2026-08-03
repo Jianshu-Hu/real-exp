@@ -19,13 +19,51 @@ This split is safer because:
 Use this order:
 
 1. inspect the checkpoint and confirm the dataset contract
-2. start the camera publisher on the robot machine
-3. start the ROS 2 bridge
-4. start the policy server on the inference machine
-5. for live execution, start the ROS 2 arm and gripper consumers
-6. start the executor in dry-run mode on the robot machine
-7. verify that observations and predictions look correct
-8. restart the executor with `--execute` only after dry-run looks safe
+2. start the policy server on the inference machine
+3. start the four ROS 2 launch groups on the robot machine
+4. start the executor in dry-run mode on the robot machine
+5. verify that observations and predictions look correct
+6. restart the executor with `--execute` only after dry-run looks safe
+
+The four Robot-Host ROS 2 launch groups are:
+
+1. `franka_fr3_arm_controllers ... deployment_mode:=true`
+2. `franka_gripper_manager`
+3. `franka_realsense_camera_publisher`
+4. `franka_lerobot_data_bridge ... deployment_duo.yaml`
+
+The first launch group includes the Franka hardware bringup,
+`robot_state_publisher`, `joint_state_publisher`, `ros2_control`, and the
+deployment-gated joint controller. Do not start `franka_gello_state_publisher`
+during policy deployment.
+
+To supervise these four groups from one Robot-Host terminal, use:
+
+```bash
+cd ~/real-exp
+bash scripts/start_deployment_duo.sh
+```
+
+This starts the groups in dependency order and does not start the policy server
+or ACT/Diffusion executor. Before opening either Franka connection, it validates
+that the installed ROS packages come from this repository's overlay, parses the
+installed YAML files, checks that ports `5555` and `5556` are free, and rejects
+an existing controller, bridge, or GELLO collection stack. During startup it
+requires fresh arm, gripper, and camera messages; verifies that both deployment
+controllers are loaded `inactive`; and verifies that the bridge is using
+`deployment_duo.yaml`, `deployment_state_source=topics`, and STANDBY mode.
+
+Run only the non-hardware checks with:
+
+```bash
+bash scripts/start_deployment_duo.sh --preflight-only
+```
+
+The script homes the two gripper clients sequentially because simultaneous
+startup has previously caused one homing action to time out. Ctrl-C first asks
+the bridge to return to STANDBY, waits for both deployment controllers to become
+inactive, and then stops bridge, cameras, grippers, and arm bringup in reverse
+order. Manual four-terminal commands remain available below.
 
 ## What Runs Where
 
@@ -43,7 +81,8 @@ Robot-connected machine:
 - send observations to the policy server
 - receive action chunks
 - convert policy actions into Franka-safe commands
-- enforce velocity limits, interpolation, watchdog timeout, and abort handling locally
+- enforce joint position, velocity, and acceleration limits by default; `--no-limit` is the explicit opt-out
+- enforce watchdog timeout and abort handling locally
 
 ROS 2 bridge on the robot machine:
 
@@ -82,7 +121,7 @@ Verify that:
 - `dataset_state_dim` is `16`
 - `dataset_action_dim` is `16`
 - `dataset_image_keys` are `observation.images.cam_left`, `observation.images.cam_front`, `observation.images.cam_right`
-- `dataset_action_representation` says `arm=absolute_joint_position, gripper=binary_open_close`
+- `dataset_action_representation` says `arm=absolute_joint_position, gripper=absolute_width`
 
 ### 2. Start the camera publisher
 
@@ -174,12 +213,14 @@ ros2 launch franka_gripper_manager franka_gripper_client.launch.py config_file:=
 In `deployment_mode:=true`, `joint_impedance_controller` holds the current arm pose until the bridge explicitly enables deployment control.
 The bridge republishes policy actions to these existing topics:
 
-- `/left/gello/joint_states`
-- `/right/gello/joint_states`
+- `/left/deployment/joint_states`
+- `/right/deployment/joint_states`
 - `/left/gripper/gripper_client/target_gripper_width_percent`
 - `/right/gripper/gripper_client/target_gripper_width_percent`
 
 This lets the existing ROS 2 consumers be reused during deployment.
+By default, gripper actions are continuous open-width percentages in `[0, 1]`.
+To switch back to latched binary gripper commands, update both `GRIPPER_COMMAND_MODE` in `gello_publisher.py` and `GRIPPER_ACTION_REPRESENTATION` in `lerobot_data_bridge.py` to `binary_open_close` before collecting or deploying matching data.
 
 ### 6. Start the executor in dry-run mode
 
@@ -280,17 +321,79 @@ python train/franka_act_policy_executor.py \
   --fps 15 \
   --task "pick and place" \
   --act-aggregate-ratio-old 0.8 \
+  --policy-start \
   --execute
 ```
 
+The limiter is enabled by default on both the ACT and diffusion executors. The
+legacy `--limit` flag remains accepted but is now redundant. Only `--no-limit`
+disables time-stretching and restores direct valid-target command generation.
+With the default limiter active, each absolute arm target is checked against the
+FR3 joint position range (with a `0.02 rad` margin). A target segment that would
+exceed the configured velocity or acceleration envelope is expanded into multiple
+15 Hz command steps using a quintic trajectory; a segment already inside the
+envelope remains one step.
+
+The limiter uses `80%` of the FR3 interface velocity and acceleration limits:
+
+- velocity: `[2.096, 2.096, 2.096, 2.096, 4.208, 3.344, 4.208] rad/s`
+- acceleration: `8.0 rad/s^2` on every joint
+
+The two arms are checked independently against the same seven-joint limits. Gripper
+commands are emitted only on the final step of a stretched segment. NaN, infinity,
+and out-of-range arm targets stop the executor before that target is sent. Every
+generated step is recorded as `action_limit_step` in `samples.jsonl`; a terminal
+line such as `1 -> 6 control steps` means that policy segment was stretched.
+
+For diffusion, live execution is limited by default as well:
+
+```bash
+python train/franka_diffusion_policy_executor.py \
+  ... \
+  --execute
+```
+
+Use `--no-limit` only for an intentional comparison or diagnosis where direct
+valid-target command generation is required.
+
+Both ACT and diffusion executors support two mutually exclusive startup target
+sources:
+
+- `--policy-start` obtains the first policy action from the current observation.
+- `--episode-start` selects a random dataset episode and uses its frame-0
+  `observation.state`.
+- `--episode-start 12` selects episode 12. Add
+  `--episode-start-frame-index N` only when a frame other than 0 is intentional.
+
+Both modes use the already-running deployment bridge and ROS controller. They
+approach the selected absolute joint target with the same conservative quintic
+trajectory, wait for both arms to settle, discard stale policy actions, and resume
+from a fresh inference request. Do not stop the four ROS deployment launch groups
+or run the direct `pylibfranka` initializer for this executor flow.
+
+For example, the command above can use a random episode start by replacing
+`--policy-start` with:
+
+```bash
+--episode-start \
+--execute
+```
+
+`--episode-start` requires the dataset parquet files under
+`DATASET_ROOT/data/chunk-*/*.parquet` on the Robot Host. It does not require the
+dataset videos. Startup alignment and default action time-stretching work together
+with `--policy-start --execute` or `--episode-start [INDEX] --execute`. Older
+commands that also include `--limit` remain valid. Add `--no-limit` to opt out.
+
 Live execution ordering should be:
 
-1. start the bridge with `deployment_duo.yaml` or `deployment_single.yaml`
-2. start the arm controllers with `deployment_mode:=true`
-3. start the gripper manager
-4. start the remote policy server
-5. start the executor with `--execute`
-6. let the executor auto-activate the bridge before the first command
+1. start the arm bringup with `deployment_mode:=true`
+2. start the gripper manager
+3. start the camera publisher
+4. start the bridge with `deployment_duo.yaml` or `deployment_single.yaml`
+5. start the remote policy server
+6. start the executor with `--execute`
+7. let the executor auto-activate the bridge before the first command
 
 With the current executor flow, you do not need to call `/set_deployment_active` manually for live execution unless you explicitly pass `--no-auto-activate-bridge`.
 
@@ -304,9 +407,9 @@ The executor will:
 
 Important live-control caveats:
 
-- the ROS 2 bridge needs upstream camera topics and direct Franka state access
+- the ROS 2 bridge needs upstream camera topics and Franka joint-state topics from the arm bringup
 - the current deployment execute path is intended to use the ROS 2 controller stack, not direct active `pylibfranka` control
-- do not run another node that publishes conflicting targets to `/left/gello/joint_states` or `/right/gello/joint_states`
+- do not start the GELLO publisher or publish conflicting targets to `/left/deployment/joint_states` or `/right/deployment/joint_states`
 
 If you want to keep bridge activation manual during execution, pass `--no-auto-activate-bridge` to the executor and then call:
 
@@ -315,7 +418,9 @@ ros2 service call /set_deployment_active std_srvs/srv/SetBool "{data: true}"
 ```
 
 The bridge only enables the deployment-gated arm controllers after it receives the first real command packet from the executor.
-If you start the bridge in direct `pylibfranka` deployment-state mode while `ros2_control` is active, the bridge may stop publishing fresh `/left/right/gello/joint_states`, which causes the joint impedance controllers to time out waiting for valid command input.
+Keep `deployment_state_source: topics` in `deployment_duo.yaml` while the ROS 2
+controller stack is active. The bridge reads `/left/right/franka/joint_states`
+and publishes policy targets to `/left/right/deployment/joint_states`.
 
 ### 9. Tune only if needed
 
@@ -326,6 +431,10 @@ Useful executor options:
 - `--act-chunk-size-threshold` and `--act-aggregate-ratio-old` on `franka_act_policy_executor.py` to tune overlapping ACT chunks
 - `--diffusion-chunk-size-threshold` and `--diffusion-aggregate-ratio-old` on `franka_diffusion_policy_executor.py` to tune overlapping diffusion chunks
 - `--diffusion-noise-scheduler-type` and `--diffusion-num-inference-steps` on the server to override diffusion denoising at load time
+- `--limit` on either executor as a backward-compatible explicit spelling of the default limiter behavior
+- `--no-limit` on either executor to disable time-stretching and send valid targets directly
+- `--policy-start` on either executor to align to the first policy target and then re-infer
+- `--episode-start [INDEX]` on either executor to align to a random or selected dataset episode start and then re-infer
 - `--command-zmq-host` and `--command-zmq-port` to match the bridge command socket
 - `--bridge-activation-service` to override the ROS 2 `SetBool` service used for bridge activation
 - `--no-auto-activate-bridge` to keep bridge activation manual
@@ -362,8 +471,8 @@ Useful executor options:
   - expected if the bridge is still in `STANDBY`
   - call `ros2 service call /set_deployment_active std_srvs/srv/SetBool "{data: true}"`
   - live execution with `--execute` auto-activates the bridge unless `--no-auto-activate-bridge` is set
-- `Timeout: No valid joint states received from Gello` from `joint_impedance_controller`:
-  - the controller is not receiving fresh `/left/right/gello/joint_states`
+- `Waiting for fresh deployment joint targets...` from `deployment_joint_impedance_controller`:
+  - the controller is not receiving fresh `/left/right/deployment/joint_states`
   - for live ROS 2 deployment, launch the bridge with `deployment_duo.yaml` or `deployment_single.yaml`
   - rebuild and source the ROS 2 workspace before relaunching
 - `franka_robot_state_broadcaster` fails with `State interface with key 'fr3/robot_state' does not exist`:
@@ -388,6 +497,5 @@ The executor should interpret actions using the same structure as the dataset:
 In practice, the executor should:
 
 - command absolute joint targets through the deployment bridge
-- clamp commands to conservative Franka limits
-- smooth or interpolate commands between network updates
+- reject invalid positions and time-stretch over-limit segments by default; only `--no-limit` disables time-stretching
 - stop safely if server responses are delayed or missing

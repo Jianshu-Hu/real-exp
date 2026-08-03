@@ -203,6 +203,26 @@ def make_deployment_policy_server(
     from lerobot.transport import services_pb2
 
     class DeploymentPolicyServer(PolicyServer):
+        def _new_diffusion_history(self):
+            if self.policy_type != "diffusion" or self.policy is None:
+                return None
+            history = {
+                OBS_STATE: deque(maxlen=self.policy.config.n_obs_steps),
+            }
+            if self.policy.config.image_features:
+                history[OBS_IMAGES] = deque(maxlen=self.policy.config.n_obs_steps)
+            if self.policy.config.env_state_feature:
+                history[OBS_ENV_STATE] = deque(maxlen=self.policy.config.n_obs_steps)
+            return history
+
+        def _reset_server(self) -> None:
+            super()._reset_server()
+            self._deployment_reset_generation = (
+                getattr(self, "_deployment_reset_generation", 0) + 1
+            )
+            self.last_processed_obs = None
+            self._diffusion_history = self._new_diffusion_history()
+
         def SendPolicyInstructions(self, request, context):  # noqa: N802
             if not self.running:
                 self.logger.warning("Server is not running. Ignoring policy instructions.")
@@ -276,16 +296,7 @@ def make_deployment_policy_server(
             else:
                 self.logger.info("Using upstream direct resize during inference image preparation")
 
-            if self.policy_type == "diffusion":
-                self._diffusion_history = {
-                    OBS_STATE: deque(maxlen=self.policy.config.n_obs_steps),
-                }
-                if self.policy.config.image_features:
-                    self._diffusion_history[OBS_IMAGES] = deque(maxlen=self.policy.config.n_obs_steps)
-                if self.policy.config.env_state_feature:
-                    self._diffusion_history[OBS_ENV_STATE] = deque(maxlen=self.policy.config.n_obs_steps)
-            else:
-                self._diffusion_history = None
+            self._diffusion_history = self._new_diffusion_history()
 
             return services_pb2.Empty()
 
@@ -420,6 +431,9 @@ def make_deployment_policy_server(
 
         def GetActions(self, request, context):  # noqa: N802
             try:
+                reset_generation = getattr(
+                    self, "_deployment_reset_generation", 0
+                )
                 getactions_starts = time.perf_counter()
                 obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
 
@@ -427,6 +441,13 @@ def make_deployment_policy_server(
                     self._predicted_timesteps.add(obs.get_timestep())
 
                 action_chunk = self._predict_action_chunk(obs)
+                if reset_generation != getattr(
+                    self, "_deployment_reset_generation", 0
+                ):
+                    self.logger.info(
+                        "Discarding an action chunk computed before the latest server reset."
+                    )
+                    return services_pb2.Empty()
 
                 actions_bytes = pickle.dumps(action_chunk)  # nosec
 

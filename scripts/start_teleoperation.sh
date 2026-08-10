@@ -99,11 +99,11 @@ for port in "${required_ports[@]}"; do
 done
 
 if [[ "${arm_mode}" == "duo" ]]; then
-  gello_config="example_duo.yaml"
+  gello_config="gello_duo.yaml"
   robot_config="example_fr3_duo_config.yaml"
   gripper_config="example_fr3_duo_config_franka_hand.yaml"
 else
-  gello_config="example_single.yaml"
+  gello_config="gello_single.yaml"
   robot_config="example_fr3_config.yaml"
   gripper_config="example_fr3_config_franka_hand.yaml"
 fi

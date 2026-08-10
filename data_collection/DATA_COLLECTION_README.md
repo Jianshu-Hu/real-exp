@@ -202,10 +202,10 @@ Franka-hand manager.
 
 - GELLO publisher configs live in `gello_software/ros2/src/franka_gello_state_publisher/config/`.
 - FR3 controller configs live in `gello_software/ros2/src/franka_fr3_arm_controllers/config/`.
-- `--duo` selects `example_duo.yaml` and `example_fr3_duo_config.yaml`.
-- `--single` selects `example_single.yaml` and `example_fr3_config.yaml`.
+- `--duo` selects calibrated `gello_duo.yaml` and `example_fr3_duo_config.yaml`.
+- `--single` selects calibrated `gello_single.yaml` and `example_fr3_config.yaml`.
 - `--gripper` selects the matching `example_fr3*_config_franka_hand.yaml` file.
-- `example_duo.yaml` defines the left and right GELLO devices for bimanual control.
+- `gello_duo.yaml` defines the calibrated left and right GELLO devices for bimanual control.
 - `example_fr3_duo_config.yaml` defines the corresponding left and right FR3 robot IPs and namespaces.
 - If you are switching between single-arm and dual-arm setups, make sure the publisher and controller configs match.
 

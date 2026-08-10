@@ -67,7 +67,18 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
 teleoperation_script="${script_dir}/start_teleoperation.sh"
 
+if [[ "${arm_mode}" == "duo" ]]; then
+  calibrated_gello_config="gello_duo.yaml"
+else
+  calibrated_gello_config="gello_single.yaml"
+fi
+
 [[ -x "${teleoperation_script}" ]] || die "teleoperation script is missing or not executable: ${teleoperation_script}"
+
+# start_teleoperation.sh selects this calibrated GELLO configuration for the
+# requested arm mode before starting the FR3 controller and data-collection stack.
+calibrated_gello_config_path="${repository_root}/gello_software/ros2/install/franka_gello_state_publisher/share/franka_gello_state_publisher/config/${calibrated_gello_config}"
+[[ -r "${calibrated_gello_config_path}" ]] || die "calibrated GELLO config is missing: ${calibrated_gello_config_path}"
 
 setup_files=(
   "/opt/ros/humble/setup.bash"

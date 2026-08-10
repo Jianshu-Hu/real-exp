@@ -28,13 +28,20 @@ This repo uses two different Python environments:
 - Use the `lerobot` Conda environment for `data_collection/lerobot_collection.py`, dataset inspection, dataset editing, and training under `lerobot/`.
 
 ## Common Workflows
+
 ### Data Collection
+
 Data collection and replay instructions live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md).
 - [`scripts/start_teleoperation.sh`](scripts/start_teleoperation.sh): start single- or dual-arm GELLO teleoperation, with or without gripper control.
 - [`scripts/start_data_collection.sh`](scripts/start_data_collection.sh): start teleoperation together with the RealSense camera publisher and LeRobot data bridge.
+- [`scripts/replay.sh`](scripts/replay.sh): start the dual-arm FR3 replay controllers and Franka-hand managers, then replay a recorded LeRobot episode.
+
 ### Train
+
 - Training instructions live in [train/TRAIN_README.md](train/TRAIN_README.md).
+
 ### Deploy
+
 - Deployment instructions live in [deploy/DEPLOY_README.md](deploy/DEPLOY_README.md).
 
 ## Notes

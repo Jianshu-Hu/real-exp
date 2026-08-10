@@ -123,33 +123,44 @@ python3 data_collection/reset_pylibfranka.py \
   --frame-index 0
 ```
 
-For episode replay, first start the normal arm controllers and gripper manager
-described in the teleoperation quick start. Do not run the GELLO publisher at the
-same time because replay publishes to the same `/left/gello/joint_states` and
-`/right/gello/joint_states` topics.
-
-Inspect episode 0 without publishing commands:
-
-```bash
-python3 data_collection/replay_lerobot_episode.py \
-  --dataset-root data/pick_and_place_test \
-  --episode 0 \
-  --dry-run
-```
-
-Replay through the ROS 2 collection controller:
+For a complete bimanual replay setup, use the replay supervisor from the
+repository root. It starts both FR3 controllers, both Franka-hand managers,
+waits for the FR3 controller nodes and arm state topics, starts the gripper
+managers, waits for both gripper-client nodes and gripper state topics, and only
+waits for each gripper client's command subscription (after homing and client
+initialization), and only then runs the episode replay:
 
 ```bash
-python3 data_collection/replay_lerobot_episode.py \
-  --dataset-root data/pick_and_place_test \
-  --episode 0 \
-  --output outputs/replay_episode_0
+bash scripts/replay.sh \
+  --dataset-root data/test-pick-and-place-new \
+  --episode 0
 ```
 
-The replay tool always uses the recorded `action` values. It requires
-`arm_action_representation=absolute_joint_position` and
-`gripper_action_representation=absolute_width`. Type `s` and Enter after the
-controller-state subscriptions are ready; type `q` and Enter to abort.
+The supervisor forwards replay options such as `--fps`, `--start-frame`,
+`--end-frame`, `--max-frames`, `--output`, and `--dry-run`. Use `--no-gripper`
+to skip the Franka-hand managers and gripper commands:
+
+```bash
+bash scripts/replay.sh \
+  --dataset-root data/test-pick-and-place-new \
+  --episode 0 \
+  --no-gripper
+```
+
+With `--dry-run`, the supervisor skips all ROS and robot startup and only
+prints the episode summary. During a normal replay, it waits for each gripper
+client's command subscription before starting the replay process. The replay
+process then advertises `/left/gello/joint_states` and `/right/gello/joint_states`
+while it waits for you to press `s`.
+
+The supervisor preserves the terminal for this prompt even though the ROS
+launches run in separate process groups. Press `s` and Enter to begin, or `q`
+and Enter to abort.
+
+Replay waits for all required actual state topics before accepting `s`. If you
+intentionally need to begin without those samples, pass
+`--allow-missing-state`; the trace will then mark unavailable actual values and
+`controller_ready` accordingly.
 
 ## Teleoperation Quick Start
 

@@ -61,6 +61,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, default=None, help="Maximum number of selected frames to replay.")
     parser.add_argument("--dry-run", action="store_true", help="Load and summarize targets without publishing.")
     parser.add_argument("--no-gripper", action="store_true", help="Skip gripper command publishing and trace targets.")
+    parser.add_argument(
+        "--allow-missing-state",
+        action="store_true",
+        help="Allow replay to start before all required actual arm/gripper state topics have produced a sample.",
+    )
     parser.add_argument("--left-target-topic", default="/left/gello/joint_states")
     parser.add_argument("--right-target-topic", default="/right/gello/joint_states")
     parser.add_argument("--left-gripper-topic", default="/left/gripper/gripper_client/target_gripper_width_percent")
@@ -270,6 +275,10 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
     class LerobotEpisodeReplayNode(Node):  # type: ignore[misc, valid-type]
         def __init__(self, args: argparse.Namespace) -> None:
             super().__init__("lerobot_episode_replay")
+            self.left_state_topic = args.left_state_topic
+            self.right_state_topic = args.right_state_topic
+            self.left_gripper_state_topic = args.left_gripper_state_topic
+            self.right_gripper_state_topic = args.right_gripper_state_topic
             self.left_target_publisher = self.create_publisher(JointState, args.left_target_topic, 10)
             self.right_target_publisher = self.create_publisher(JointState, args.right_target_topic, 10)
             self.left_gripper_publisher = self.create_publisher(Float32, args.left_gripper_topic, 10)
@@ -363,10 +372,20 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
                 self.right_gripper_publisher.publish(msg)
 
         def controller_ready(self, no_gripper: bool) -> bool:
-            arms_ready = self.left_actual_q is not None and self.right_actual_q is not None
-            if no_gripper:
-                return arms_ready
-            return arms_ready and self.left_gripper_actual is not None and self.right_gripper_actual is not None
+            return not self.missing_state_topics(no_gripper)
+
+        def missing_state_topics(self, no_gripper: bool) -> list[str]:
+            missing: list[str] = []
+            if self.left_actual_q is None:
+                missing.append(self.left_state_topic)
+            if self.right_actual_q is None:
+                missing.append(self.right_state_topic)
+            if not no_gripper:
+                if self.left_gripper_actual is None:
+                    missing.append(self.left_gripper_state_topic)
+                if self.right_gripper_actual is None:
+                    missing.append(self.right_gripper_state_topic)
+            return missing
 
     return LerobotEpisodeReplayNode
 
@@ -423,17 +442,33 @@ def consume_commands(commands: Queue[str]) -> str | None:
         command_seen = command
 
 
-def wait_for_start(rclpy: Any, node: Any, commands: Queue[str], no_gripper: bool) -> bool:
+def wait_for_start(
+    rclpy: Any,
+    node: Any,
+    commands: Queue[str],
+    no_gripper: bool,
+    allow_missing_state: bool,
+) -> bool:
     print("Waiting for ROS state samples. Type `s` + Enter to start, or `q` + Enter to abort.")
+    last_missing: tuple[str, ...] | None = None
     while rclpy.ok():
         rclpy.spin_once(node, timeout_sec=0.05)
+        missing = tuple(node.missing_state_topics(no_gripper))
+        if missing != last_missing:
+            if missing:
+                print("Waiting for: " + ", ".join(missing))
+            else:
+                print("All required actual arm/gripper state samples are available.")
+            last_missing = missing
         command = consume_commands(commands)
         if command == "q":
             return False
         if command == "s":
-            if not node.controller_ready(no_gripper):
-                print("Warning: starting before all actual state samples are available.")
-            return True
+            if node.controller_ready(no_gripper) or allow_missing_state:
+                if not node.controller_ready(no_gripper):
+                    print("Warning: starting before all actual state samples are available.")
+                return True
+            print("Still waiting for required state samples. Use --allow-missing-state to override.")
     return False
 
 
@@ -480,6 +515,7 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
             "end_frame": args.end_frame,
             "max_frames": args.max_frames,
             "no_gripper": args.no_gripper,
+            "allow_missing_state": args.allow_missing_state,
             "trace_file": TRACE_FILENAME,
         },
     )
@@ -495,7 +531,13 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
     last_controller_ready = False
     start_time = 0.0
     try:
-        if not wait_for_start(rclpy, node, commands, args.no_gripper):
+        if not wait_for_start(
+            rclpy,
+            node,
+            commands,
+            args.no_gripper,
+            args.allow_missing_state,
+        ):
             aborted = True
             return
 
@@ -574,6 +616,8 @@ def main() -> None:
     data = load_episode_data(args.dataset_root, args.episode)
     data = select_frame_range(data, args.start_frame, args.end_frame, args.max_frames)
     fps = float(args.fps if args.fps is not None else data.fps)
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError(f"Replay FPS must be a finite positive number, got {fps!r}.")
 
     if args.dry_run:
         print_dry_run_summary(data, fps, args.no_gripper)

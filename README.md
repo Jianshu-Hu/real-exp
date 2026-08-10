@@ -36,7 +36,7 @@ python data_collection/lerobot_collection.py --help
 python data_collection/delete_lerobot_episode.py --help
 ```
 
-For replay with `pylibfranka`:
+For replay through the ROS 2 collection controller:
 
 ```bash
 python3 data_collection/replay_lerobot_episode.py --help

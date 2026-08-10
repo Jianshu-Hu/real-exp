@@ -16,7 +16,7 @@ Quick links:
 
 Environment split used in this repo:
 
-- Use `/usr/bin/python3` (Python 3.10 on this machine) for ROS 2 Humble, GELLO helper scripts, `colcon build`, and direct `pylibfranka` replay.
+- Use `/usr/bin/python3` (Python 3.10 on this machine) for ROS 2 Humble, GELLO helper scripts, `colcon build`, and ROS 2 episode replay.
 - Use the `lerobot` Conda environment for LeRobot dataset and training. 
 
 

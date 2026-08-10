@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import shutil
 import sys
 from dataclasses import dataclass
@@ -261,8 +260,10 @@ def detect_initial_trim(rows: list[dict[str, Any]], threshold: float, min_static
         raise ValueError("--min-static-frames must be positive.")
     ordered = sorted(rows, key=lambda row: int(row["frame_index"]))
     states = [flatten_numeric(row.get("observation.state")) for row in ordered]
-    if not states or len(states[0]) != 16:
-        return 0
+    if not states or any(len(state) != 16 for state in states):
+        raise ValueError("Static detection requires a 16-D observation.state for every frame.")
+    if any(has_non_finite(state) for state in states):
+        raise ValueError("Static detection requires finite observation.state values.")
     static_transitions = 0
     for previous, current in zip(states, states[1:], strict=True):
         if len(current) != 16 or len(previous) != 16:
@@ -751,6 +752,8 @@ def trim_initial_static_segments(args: argparse.Namespace) -> int:
         raise RuntimeError("LeRobot dataset-processing dependencies are required for trim-initial.") from exc
 
     dataset_root = Path(args.dataset_root).expanduser().resolve()
+    if not (dataset_root / INFO_PATH).exists():
+        raise FileNotFoundError(f"{dataset_root} is not a LeRobot dataset root. Missing {INFO_PATH}.")
     info = load_json(dataset_root / INFO_PATH)
     fps = float(info["fps"])
     source_meta = LeRobotDatasetMetadata(
@@ -778,6 +781,11 @@ def trim_initial_static_segments(args: argparse.Namespace) -> int:
     for episode in source_meta.episodes:
         index = int(episode["episode_index"])
         old_length = int(episode["length"])
+        if len(rows_by_episode[index]) != old_length:
+            raise ValueError(
+                f"Episode {index} metadata declares {old_length} frames, "
+                f"but {len(rows_by_episode[index])} data rows were found."
+            )
         trim_frames = detect_initial_trim(rows_by_episode[index], args.motion_threshold, args.min_static_frames) if index in episode_indices else 0
         trim_plan[index] = InitialTrim(index, old_length, trim_frames)
 

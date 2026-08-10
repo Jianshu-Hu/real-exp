@@ -1,3 +1,14 @@
+"""Reset both Franka arms to a dataset pose or a measured fallback pose.
+
+Usage:
+    python data_collection/reset_pylibfranka.py --dataset-root data/my_dataset \
+        --episode 0 --frame-index 0 --dry-run
+
+Hardware warning: running without ``--dry-run`` commands real robots. Prefer a
+matching dataset frame when available; the fallback pose is specific to the
+hardware setup on which it was measured.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -18,25 +29,25 @@ RESET_MAX_JOINT_ACCELERATIONS_RAD_PER_S2 = np.array([0.80, 0.80, 0.80, 0.80, 1.2
 INITIAL_POSE_TRACKING_GAIN_PER_S = 1.5
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Episode 0 initial state from data/pick_and_place_test:
+# Measured initial state from the aligned dual-arm hardware setup:
 # [Left Arm(7), Left Grip(1), Right Arm(7), Right Grip(1)]
 INITIAL_STATE = np.array(
     [
-        0.04882633313536644,
-        0.5285813212394714,
-        -0.5865817666053772,
-        -1.853965163230896,
-        0.9884126782417297,
-        1.7107422351837158,
-        -1.065798044204712,
+        -0.06613873690366745,
+        0.4168303906917572,
+        -0.7708715796470642,
+        -2.1752805709838867,
+        1.229206919670105,
+        1.8434054851531982,
+        -2.0628912448883057,
         0.08010675758123398,
-        -0.07229013741016388,
-        0.5121952891349792,
-        0.6051291227340698,
-        -1.866397500038147,
-        -0.9738773703575134,
-        1.726406455039978,
-        1.002806544303894,
+        -0.01702199876308441,
+        0.29014238715171814,
+        0.7934812903404236,
+        -2.2553374767303467,
+        -1.150952696800232,
+        1.8947919607162476,
+        0.5678431987762451,
         0.08030491322278976,
     ],
     dtype=float,
@@ -50,7 +61,7 @@ RIGHT_GRIPPER_START_WIDTH = float(INITIAL_STATE[15])
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Reset both Franka arms to a hardcoded pose or a dataset observation.state frame."
+        description="Reset both Franka arms to a dataset observation.state frame or a measured fallback pose."
     )
     parser.add_argument("--ip-left", default="172.16.0.3", help="IP address of the Left Franka robot.")
     parser.add_argument("--ip-right", default="172.16.0.2", help="IP address of the Right Franka robot.")
@@ -60,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Load the reset target from this LeRobot dataset root. "
-            "If omitted, the script uses its legacy hardcoded target."
+            "If omitted, the script uses its measured hardware-specific fallback pose."
         ),
     )
     parser.add_argument(
@@ -121,11 +132,13 @@ def start_sync_joint_velocity_control(robot: pylibfranka.Robot) -> pylibfranka.A
 
 def split_dual_arm_state(state: np.ndarray) -> dict[str, Any]:
     state = np.asarray(state, dtype=float)
-    if state.shape[0] != 16:
+    if state.ndim != 1 or state.shape[0] != 16:
         raise ValueError(
             f"Expected a 16-D dual-arm observation.state "
             f"[left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]. Got shape {state.shape}."
         )
+    if not np.all(np.isfinite(state)):
+        raise ValueError("Reset observation.state must contain only finite values.")
     return {
         "left_arm": state[0:7],
         "left_gripper": float(state[7]),
@@ -140,7 +153,7 @@ def load_dataset_reset_state(dataset_root: Path, episode_index: int, frame_index
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "pyarrow is required to load reset targets from a LeRobot dataset. "
-            "Install pyarrow or run without --dataset-root to use the hardcoded target."
+            "Install pyarrow or run without --dataset-root to use the fallback pose."
         ) from exc
 
     dataset_root = dataset_root.expanduser().resolve()
@@ -196,7 +209,7 @@ def load_dataset_reset_state(dataset_root: Path, episode_index: int, frame_index
 def resolve_reset_target(args: argparse.Namespace) -> dict[str, Any]:
     if args.dataset_root is None:
         state = INITIAL_STATE.copy()
-        source = "legacy hardcoded INITIAL_STATE"
+        source = "measured hardware-specific INITIAL_STATE fallback"
     else:
         state = load_dataset_reset_state(args.dataset_root, int(args.episode), int(args.frame_index))
         source = (

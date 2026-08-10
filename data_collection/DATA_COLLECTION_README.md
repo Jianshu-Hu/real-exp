@@ -1,28 +1,40 @@
-# DATA COLLECTION
-
+# Data Collection
 
 ## Overview
+
 - `lerobot_collection.py`: Minimal script for recording synchronized RealSense images and robot state/action data into a LeRobot dataset.
-- `replay_pylibfranka.py`: Replay a recorded LeRobot episode on the real Franka arms using `pylibfranka`, with optional `--dry-run` inspection before motion.
-- `reset_pylibfranka.py`: Reset both Franka arms to the hardcoded initial state copied from `data/pick_and_place_test` episode 0, without reading dataset parquet files at runtime.
+- `replay_lerobot_episode.py`: Replay a recorded LeRobot episode through the same ROS 2 arm and gripper controller topics used during collection.
+- `reset_pylibfranka.py`: Reset both Franka arms to a selected dataset `observation.state` frame or a measured hardware-specific fallback pose.
 - `delete_lerobot_episode.py`: Remove one or more episodes from a local LeRobot dataset while preserving the remaining metadata, videos, and parquet data.
-- `validate_dataset.py`: Validate a local LeRobot dataset and print dataset-level and per-episode consistency information.
+- `process_dataset.py`: Validate and process local LeRobot datasets, including automatic initial-static-segment trimming.
 
 Quick links:
 
-- [GELLO docs](gello_software/README.md)
-- [FR3 ROS 2 docs](gello_software/ros2/README.md)
-- [LeRobot docs](lerobot/README.md)
+- [GELLO docs](../gello_software/README.md)
+- [FR3 ROS 2 docs](../gello_software/ros2/README.md)
+- [LeRobot docs](../lerobot/README.md)
 
 Environment split used in this repo:
 
-- Use `/usr/bin/python3` (Python 3.10 on this machine) for ROS 2 Humble, GELLO helper scripts, `colcon build`, and direct `pylibfranka` replay.
-- Use the `lerobot` Conda environment for LeRobot dataset and training. 
+- Use `/usr/bin/python3` (Python 3.10 on this machine) for ROS 2 Humble, GELLO helper scripts, `colcon build`, and ROS 2 episode replay. Install `numpy` and `pyarrow` in this environment because replay reads LeRobot Parquet files.
+- Use the `lerobot` Conda environment for collection, dataset processing, and training.
 
 
 ## Before launching
 
-- Test offset if the gello connection is unplugged.
+Install the GELLO USB aliases once on the robot-control host:
+
+```bash
+sudo ./scripts/setup_usb_rules.sh
+```
+
+The aliases depend on the host USB topology. Verify `/dev/ttyUSB_left` and
+`/dev/ttyUSB_right` before launching the ROS 2 nodes after reconnecting devices.
+The active user must belong to the `dialout` group to access the devices without
+root privileges.
+
+Test the offsets after reconnecting a GELLO device:
+
 ```bash
 source /opt/ros/humble/setup.sh
 source ~/franka_ros2_ws/install/setup.bash
@@ -31,18 +43,22 @@ source ~/real-exp/gello_software/ros2/install/setup.bash
 ros2 topic echo /left/gello/joint_states
 ros2 topic echo /right/gello/joint_states
 ```
-compare the results with the joint angles from ```172.16.0.2/desk/api/robot/robot-state``` and ```172.16.0.3/desk/api/robot/robot-state```
 
-- Set the offset if necessary.
+Compare the results with the joint angles reported by
+`172.16.0.2/desk/api/robot/robot-state` and
+`172.16.0.3/desk/api/robot/robot-state`.
+
+Set the offset if necessary:
+
 ```bash
 cd ~/real-exp/gello_software
 python3 scripts/setup_offset.py --start-joints 0 0 0 -1.57 0 1.57 0 --joint-signs 1 -1 1 1 1 -1 1 --port /dev/ttyUSB_left
 python3 scripts/setup_offset.py --start-joints 0 0 0 -1.57 0 1.57 0 --joint-signs 1 -1 1 1 1 -1 1 --port /dev/ttyUSB_right
 ```
 
-- Unlock the franka arm and activate FCI.
+- Unlock the Franka arms and activate FCI.
 
-- Build the ROS 2 workspace
+Build the ROS 2 workspace.
 
 Skip this if nothing under `gello_software/ros2/` changed since the last build.
 
@@ -58,31 +74,35 @@ If you open a new shell after building, run `source install/setup.bash` again be
 
 Use the direct `pylibfranka` reset script when you want to return both robots to a dataset start pose before recording, replay, or deployment.
 
-By default, the script preserves the legacy hardcoded target stored inside `data_collection/reset_pylibfranka.py`:
+When a matching dataset is available, prefer selecting its `observation.state` frame. The script validates the expected 16-dimensional layout:
 
 - left arm joint positions
 - left gripper width
 - right arm joint positions
 - right gripper width
 
-Preview the legacy target state without moving the robots:
+If `--dataset-root` is omitted, the script uses the measured `INITIAL_STATE` stored inside `data_collection/reset_pylibfranka.py`. This fallback is specific to the aligned hardware setup and may not be safe for another robot or GELLO calibration.
+
+Preview the fallback target without moving the robots:
 
 ```bash
-python data_collection/reset_pylibfranka.py --dry-run
+python3 data_collection/reset_pylibfranka.py --dry-run
 ```
 
-Reset both arms and grippers to the legacy target:
+Reset both arms and grippers to the fallback target:
 
 ```bash
-python data_collection/reset_pylibfranka.py
+python3 data_collection/reset_pylibfranka.py
 ```
 
 To reset to the actual initial `observation.state` from a dataset episode, pass `--dataset-root`, `--episode`, and optionally `--frame-index`.
 
+Dataset gripper values are physical widths in metres. The `[0, 1]` clamp used for normalized continuous gripper commands during collection and replay does not apply to these reset widths.
+
 Preview dataset episode 0, frame 0:
 
 ```bash
-python data_collection/reset_pylibfranka.py \
+python3 data_collection/reset_pylibfranka.py \
   --dataset-root data/pick_and_place_test \
   --episode 0 \
   --frame-index 0 \
@@ -92,11 +112,39 @@ python data_collection/reset_pylibfranka.py \
 Reset to that dataset frame:
 
 ```bash
-python data_collection/reset_pylibfranka.py \
+python3 data_collection/reset_pylibfranka.py \
   --dataset-root data/pick_and_place_test \
   --episode 0 \
   --frame-index 0
 ```
+
+For episode replay, first start the normal arm controllers and gripper manager
+described in the teleoperation quick start. Do not run the GELLO publisher at the
+same time because replay publishes to the same `/left/gello/joint_states` and
+`/right/gello/joint_states` topics.
+
+Inspect episode 0 without publishing commands:
+
+```bash
+python3 data_collection/replay_lerobot_episode.py \
+  --dataset-root data/pick_and_place_test \
+  --episode 0 \
+  --dry-run
+```
+
+Replay through the ROS 2 collection controller:
+
+```bash
+python3 data_collection/replay_lerobot_episode.py \
+  --dataset-root data/pick_and_place_test \
+  --episode 0 \
+  --output outputs/replay_episode_0
+```
+
+The replay tool always uses the recorded `action` values. It requires
+`arm_action_representation=absolute_joint_position` and
+`gripper_action_representation=absolute_width`. Type `s` and Enter after the
+controller-state subscriptions are ready; type `q` and Enter to abort.
 
 ## Teleoperation Quick Start
 
@@ -173,6 +221,12 @@ The bridge expects:
 
 By default the bridge publishes current measured robot joint states as `observation.state` and uses the arm-controller target topic (`/left|right/franka/commanded_joint_states`) as the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
 
+New datasets use continuous normalized gripper commands with
+`gripper_action_representation=absolute_width`. The recorder preserves values
+between `0` and `1` and clamps only out-of-range gripper values at serialization.
+This normalized command is distinct from the physical gripper widths used by
+`reset_pylibfranka.py`.
+
 Launch the camera publisher from the ROS 2 workspace:
 
 ```bash
@@ -195,7 +249,7 @@ Then run the LeRobot recorder from the repo root:
 
 ```bash
 source ~/anaconda3/bin/activate && conda activate lerobot
-python lerobot_collection.py
+python data_collection/lerobot_collection.py
 ```
 
 ## Dataset Validation
@@ -205,14 +259,14 @@ After recording or editing a dataset, validate that the metadata, parquet data, 
 Run the default validation:
 
 ```bash
-python3 data_collection/validate_dataset.py \
+python3 data_collection/process_dataset.py validate \
   --dataset-root data/pick_and_place_test
 ```
 
 Print one row per episode:
 
 ```bash
-python3 data_collection/validate_dataset.py \
+python3 data_collection/process_dataset.py validate \
   --dataset-root data/pick_and_place_test \
   --verbose
 ```
@@ -230,17 +284,52 @@ The validator checks:
 If OpenCV is not available in the active Python environment, either install it or skip physical video checks:
 
 ```bash
-python3 data_collection/validate_dataset.py \
+python3 data_collection/process_dataset.py validate \
   --dataset-root data/pick_and_place_test \
   --skip-video-frames
 ```
 
+### Trim Initial Static Segments
+
+Automatically detect and remove the initial static arm segment from every episode:
+
+```bash
+python3 data_collection/process_dataset.py trim-initial \
+  --dataset-root data/pick_and_place_test \
+  --motion-threshold 0.002 \
+  --min-static-frames 5 \
+  --dry-run
+```
+
+Detection uses the 14 arm joints in `observation.state` and ignores gripper
+motion. It stops at the first frame whose maximum arm-joint displacement exceeds
+the threshold and keeps that first moving frame. Remove `--dry-run` to create a
+sibling dataset named `<dataset>_trimmed`. Use `--episode-indices 0,1,4-8` to
+process selected episodes. In-place replacement is available only with the
+explicit `--in-place` option and keeps the original dataset as a backup.
+
+## Episode Deletion
+
+Preview deletion of individual episodes and inclusive ranges:
+
+```bash
+python data_collection/delete_lerobot_episode.py \
+  --dataset-root data/pick_and_place_test \
+  --episode-indices 0,3-5,9 \
+  --dry-run
+```
+
+Without `--in-place`, the command creates a sibling output dataset. In-place
+deletion requires the explicit `--in-place` flag and keeps a backup of the
+original dataset. The operation reindexes remaining episodes and rebuilds
+Parquet data, video metadata, and dataset statistics.
+
 
 ## Additional Documentation
 
-- General GELLO docs: [gello_software/README.md](gello_software/README.md)
-- Franka FR3 ROS 2 docs: [gello_software/ros2/README.md](gello_software/ros2/README.md)
-- LeRobot docs: [lerobot/README.md](lerobot/README.md)
+- General GELLO docs: [gello_software/README.md](../gello_software/README.md)
+- Franka FR3 ROS 2 docs: [gello_software/ros2/README.md](../gello_software/ros2/README.md)
+- LeRobot docs: [lerobot/README.md](../lerobot/README.md)
 
 ## Dataset Hub Helpers
 

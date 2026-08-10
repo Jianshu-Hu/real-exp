@@ -3,11 +3,10 @@
 This directory contains the repo-local training entrypoint for imitation learning with LeRobot:
 
 - `train/train_lerobot_policy.py`
-- `train/deploy_lerobot_policy.py`
-- `train/franka_act_policy_executor.py`
-- `train/franka_diffusion_policy_executor.py`
 - `train/push_lerobot_policy.py`
-- `train/fetch_lerobot_policy.py`
+
+Policy inspection, fetching, serving, and robot-side execution are documented in
+[`deploy/DEPLOY_README.md`](../deploy/DEPLOY_README.md).
 
 ## Environment
 
@@ -44,6 +43,29 @@ local/pick_and_place_test
 ```
 
 You can override both with CLI flags if needed.
+
+Before training, validate the selected dataset from the repository root:
+
+```bash
+python data_collection/process_dataset.py validate \
+  --dataset-root data/pick_and_place_test
+```
+
+If recordings contain an initial stationary period, inspect automatic trimming
+before creating a cleaned sibling dataset:
+
+```bash
+python data_collection/process_dataset.py trim-initial \
+  --dataset-root data/pick_and_place_test \
+  --motion-threshold 0.002 \
+  --min-static-frames 5 \
+  --dry-run
+```
+
+The training entry point requires `meta/real_exp_action_config.json` with
+`arm_action_representation=absolute_joint_position`. Current collection also
+uses `gripper_action_representation=absolute_width`, which preserves continuous
+normalized gripper targets in `[0, 1]`.
 
 ## Recommended First Run
 
@@ -176,14 +198,14 @@ python train/push_lerobot_policy.py \
 Fetch a policy from Hugging Face:
 
 ```bash
-python train/fetch_lerobot_policy.py \
+python deploy/fetch_lerobot_policy.py \
   --repo-id Jianshu1/pick_and_place_test_act
 ```
 
 By default:
 
 - `push_lerobot_policy.py` pushes to remote branch `main`
-- `fetch_lerobot_policy.py` fetches from remote branch `main`
-- `fetch_lerobot_policy.py` replaces `outputs/fetched_policies/<repo-name>` so the local copy matches the remote policy
+- `deploy/fetch_lerobot_policy.py` fetches from remote branch `main`
+- `deploy/fetch_lerobot_policy.py` replaces `outputs/fetched_policies/<repo-name>` so the local copy matches the remote policy
 
 Use `--branch`, `--revision`, or `--no-clean` only when you intentionally want non-default behavior.

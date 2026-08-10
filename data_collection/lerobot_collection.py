@@ -13,16 +13,38 @@ import zmq
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(LOCAL_LEROBOT_SRC) not in sys.path:
     sys.path.insert(0, str(LOCAL_LEROBOT_SRC))
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-from dataset_stats import ensure_dataset_stats
+from utils.dataset_stats import ensure_dataset_stats
 
 LEROBOT_INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 SYSTEM_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
+
+
+def clamp_gripper_values(values: np.ndarray) -> np.ndarray:
+    """Return a copy with 16-D gripper values clamped to the normalized [0, 1] range.
+
+    Arm-only 14-D vectors are copied unchanged. Other dimensions are rejected
+    because their gripper layout is ambiguous.
+    """
+    result = np.asarray(values, dtype=np.float32).copy()
+    if result.ndim != 1:
+        raise ValueError(f"Expected a one-dimensional action/state vector, got shape {result.shape}.")
+    if result.size == 14:
+        return result
+    if result.size != 16:
+        raise ValueError(
+            "Expected a 14-D arm-only or 16-D dual-arm vector for gripper clamping; "
+            f"got {result.size} dimensions."
+        )
+    result[[7, 15]] = np.clip(result[[7, 15]], 0.0, 1.0)
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -242,8 +264,8 @@ def make_dataset(
 
 def packet_to_frame(packet: dict[str, Any], camera_names: list[str], task_name: str) -> dict[str, Any]:
     frame: dict[str, Any] = {
-        "observation.state": np.asarray(packet["state"], dtype=np.float32),
-        "action": np.asarray(packet["action"], dtype=np.float32),
+        "observation.state": clamp_gripper_values(np.asarray(packet["state"], dtype=np.float32)),
+        "action": clamp_gripper_values(np.asarray(packet["action"], dtype=np.float32)),
         "task": task_name,
     }
     for camera_name in camera_names:
@@ -284,8 +306,8 @@ def packet_pair_to_frame(
     task_name: str,
 ) -> dict[str, Any]:
     frame: dict[str, Any] = {
-        "observation.state": np.asarray(current_packet["state"], dtype=np.float32),
-        "action": compute_recorded_action(current_packet, next_packet),
+        "observation.state": clamp_gripper_values(np.asarray(current_packet["state"], dtype=np.float32)),
+        "action": clamp_gripper_values(compute_recorded_action(current_packet, next_packet)),
         "task": task_name,
     }
     for camera_name in camera_names:

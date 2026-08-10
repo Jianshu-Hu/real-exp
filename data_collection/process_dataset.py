@@ -1,25 +1,99 @@
+"""Validate and process local LeRobot datasets.
+
+Usage:
+    python data_collection/process_dataset.py validate \
+        --dataset-root data/my_dataset
+
+Dataset-processing commands may create a new dataset or replace the input only
+when explicitly requested. Review a dry run before modifying recorded data.
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(LOCAL_LEROBOT_SRC) not in sys.path:
+    sys.path.insert(0, str(LOCAL_LEROBOT_SRC))
+
+
+@dataclass(frozen=True)
+class InitialTrim:
+    episode_index: int
+    old_length: int
+    trim_frames: int
+
+    @property
+    def new_length(self) -> int:
+        return self.old_length - self.trim_frames
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate a local LeRobot dataset and print dataset information."
+        description="Validate and process a local LeRobot dataset."
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["validate", "trim-initial"],
+        default="validate",
+        help="Dataset operation to run. Defaults to validate.",
     )
     parser.add_argument(
         "--dataset-root",
         required=True,
         help="Path to the LeRobot dataset root directory.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Sibling output dataset for trim-initial. Required only when not using the default.",
+    )
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Replace the source dataset for trim-initial after moving it to a backup.",
+    )
+    parser.add_argument(
+        "--backup-dir",
+        default=None,
+        help="Backup directory used with --in-place for trim-initial.",
+    )
+    parser.add_argument(
+        "--episode-indices",
+        nargs="+",
+        default=None,
+        help="Episodes for trim-initial, using comma/whitespace-separated values and ranges.",
+    )
+    parser.add_argument(
+        "--motion-threshold",
+        type=float,
+        default=0.002,
+        help="Maximum arm-joint displacement in rad/frame considered static. Default: 0.002.",
+    )
+    parser.add_argument(
+        "--min-static-frames",
+        type=int,
+        default=5,
+        help="Minimum initial static frames required before trimming. Default: 5.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the trim plan without modifying files.",
     )
     parser.add_argument(
         "--skip-video-frames",
@@ -158,6 +232,53 @@ def get_video_keys(info: dict[str, Any]) -> list[str]:
         for feature_name, feature_spec in info.get("features", {}).items()
         if feature_spec.get("dtype") == "video"
     ]
+
+
+def parse_episode_selection(text: str) -> list[int]:
+    tokens = [token for token in text.replace(",", " ").split() if token]
+    if not tokens:
+        raise ValueError("--episode-indices must contain at least one episode.")
+    selected: set[int] = set()
+    for token in tokens:
+        parts = token.split("-")
+        if token.isdigit():
+            selected.add(int(token))
+        elif len(parts) == 2 and all(part.isdigit() for part in parts):
+            start, end = map(int, parts)
+            if start > end:
+                raise ValueError(f"Invalid episode range {token!r}: start must be <= end.")
+            selected.update(range(start, end + 1))
+        else:
+            raise ValueError(
+                f"Invalid episode token {token!r}. Use non-negative integers or ranges like 4-8."
+            )
+    return sorted(selected)
+
+
+def detect_initial_trim(rows: list[dict[str, Any]], threshold: float, min_static_frames: int) -> int:
+    if threshold < 0:
+        raise ValueError("--motion-threshold must be non-negative.")
+    if min_static_frames < 1:
+        raise ValueError("--min-static-frames must be positive.")
+    ordered = sorted(rows, key=lambda row: int(row["frame_index"]))
+    states = [flatten_numeric(row.get("observation.state")) for row in ordered]
+    if not states or any(len(state) != 16 for state in states):
+        raise ValueError("Static detection requires a 16-D observation.state for every frame.")
+    if any(has_non_finite(state) for state in states):
+        raise ValueError("Static detection requires finite observation.state values.")
+    static_transitions = 0
+    for previous, current in zip(states, states[1:], strict=True):
+        if len(current) != 16 or len(previous) != 16:
+            break
+        arm_delta = max(
+            [abs(current[index] - previous[index]) for index in range(0, 7)]
+            + [abs(current[index] - previous[index]) for index in range(8, 15)]
+        )
+        if arm_delta > threshold:
+            break
+        static_transitions += 1
+    candidate = static_transitions + 1
+    return candidate if candidate >= min_static_frames and candidate < len(ordered) else 0
 
 
 def build_data_index(data_rows: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
@@ -621,8 +742,171 @@ def validate_dataset(
     return 0
 
 
+def trim_initial_static_segments(args: argparse.Namespace) -> int:
+    """Detect and rebuild datasets after removing initial static arm frames."""
+    try:
+        import pandas as pd
+        from utils.dataset_stats import ensure_dataset_stats
+        from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+        from lerobot.datasets.dataset_tools import _keep_episodes_from_video_with_av, _write_parquet
+        from lerobot.datasets.io_utils import load_episodes, write_info
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("LeRobot dataset-processing dependencies are required for trim-initial.") from exc
+
+    dataset_root = Path(args.dataset_root).expanduser().resolve()
+    if not (dataset_root / INFO_PATH).exists():
+        raise FileNotFoundError(f"{dataset_root} is not a LeRobot dataset root. Missing {INFO_PATH}.")
+    info = load_json(dataset_root / INFO_PATH)
+    fps = float(info["fps"])
+    source_meta = LeRobotDatasetMetadata(
+        repo_id=f"local/{dataset_root.name}",
+        root=dataset_root,
+        revision=str(info.get("codebase_version", "v3.0")),
+    )
+    if source_meta.episodes is None:
+        source_meta.episodes = load_episodes(dataset_root)
+    episode_indices = (
+        parse_episode_selection(" ".join(args.episode_indices))
+        if args.episode_indices
+        else [int(episode["episode_index"]) for episode in source_meta.episodes]
+    )
+    available = {int(episode["episode_index"]) for episode in source_meta.episodes}
+    invalid = sorted(set(episode_indices) - available)
+    if invalid:
+        raise ValueError(f"Episode indices not found in dataset: {invalid}.")
+
+    rows_by_episode: dict[int, list[dict[str, Any]]] = {index: [] for index in available}
+    for parquet_file in sorted((dataset_root / "data").glob("chunk-*/*.parquet")):
+        for row in pd.read_parquet(parquet_file).to_dict(orient="records"):
+            rows_by_episode[int(row["episode_index"])].append(row)
+    trim_plan: dict[int, InitialTrim] = {}
+    for episode in source_meta.episodes:
+        index = int(episode["episode_index"])
+        old_length = int(episode["length"])
+        if len(rows_by_episode[index]) != old_length:
+            raise ValueError(
+                f"Episode {index} metadata declares {old_length} frames, "
+                f"but {len(rows_by_episode[index])} data rows were found."
+            )
+        trim_frames = detect_initial_trim(rows_by_episode[index], args.motion_threshold, args.min_static_frames) if index in episode_indices else 0
+        trim_plan[index] = InitialTrim(index, old_length, trim_frames)
+
+    print("Initial static-segment trim plan")
+    for index in episode_indices:
+        trim = trim_plan[index]
+        print(f"  episode {index}: remove {trim.trim_frames} frame(s), {trim.old_length} -> {trim.new_length}")
+    if args.dry_run:
+        print("Dry run complete. No files were changed.")
+        return 0
+
+    if args.in_place and args.output_dir:
+        raise ValueError("--output-dir cannot be used with --in-place.")
+    if args.backup_dir and not args.in_place:
+        raise ValueError("--backup-dir requires --in-place.")
+    output_root = dataset_root if args.in_place else Path(args.output_dir).expanduser().resolve() if args.output_dir else dataset_root.with_name(f"{dataset_root.name}_trimmed")
+    backup_root = Path(args.backup_dir).expanduser().resolve() if args.backup_dir else dataset_root.with_name(f"{dataset_root.name}_backup_before_trim")
+    if output_root.exists() and output_root != dataset_root:
+        raise FileExistsError(f"Output directory already exists: {output_root}")
+    source_root = dataset_root
+    moved = False
+    try:
+        if args.in_place:
+            if backup_root.exists():
+                raise FileExistsError(f"Backup directory already exists: {backup_root}")
+            shutil.move(str(dataset_root), str(backup_root))
+            source_root = backup_root
+            moved = True
+        source_meta = LeRobotDatasetMetadata(repo_id=f"local/{source_root.name}", root=source_root, revision=str(info.get("codebase_version", "v3.0")))
+        if source_meta.episodes is None:
+            source_meta.episodes = load_episodes(source_root)
+        new_meta = LeRobotDatasetMetadata.create(repo_id=f"local/{output_root.name}", fps=source_meta.fps, features=source_meta.features, robot_type=source_meta.robot_type, root=output_root, use_videos=bool(source_meta.video_keys), chunks_size=source_meta.chunks_size, data_files_size_in_mb=source_meta.data_files_size_in_mb, video_files_size_in_mb=source_meta.video_files_size_in_mb)
+        if source_meta.tasks is not None:
+            new_meta.save_episode_tasks(list(source_meta.tasks.index))
+        video_metadata: dict[int, dict[str, Any]] = {int(ep["episode_index"]): {} for ep in source_meta.episodes}
+        for video_key in source_meta.video_keys:
+            files: dict[tuple[int, int], list[int]] = {}
+            for episode in source_meta.episodes:
+                index = int(episode["episode_index"])
+                chunk = int(episode[f"videos/{video_key}/chunk_index"])
+                file_index = int(episode[f"videos/{video_key}/file_index"])
+                files.setdefault((chunk, file_index), []).append(index)
+            for (chunk, file_index), episode_ids in files.items():
+                source_video = source_root / source_meta.video_path.format(video_key=video_key, chunk_index=chunk, file_index=file_index)
+                destination_video = output_root / new_meta.video_path.format(video_key=video_key, chunk_index=chunk, file_index=file_index)
+                destination_video.parent.mkdir(parents=True, exist_ok=True)
+                ranges: list[tuple[int, int]] = []
+                cumulative = 0.0
+                for index in sorted(episode_ids):
+                    episode = source_meta.episodes[index]
+                    start = round(float(episode[f"videos/{video_key}/from_timestamp"]) * source_meta.fps)
+                    end = round(float(episode[f"videos/{video_key}/to_timestamp"]) * source_meta.fps)
+                    trim = trim_plan[index].trim_frames
+                    ranges.append((start + trim, end))
+                _keep_episodes_from_video_with_av(source_video, destination_video, ranges, source_meta.fps)
+                for index in sorted(episode_ids):
+                    trim = trim_plan[index]
+                    duration = trim.new_length / source_meta.fps
+                    video_metadata[index].update({
+                        f"videos/{video_key}/chunk_index": chunk,
+                        f"videos/{video_key}/file_index": file_index,
+                        f"videos/{video_key}/from_timestamp": cumulative,
+                        f"videos/{video_key}/to_timestamp": cumulative + duration,
+                    })
+                    cumulative += duration
+        global_index = 0
+        data_metadata: dict[int, dict[str, Any]] = {}
+        for data_file in sorted((source_root / "data").glob("chunk-*/*.parquet")):
+            frame_df = pd.read_parquet(data_file)
+            kept_parts = []
+            for index, group in frame_df.groupby("episode_index", sort=True):
+                trim = trim_plan[int(index)]
+                group = group.sort_values("frame_index").iloc[trim.trim_frames:].copy()
+                group["frame_index"] = range(len(group))
+                group["timestamp"] = [frame / source_meta.fps for frame in range(len(group))]
+                group["index"] = range(global_index, global_index + len(group))
+                kept_parts.append(group)
+                data_metadata[int(index)] = {"data/chunk_index": int(data_file.parent.name.split("-")[-1]), "data/file_index": int(data_file.stem.split("-")[-1]), "dataset_from_index": int(group["index"].min()), "dataset_to_index": int(group["index"].max() + 1)}
+                global_index += len(group)
+            if kept_parts:
+                destination = output_root / "data" / data_file.parent.name / data_file.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _write_parquet(pd.concat(kept_parts, ignore_index=True), destination, new_meta)
+        for episode in sorted(source_meta.episodes, key=lambda item: int(item["episode_index"])):
+            index = int(episode["episode_index"])
+            trim = trim_plan[index]
+            metadata = {
+                "episode_index": index,
+                "tasks": episode["tasks"],
+                "length": trim.new_length,
+                **data_metadata[index],
+                **video_metadata[index],
+            }
+            new_meta._save_episode_metadata(metadata)
+        new_meta.finalize()
+        new_meta.info.update({"total_episodes": len(trim_plan), "total_frames": sum(trim.new_length for trim in trim_plan.values()), "splits": {"train": f"0:{len(trim_plan)}"}})
+        write_info(new_meta.info, output_root)
+        source_action_config = source_root / ACTION_CONFIG_PATH
+        if source_action_config.exists():
+            target_action_config = output_root / ACTION_CONFIG_PATH
+            target_action_config.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_action_config, target_action_config)
+        ensure_dataset_stats(f"local/{output_root.name}", output_root, force_recompute=True)
+    except Exception:
+        if output_root.exists() and output_root != dataset_root:
+            shutil.rmtree(output_root)
+        if moved and backup_root.exists():
+            if dataset_root.exists():
+                shutil.rmtree(dataset_root)
+            shutil.move(str(backup_root), str(dataset_root))
+        raise
+    print(f"Finished trimming initial static segments. Output: {output_root}")
+    return 0
+
+
 def main() -> None:
     args = parse_args()
+    if args.command == "trim-initial":
+        raise SystemExit(trim_initial_static_segments(args))
     dataset_root = Path(args.dataset_root).expanduser().resolve()
     try:
         exit_code = validate_dataset(

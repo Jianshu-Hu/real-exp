@@ -1,3 +1,10 @@
+"""Inspect trained policies or serve them for remote robot-side execution.
+
+Usage:
+    python deploy/deploy_lerobot_policy.py inspect --policy-path outputs/my_policy
+    python deploy/deploy_lerobot_policy.py server --host 0.0.0.0 --port 8080
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -5,6 +12,7 @@ import json
 import logging
 import os
 import pickle  # nosec
+import sys
 import time
 import traceback
 from concurrent import futures
@@ -17,12 +25,14 @@ from typing import Any
 
 import torch
 
-from image_preprocessing import ResizePadSquare, infer_square_resize_pad_size_from_policy_features
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils.image_preprocessing import ResizePadSquare, infer_square_resize_pad_size_from_policy_features
 from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.transport.utils import receive_bytes_in_chunks
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"

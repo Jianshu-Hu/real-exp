@@ -1,3 +1,11 @@
+"""Fetch a LeRobot policy from the Hugging Face Hub into local outputs.
+
+Usage:
+    python deploy/fetch_lerobot_policy.py --repo-id user/policy
+
+Warning: the default clean mode replaces an existing target policy directory.
+"""
+
 from __future__ import annotations
 
 import argparse

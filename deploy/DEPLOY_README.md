@@ -63,7 +63,7 @@ For the default Franka duo setup, start the robot and gripper bringup before sta
 Run this on the machine that has the checkpoint and the `lerobot` environment:
 
 ```bash
-python train/deploy_lerobot_policy.py \
+python deploy/deploy_lerobot_policy.py \
   inspect \
   --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model
 ```
@@ -82,7 +82,7 @@ Verify that:
 - `dataset_state_dim` is `16`
 - `dataset_action_dim` is `16`
 - `dataset_image_keys` are `observation.images.cam_left`, `observation.images.cam_front`, `observation.images.cam_right`
-- `dataset_action_representation` says `arm=absolute_joint_position, gripper=binary_open_close`
+- `dataset_action_representation` says `arm=absolute_joint_position, gripper=absolute_width`
 
 ### 2. Start the camera publisher
 
@@ -140,7 +140,7 @@ In standby it can publish hold commands to the ROS 2 controller topics, but it d
 Run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train/deploy_lerobot_policy.py \
+CUDA_VISIBLE_DEVICES=0 python deploy/deploy_lerobot_policy.py \
   server \
   --host 0.0.0.0 \
   --port 8080 \
@@ -186,7 +186,7 @@ This lets the existing ROS 2 consumers be reused during deployment.
 Run this on the robot machine:
 
 ```bash
-python train/franka_act_policy_executor.py \
+python deploy/franka_act_policy_executor.py \
   --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
   --server-address 192.168.50.6:8080 \
   --zmq-host 127.0.0.1 \
@@ -212,7 +212,7 @@ This ACT-specific flag sets the weight of the already-queued action when the exe
 For diffusion deployment, use the diffusion-specific knobs instead:
 
 ```bash
-python train/franka_diffusion_policy_executor.py \
+python deploy/franka_diffusion_policy_executor.py \
   --policy-path outputs/pick_and_place_test_diffusion/checkpoints/last/pretrained_model \
   --actions-per-chunk 8 \
   --server-address 192.168.50.6:8080 \
@@ -232,7 +232,7 @@ If the checkpoint exists only on the policy server machine and not on the robot 
 Example:
 
 ```bash
-python train/franka_diffusion_policy_executor.py \
+python deploy/franka_diffusion_policy_executor.py \
   --policy-path /home/pair/real-exp/outputs/policy-dir \
   --actions-per-chunk 8 \
   --policy-device cuda:0 \
@@ -270,7 +270,7 @@ If the executor raises an `action_dim` mismatch, fix the ROS 2 bridge configurat
 Once dry-run is stable, restart the executor for live execution:
 
 ```bash
-python train/franka_act_policy_executor.py \
+python deploy/franka_act_policy_executor.py \
   --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
   --server-address 192.168.50.6:8080 \
   --zmq-host 127.0.0.1 \
@@ -299,6 +299,7 @@ The executor will:
 - split the policy action into left and right arm and gripper components
 - interpret arm actions using the trained dataset layout
 - send `absolute_joint_position` arm actions directly as robot joint targets
+- preserve continuous `absolute_width` gripper actions and clamp them to `[0, 1]`
 - send those targets to the bridge command socket
 - let the bridge enable the deployment-gated arm controllers and republish targets to the existing ROS 2 arm and gripper topics
 
@@ -351,7 +352,7 @@ Useful executor options:
   - start the server with `CUDA_VISIBLE_DEVICES=0` and use `--policy-device cuda:0`
 - `stack expects a non-empty TensorList` on the server:
   - the policy did not receive a valid stacked image batch
-  - confirm the live bridge publishes all cameras from the training contract and restart `python train/deploy_lerobot_policy.py server ...`
+  - confirm the live bridge publishes all cameras from the training contract and restart `python deploy/deploy_lerobot_policy.py server ...`
 - `Action receiver RPC error: Channel closed!` on the robot machine:
   - the server usually crashed while handling inference
   - check the server log first and fix the upstream error there
@@ -377,13 +378,18 @@ Useful executor options:
 
 ## Franka Control Note
 
-The dataset action representation is absolute joint position for the arms, with optional gripper commands.
+The current dataset action representation is absolute joint position for the
+arms and continuous normalized absolute width for enabled grippers.
 That means the robot-side executor can send policy arm outputs to the deployment bridge as joint targets, while still keeping local safety checks and the ROS 2 controller layer in the loop.
 
 The executor should interpret actions using the same structure as the dataset:
 
 - 16-dim: `[Left Arm(7), Left Gripper(1), Right Arm(7), Right Gripper(1)]`
 - 14-dim: `[Left Arm(7), Right Arm(7)]`
+
+For a 16-dimensional dataset, gripper action indices `7` and `15` are continuous
+values in `[0, 1]`. They are not binary open/close labels. The executor clamps
+predicted values to this normalized range before sending them to the bridge.
 
 In practice, the executor should:
 

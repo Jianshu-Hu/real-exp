@@ -82,7 +82,7 @@ Verify that:
 - `dataset_state_dim` is `16`
 - `dataset_action_dim` is `16`
 - `dataset_image_keys` are `observation.images.cam_left`, `observation.images.cam_front`, `observation.images.cam_right`
-- `dataset_action_representation` says `arm=absolute_joint_position, gripper=binary_open_close`
+- `dataset_action_representation` says `arm=absolute_joint_position, gripper=absolute_width`
 
 ### 2. Start the camera publisher
 
@@ -299,6 +299,7 @@ The executor will:
 - split the policy action into left and right arm and gripper components
 - interpret arm actions using the trained dataset layout
 - send `absolute_joint_position` arm actions directly as robot joint targets
+- preserve continuous `absolute_width` gripper actions and clamp them to `[0, 1]`
 - send those targets to the bridge command socket
 - let the bridge enable the deployment-gated arm controllers and republish targets to the existing ROS 2 arm and gripper topics
 
@@ -377,13 +378,18 @@ Useful executor options:
 
 ## Franka Control Note
 
-The dataset action representation is absolute joint position for the arms, with optional gripper commands.
+The current dataset action representation is absolute joint position for the
+arms and continuous normalized absolute width for enabled grippers.
 That means the robot-side executor can send policy arm outputs to the deployment bridge as joint targets, while still keeping local safety checks and the ROS 2 controller layer in the loop.
 
 The executor should interpret actions using the same structure as the dataset:
 
 - 16-dim: `[Left Arm(7), Left Gripper(1), Right Arm(7), Right Gripper(1)]`
 - 14-dim: `[Left Arm(7), Right Arm(7)]`
+
+For a 16-dimensional dataset, gripper action indices `7` and `15` are continuous
+values in `[0, 1]`. They are not binary open/close labels. The executor clamps
+predicted values to this normalized range before sending them to the bridge.
 
 In practice, the executor should:
 

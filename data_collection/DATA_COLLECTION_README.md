@@ -3,7 +3,7 @@
 
 ## Overview
 - `lerobot_collection.py`: Minimal script for recording synchronized RealSense images and robot state/action data into a LeRobot dataset.
-- `replay_pylibfranka.py`: Replay a recorded LeRobot episode on the real Franka arms using `pylibfranka`, with optional `--dry-run` inspection before motion.
+- `replay_lerobot_episode.py`: Replay a recorded LeRobot episode through the same ROS 2 arm and gripper controller topics used during collection.
 - `reset_pylibfranka.py`: Reset both Franka arms to a selected dataset `observation.state` frame or a measured hardware-specific fallback pose.
 - `delete_lerobot_episode.py`: Remove one or more episodes from a local LeRobot dataset while preserving the remaining metadata, videos, and parquet data.
 - `process_dataset.py`: Validate and process local LeRobot datasets, including automatic initial-static-segment trimming.

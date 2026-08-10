@@ -22,7 +22,7 @@ git submodule update --init --recursive
 
 This repo uses two different Python environments:
 
-- Use the system ROS 2 / Franka environment for `gello_software`, ROS 2 launch files, and `data_collection/replay_pylibfranka.py`.
+- Use the system ROS 2 / Franka environment for `gello_software`, ROS 2 launch files, and `data_collection/replay_lerobot_episode.py`.
 - Use the `lerobot` Conda environment for `data_collection/lerobot_collection.py`, dataset inspection, dataset editing, and training under `lerobot/`.
 
 ## Common Workflows
@@ -39,7 +39,7 @@ python data_collection/delete_lerobot_episode.py --help
 For replay with `pylibfranka`:
 
 ```bash
-python3 data_collection/replay_pylibfranka.py --help
+python3 data_collection/replay_lerobot_episode.py --help
 ```
 
 The detailed data collection and replay instructions now live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md).

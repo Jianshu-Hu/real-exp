@@ -1,3 +1,9 @@
+"""Create and maintain training-ready statistics for local LeRobot datasets.
+
+Import ``ensure_dataset_stats`` from this module after adding the repository
+root and local LeRobot source directory to the Python module search path.
+"""
+
 from __future__ import annotations
 
 import logging

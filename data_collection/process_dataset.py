@@ -24,6 +24,8 @@ INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(LOCAL_LEROBOT_SRC) not in sys.path:
     sys.path.insert(0, str(LOCAL_LEROBOT_SRC))
 
@@ -744,7 +746,7 @@ def trim_initial_static_segments(args: argparse.Namespace) -> int:
     """Detect and rebuild datasets after removing initial static arm frames."""
     try:
         import pandas as pd
-        from dataset_stats import ensure_dataset_stats
+        from utils.dataset_stats import ensure_dataset_stats
         from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
         from lerobot.datasets.dataset_tools import _keep_episodes_from_video_with_av, _write_parquet
         from lerobot.datasets.io_utils import load_episodes, write_info

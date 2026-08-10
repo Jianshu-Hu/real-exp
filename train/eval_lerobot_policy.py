@@ -14,9 +14,8 @@ DEFAULT_HF_DATASETS_CACHE = DEFAULT_HF_CACHE / "datasets"
 os.environ["HF_HOME"] = str(DEFAULT_HF_CACHE)
 os.environ["HF_DATASETS_CACHE"] = str(DEFAULT_HF_DATASETS_CACHE)
 
-DATA_COLLECTION_DIR = REPO_ROOT / "data_collection"
-if str(DATA_COLLECTION_DIR) not in sys.path:
-    sys.path.insert(0, str(DATA_COLLECTION_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from accelerate import Accelerator
 
@@ -24,7 +23,7 @@ from lerobot.configs.default import DatasetConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
-from image_preprocessing import ResizePadConfig, infer_square_resize_pad_size_from_policy_features
+from utils.image_preprocessing import ResizePadConfig, infer_square_resize_pad_size_from_policy_features
 from train_lerobot_policy import (
     DEFAULT_DATASET_ROOT,
     apply_dataset_image_transform,

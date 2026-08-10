@@ -11,9 +11,8 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DATA_COLLECTION_DIR = REPO_ROOT / "data_collection"
-if str(DATA_COLLECTION_DIR) not in sys.path:
-    sys.path.insert(0, str(DATA_COLLECTION_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 from accelerate import Accelerator
@@ -38,8 +37,8 @@ from lerobot.utils.train_utils import (
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.utils import init_logging
 
-from dataset_stats import ensure_dataset_stats
-from image_preprocessing import (
+from utils.dataset_stats import ensure_dataset_stats
+from utils.image_preprocessing import (
     ResizePadConfig,
     apply_resize_pad_to_feature_specs,
     make_resize_pad_transform,

@@ -6,6 +6,7 @@ This repository groups the code and notes used for real-world Franka FR3 experim
 
 - `data_collection/`: scripts and documentation for recording, replaying, and editing local LeRobot datasets.
 - `train/`: training-related notes and experiment-specific training assets.
+- `utils/`: shared dataset-statistics and image-preprocessing helpers.
 - `lerobot/`: vendored LeRobot codebase used by the local collection and training workflow.
 - `gello_software/`: GELLO and ROS 2 integration code, tracked as a git submodule.
 - `data/`: local datasets and experiment outputs.

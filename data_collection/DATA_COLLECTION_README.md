@@ -4,7 +4,7 @@
 ## Overview
 - `lerobot_collection.py`: Minimal script for recording synchronized RealSense images and robot state/action data into a LeRobot dataset.
 - `replay_pylibfranka.py`: Replay a recorded LeRobot episode on the real Franka arms using `pylibfranka`, with optional `--dry-run` inspection before motion.
-- `reset_pylibfranka.py`: Reset both Franka arms to the hardcoded initial state copied from `data/pick_and_place_test` episode 0, without reading dataset parquet files at runtime.
+- `reset_pylibfranka.py`: Reset both Franka arms to a selected dataset `observation.state` frame or a measured hardware-specific fallback pose.
 - `delete_lerobot_episode.py`: Remove one or more episodes from a local LeRobot dataset while preserving the remaining metadata, videos, and parquet data.
 - `validate_dataset.py`: Validate a local LeRobot dataset and print dataset-level and per-episode consistency information.
 
@@ -58,26 +58,30 @@ If you open a new shell after building, run `source install/setup.bash` again be
 
 Use the direct `pylibfranka` reset script when you want to return both robots to a dataset start pose before recording, replay, or deployment.
 
-By default, the script preserves the legacy hardcoded target stored inside `data_collection/reset_pylibfranka.py`:
+When a matching dataset is available, prefer selecting its `observation.state` frame. The script validates the expected 16-dimensional layout:
 
 - left arm joint positions
 - left gripper width
 - right arm joint positions
 - right gripper width
 
-Preview the legacy target state without moving the robots:
+If `--dataset-root` is omitted, the script uses the measured `INITIAL_STATE` stored inside `data_collection/reset_pylibfranka.py`. This fallback is specific to the aligned hardware setup and may not be safe for another robot or GELLO calibration.
+
+Preview the fallback target without moving the robots:
 
 ```bash
 python data_collection/reset_pylibfranka.py --dry-run
 ```
 
-Reset both arms and grippers to the legacy target:
+Reset both arms and grippers to the fallback target:
 
 ```bash
 python data_collection/reset_pylibfranka.py
 ```
 
 To reset to the actual initial `observation.state` from a dataset episode, pass `--dataset-root`, `--episode`, and optionally `--frame-index`.
+
+Dataset gripper values are physical widths in metres. The `[0, 1]` clamp used for normalized continuous gripper commands during collection and replay does not apply to these reset widths.
 
 Preview dataset episode 0, frame 0:
 

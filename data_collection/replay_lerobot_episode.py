@@ -49,12 +49,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset-root", required=True, type=Path, help="LeRobot dataset root.")
     parser.add_argument("--episode", type=int, default=0, help="Episode index to replay.")
-    parser.add_argument(
-        "--mode",
-        choices=("action", "state", "policy"),
-        default="action",
-        help="Target source: dataset action, observation.state, or policy (reserved).",
-    )
     parser.add_argument("--fps", type=float, default=None, help="Replay FPS. Defaults to dataset metadata fps.")
     parser.add_argument(
         "--output",
@@ -188,13 +182,8 @@ def select_frame_range(data: EpisodeData, start_frame: int, end_frame: int | Non
     )
 
 
-def split_targets(data: EpisodeData, mode: str) -> dict[str, np.ndarray]:
-    if mode == "policy":
-        raise NotImplementedError(
-            "policy mode is reserved for closed-loop smoke-test integration and is not implemented in v1."
-        )
-
-    source = data.actions if mode == "action" else data.states
+def split_targets(data: EpisodeData) -> dict[str, np.ndarray]:
+    source = data.actions
     return {
         "left_arm": source[:, 0:7],
         "right_arm": source[:, 8:15],
@@ -203,32 +192,30 @@ def split_targets(data: EpisodeData, mode: str) -> dict[str, np.ndarray]:
     }
 
 
-def continuous_gripper_targets(values: np.ndarray, mode: str) -> np.ndarray:
+def continuous_gripper_targets(values: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype=float)
     if not np.all(np.isfinite(values)):
         raise ValueError("Gripper targets must contain only finite values.")
-    if np.any(values < 0.0) or np.any(values > 1.0):
-        raise ValueError("Normalized continuous gripper targets must be within [0, 1].")
-    return values.copy()
+    return np.clip(values, 0.0, 1.0)
 
 
-def print_dry_run_summary(data: EpisodeData, mode: str, fps: float, no_gripper: bool) -> None:
-    targets = split_targets(data, mode)
+def print_dry_run_summary(data: EpisodeData, fps: float, no_gripper: bool) -> None:
+    targets = split_targets(data)
     print("Controller-matched replay dry run")
     print("----------------------------------")
     print(f"frames: {len(data.frame_indices)}")
     print(f"frame range: {int(data.frame_indices[0])}..{int(data.frame_indices[-1])}")
     print(f"dataset fps: {data.fps:g}")
     print(f"replay fps: {fps:g}")
-    print(f"mode: {mode}")
+    print("target source: action")
     print(f"arm action config: {data.action_config.get('arm_action_representation')} / {data.action_config.get('arm_action_definition')}")
     for arm_name in ("left_arm", "right_arm"):
         values = np.asarray(targets[arm_name], dtype=float)
         print(f"{arm_name} target min: {np.min(values, axis=0).round(6).tolist()}")
         print(f"{arm_name} target max: {np.max(values, axis=0).round(6).tolist()}")
     if not no_gripper:
-        left = continuous_gripper_targets(targets["left_gripper_raw"], mode)
-        right = continuous_gripper_targets(targets["right_gripper_raw"], mode)
+        left = continuous_gripper_targets(targets["left_gripper_raw"])
+        right = continuous_gripper_targets(targets["right_gripper_raw"])
         print(f"left gripper target counts: {value_counts(left)}")
         print(f"right gripper target counts: {value_counts(right)}")
 
@@ -477,9 +464,9 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
     rclpy, Node, JointState, Float32 = import_ros_dependencies()
     ReplayNode = build_replay_node_class(Node, JointState, Float32)
 
-    targets = split_targets(data, args.mode)
-    left_gripper_targets = None if args.no_gripper else continuous_gripper_targets(targets["left_gripper_raw"], args.mode)
-    right_gripper_targets = None if args.no_gripper else continuous_gripper_targets(targets["right_gripper_raw"], args.mode)
+    targets = split_targets(data)
+    left_gripper_targets = None if args.no_gripper else continuous_gripper_targets(targets["left_gripper_raw"])
+    right_gripper_targets = None if args.no_gripper else continuous_gripper_targets(targets["right_gripper_raw"])
     args.output.mkdir(parents=True, exist_ok=True)
 
     write_json(
@@ -487,7 +474,7 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
         {
             "dataset_root": str(args.dataset_root),
             "episode": args.episode,
-            "mode": args.mode,
+            "mode": "action",
             "fps": fps,
             "start_frame": args.start_frame,
             "end_frame": args.end_frame,
@@ -546,8 +533,8 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
                         elapsed_s=elapsed_s,
                         frame_index=int(frame_index),
                         dataset_timestamp=float(data.timestamps[local_idx]),
-                        mode=args.mode,
-                        target_source=args.mode,
+                        mode="action",
+                        target_source="action",
                         left_target=left_target,
                         right_target=right_target,
                         left_actual=node.left_actual_q,
@@ -588,13 +575,8 @@ def main() -> None:
     data = select_frame_range(data, args.start_frame, args.end_frame, args.max_frames)
     fps = float(args.fps if args.fps is not None else data.fps)
 
-    if args.mode == "policy":
-        raise NotImplementedError(
-            "policy mode is reserved for closed-loop smoke-test integration and is not implemented in v1."
-        )
-
     if args.dry_run:
-        print_dry_run_summary(data, args.mode, fps, args.no_gripper)
+        print_dry_run_summary(data, fps, args.no_gripper)
         return
 
     run_replay(args, data, fps)

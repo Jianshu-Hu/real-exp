@@ -248,6 +248,25 @@ python3 data_collection/process_dataset.py validate \
   --skip-video-frames
 ```
 
+### Trim Initial Static Segments
+
+Automatically detect and remove the initial static arm segment from every episode:
+
+```bash
+python3 data_collection/process_dataset.py trim-initial \
+  --dataset-root data/pick_and_place_test \
+  --motion-threshold 0.002 \
+  --min-static-frames 5 \
+  --dry-run
+```
+
+Detection uses the 14 arm joints in `observation.state` and ignores gripper
+motion. It stops at the first frame whose maximum arm-joint displacement exceeds
+the threshold and keeps that first moving frame. Remove `--dry-run` to create a
+sibling dataset named `<dataset>_trimmed`. Use `--episode-indices 0,1,4-8` to
+process selected episodes. In-place replacement is available only with the
+explicit `--in-place` option and keeps the original dataset as a backup.
+
 
 ## Additional Documentation
 

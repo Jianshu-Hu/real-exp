@@ -1,3 +1,13 @@
+"""Validate and process local LeRobot datasets.
+
+Usage:
+    python data_collection/process_dataset.py validate \
+        --dataset-root data/my_dataset
+
+Dataset-processing commands may create a new dataset or replace the input only
+when explicitly requested. Review a dry run before modifying recorded data.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -14,7 +24,14 @@ ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate a local LeRobot dataset and print dataset information."
+        description="Validate and process a local LeRobot dataset."
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["validate"],
+        default="validate",
+        help="Dataset operation to run. Defaults to validate.",
     )
     parser.add_argument(
         "--dataset-root",

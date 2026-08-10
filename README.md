@@ -27,9 +27,14 @@ This repo uses two different Python environments:
 - Use the system ROS 2 / Franka environment for `gello_software`, ROS 2 launch files, and `data_collection/replay_lerobot_episode.py`.
 - Use the `lerobot` Conda environment for `data_collection/lerobot_collection.py`, dataset inspection, dataset editing, and training under `lerobot/`.
 
-## Common Workflows (Data collection-Train-Deploy)
-- Data collection and replay instructions live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md).
+## Common Workflows
+### Data Collection
+Data collection and replay instructions live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md).
+- [`scripts/start_teleoperation.sh`](scripts/start_teleoperation.sh): start single- or dual-arm GELLO teleoperation, with or without gripper control.
+- [`scripts/start_data_collection.sh`](scripts/start_data_collection.sh): start teleoperation together with the RealSense camera publisher and LeRobot data bridge.
+### Train
 - Training instructions live in [train/TRAIN_README.md](train/TRAIN_README.md).
+### Deploy
 - Deployment instructions live in [deploy/DEPLOY_README.md](deploy/DEPLOY_README.md).
 
 ## Notes

@@ -40,6 +40,11 @@ source /opt/ros/humble/setup.sh
 source ~/franka_ros2_ws/install/setup.bash
 source ~/real-exp/gello_software/ros2/install/setup.bash
 
+# start gello publisher
+ros2 launch franka_gello_state_publisher main.launch.py \
+config_file:=gello_duo.yaml
+
+# read states
 ros2 topic echo /left/gello/joint_states
 ros2 topic echo /right/gello/joint_states
 ```
@@ -148,58 +153,65 @@ controller-state subscriptions are ready; type `q` and Enter to abort.
 
 ## Teleoperation Quick Start
 
-The commands below cover the common FR3 teleoperation workflow from this repository.
+Run the teleoperation supervisor from the repository root. It sources the ROS 2
+and Franka workspaces, validates the required GELLO USB aliases, starts the GELLO
+publisher and matching FR3 controller, and optionally starts gripper control.
 
-### 1. Start the GELLO publisher
-
-Dual-arm example:
-
-```bash
-ros2 launch franka_gello_state_publisher main.launch.py config_file:=example_duo.yaml
-```
-
-Single left arm example:
+Dual-arm teleoperation with gripper control:
 
 ```bash
-ros2 launch franka_gello_state_publisher main.launch.py config_file:=example_single.yaml
+cd ~/real-exp
+./scripts/start_teleoperation.sh --duo --gripper
 ```
 
-### 2. Start teleoperation on the robot side
-
-Dual FR3 setup:
+Dual-arm teleoperation without gripper control:
 
 ```bash
-ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py robot_config_file:=example_fr3_duo_config.yaml
+cd ~/real-exp
+./scripts/start_teleoperation.sh --duo --no-gripper
 ```
 
-Single left FR3 setup:
+Single left-arm teleoperation with gripper control:
 
 ```bash
-ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py robot_config_file:=example_fr3_config.yaml
+cd ~/real-exp
+./scripts/start_teleoperation.sh --single --gripper
 ```
 
-### 3. Start gripper control
-Dual arm setup:
+Single left-arm teleoperation without gripper control:
+
 ```bash
-ros2 launch franka_gripper_manager franka_gripper_client.launch.py config_file:=example_fr3_duo_config_franka_hand.yaml
+cd ~/real-exp
+./scripts/start_teleoperation.sh --single --no-gripper
 ```
 
-Single left arm setup:
+The argument order is interchangeable. Run the following command for the full
+usage summary:
+
 ```bash
-ros2 launch franka_gripper_manager franka_gripper_client.launch.py config_file:=example_fr3_config_franka_hand.yaml
+./scripts/start_teleoperation.sh --help
 ```
+
+Press `Ctrl-C` once to stop the complete teleoperation stack. If any managed ROS
+launch process fails, the script stops the remaining processes and returns the
+failing process's status. With `--gripper`, the script waits until every selected
+arm controller publishes a commanded joint-state message before launching the
+Franka-hand manager.
 
 ### Configuration Notes
 
 - GELLO publisher configs live in `gello_software/ros2/src/franka_gello_state_publisher/config/`.
 - FR3 controller configs live in `gello_software/ros2/src/franka_fr3_arm_controllers/config/`.
+- `--duo` selects `example_duo.yaml` and `example_fr3_duo_config.yaml`.
+- `--single` selects `example_single.yaml` and `example_fr3_config.yaml`.
+- `--gripper` selects the matching `example_fr3*_config_franka_hand.yaml` file.
 - `example_duo.yaml` defines the left and right GELLO devices for bimanual control.
 - `example_fr3_duo_config.yaml` defines the corresponding left and right FR3 robot IPs and namespaces.
 - If you are switching between single-arm and dual-arm setups, make sure the publisher and controller configs match.
 
 ## Data Collection
 
-The recording path is split into two pieces:
+The recording path has three components:
 
 - A ROS 2 camera publisher in `gello_software/ros2/src/franka_realsense_camera_publisher/` that publishes RGB images from up to three RealSense cameras.
 - A ROS 2 bridge node in `gello_software/ros2/src/franka_lerobot_data_bridge/` that subscribes to robot, teleop, gripper, and camera topics and publishes synchronized samples over ZMQ.
@@ -209,7 +221,7 @@ The dataset currently records:
 
 - `observation.state`: actual robot joint positions, plus gripper width if enabled
 - `action`: absolute arm joint targets for the next sample, plus gripper command if enabled
-- `observation.images.cam_left`, `observation.images.cam_front`, `observation.images.cam_right`: RGB video streams
+- `observation.images.<camera_name>`: enabled RGB video streams (`cam_left`, `cam_front`, and `cam_right` for duo; `cam_left` and `cam_front` for single-arm collection)
 
 The bridge expects:
 
@@ -217,7 +229,7 @@ The bridge expects:
 - Arm-controller target joint states on a topic like `/left/franka/commanded_joint_states`
 - Robot gripper joint states on a topic like `/left/franka_gripper/joint_states`
 - Gripper commands on a topic like `/left/gripper/gripper_client/target_gripper_width_percent`
-- RGB image topics for three cameras
+- RGB image topics for each camera enabled by the selected bridge configuration
 
 By default the bridge publishes current measured robot joint states as `observation.state` and uses the arm-controller target topic (`/left|right/franka/commanded_joint_states`) as the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
 
@@ -227,23 +239,33 @@ between `0` and `1` and clamps only out-of-range gripper values at serialization
 This normalized command is distinct from the physical gripper widths used by
 `reset_pylibfranka.py`.
 
-Launch the camera publisher from the ROS 2 workspace:
+Run the data-collection support stack from the repository root. This starts the
+teleoperation supervisor, RealSense camera publisher, and LeRobot data bridge:
 
 ```bash
-ros2 launch franka_realsense_camera_publisher cameras.launch.py
+cd ~/real-exp
+./scripts/start_data_collection.sh --duo --gripper
 ```
 
-Launch the bridge from the ROS 2 workspace:
+The script supports the same four arm/gripper combinations as the teleoperation
+script:
 
 ```bash
-ros2 launch franka_lerobot_data_bridge bridge.launch.py
+./scripts/start_data_collection.sh --duo --gripper
+./scripts/start_data_collection.sh --duo --no-gripper
+./scripts/start_data_collection.sh --single --gripper
+./scripts/start_data_collection.sh --single --no-gripper
 ```
 
-The bridge defaults to the bimanual config. To use single-arm recording (this will only use two cameras):
+In duo mode, the bridge uses its default `example_duo.yaml` configuration and
+records `cam_left`, `cam_front`, and `cam_right`. In single mode, it uses
+`example_single.yaml`; that bridge configuration records only `cam_left` and
+`cam_front`, even though the standard camera publisher may publish all three
+configured streams.
 
-```bash
-ros2 launch franka_lerobot_data_bridge bridge.launch.py config_file:=example_single.yaml
-```
+Press `Ctrl-C` once to stop teleoperation, the camera publisher, and the bridge.
+If any component fails, the supervisor stops the complete support stack and
+returns the failing component's status.
 
 Then run the LeRobot recorder from the repo root:
 

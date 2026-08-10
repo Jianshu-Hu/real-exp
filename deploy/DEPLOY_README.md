@@ -63,7 +63,7 @@ For the default Franka duo setup, start the robot and gripper bringup before sta
 Run this on the machine that has the checkpoint and the `lerobot` environment:
 
 ```bash
-python train/deploy_lerobot_policy.py \
+python deploy/deploy_lerobot_policy.py \
   inspect \
   --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model
 ```
@@ -140,7 +140,7 @@ In standby it can publish hold commands to the ROS 2 controller topics, but it d
 Run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train/deploy_lerobot_policy.py \
+CUDA_VISIBLE_DEVICES=0 python deploy/deploy_lerobot_policy.py \
   server \
   --host 0.0.0.0 \
   --port 8080 \
@@ -186,7 +186,7 @@ This lets the existing ROS 2 consumers be reused during deployment.
 Run this on the robot machine:
 
 ```bash
-python train/franka_act_policy_executor.py \
+python deploy/franka_act_policy_executor.py \
   --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
   --server-address 192.168.50.6:8080 \
   --zmq-host 127.0.0.1 \
@@ -212,7 +212,7 @@ This ACT-specific flag sets the weight of the already-queued action when the exe
 For diffusion deployment, use the diffusion-specific knobs instead:
 
 ```bash
-python train/franka_diffusion_policy_executor.py \
+python deploy/franka_diffusion_policy_executor.py \
   --policy-path outputs/pick_and_place_test_diffusion/checkpoints/last/pretrained_model \
   --actions-per-chunk 8 \
   --server-address 192.168.50.6:8080 \
@@ -232,7 +232,7 @@ If the checkpoint exists only on the policy server machine and not on the robot 
 Example:
 
 ```bash
-python train/franka_diffusion_policy_executor.py \
+python deploy/franka_diffusion_policy_executor.py \
   --policy-path /home/pair/real-exp/outputs/policy-dir \
   --actions-per-chunk 8 \
   --policy-device cuda:0 \
@@ -270,7 +270,7 @@ If the executor raises an `action_dim` mismatch, fix the ROS 2 bridge configurat
 Once dry-run is stable, restart the executor for live execution:
 
 ```bash
-python train/franka_act_policy_executor.py \
+python deploy/franka_act_policy_executor.py \
   --policy-path outputs/pick_and_place_test_act/checkpoints/last/pretrained_model \
   --server-address 192.168.50.6:8080 \
   --zmq-host 127.0.0.1 \
@@ -352,7 +352,7 @@ Useful executor options:
   - start the server with `CUDA_VISIBLE_DEVICES=0` and use `--policy-device cuda:0`
 - `stack expects a non-empty TensorList` on the server:
   - the policy did not receive a valid stacked image batch
-  - confirm the live bridge publishes all cameras from the training contract and restart `python train/deploy_lerobot_policy.py server ...`
+  - confirm the live bridge publishes all cameras from the training contract and restart `python deploy/deploy_lerobot_policy.py server ...`
 - `Action receiver RPC error: Channel closed!` on the robot machine:
   - the server usually crashed while handling inference
   - check the server log first and fix the upstream error there

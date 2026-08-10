@@ -6,6 +6,7 @@ This repository groups the code and notes used for real-world Franka FR3 experim
 
 - `data_collection/`: scripts and documentation for recording, replaying, and editing local LeRobot datasets.
 - `train/`: training-related notes and experiment-specific training assets.
+- `deploy/`: policy inspection, serving, fetching, and real-robot execution tools.
 - `utils/`: shared dataset-statistics and image-preprocessing helpers.
 - `lerobot/`: vendored LeRobot codebase used by the local collection and training workflow.
 - `gello_software/`: GELLO and ROS 2 integration code, tracked as a git submodule.
@@ -45,10 +46,10 @@ python3 data_collection/replay_lerobot_episode.py --help
 ```
 
 The detailed data collection and replay instructions now live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md).
-Training and deployment instructions live in [train/TRAIN_README.md](train/TRAIN_README.md) and [train/DEPLOY_README.md](train/DEPLOY_README.md).
+Training and deployment instructions live in [train/TRAIN_README.md](train/TRAIN_README.md) and [deploy/DEPLOY_README.md](deploy/DEPLOY_README.md).
 
 ## Notes
 
 - Do not change the GELLO USB connections. If the topology changes, reinstall or update the USB rules and verify both aliases before launching ROS 2 nodes.
-- Start the arm controllers in the correct mode for the task. Collection and episode replay use the normal collection controller; live policy execution uses `deployment_mode:=true` as described in [train/DEPLOY_README.md](train/DEPLOY_README.md).
+- Start the arm controllers in the correct mode for the task. Collection and episode replay use the normal collection controller; live policy execution uses `deployment_mode:=true` as described in [deploy/DEPLOY_README.md](deploy/DEPLOY_README.md).
 - Check the GELLO offsets whenever the teleoperator joints do not align with the robot or after a hardware reset. Recompute the offsets with the procedure in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md) before collecting data.

@@ -3,11 +3,10 @@
 This directory contains the repo-local training entrypoint for imitation learning with LeRobot:
 
 - `train/train_lerobot_policy.py`
-- `train/deploy_lerobot_policy.py`
-- `train/franka_act_policy_executor.py`
-- `train/franka_diffusion_policy_executor.py`
 - `train/push_lerobot_policy.py`
-- `train/fetch_lerobot_policy.py`
+
+Policy inspection, fetching, serving, and robot-side execution are documented in
+[`deploy/DEPLOY_README.md`](../deploy/DEPLOY_README.md).
 
 ## Environment
 
@@ -199,14 +198,14 @@ python train/push_lerobot_policy.py \
 Fetch a policy from Hugging Face:
 
 ```bash
-python train/fetch_lerobot_policy.py \
+python deploy/fetch_lerobot_policy.py \
   --repo-id Jianshu1/pick_and_place_test_act
 ```
 
 By default:
 
 - `push_lerobot_policy.py` pushes to remote branch `main`
-- `fetch_lerobot_policy.py` fetches from remote branch `main`
-- `fetch_lerobot_policy.py` replaces `outputs/fetched_policies/<repo-name>` so the local copy matches the remote policy
+- `deploy/fetch_lerobot_policy.py` fetches from remote branch `main`
+- `deploy/fetch_lerobot_policy.py` replaces `outputs/fetched_policies/<repo-name>` so the local copy matches the remote policy
 
 Use `--branch`, `--revision`, or `--no-clean` only when you intentionally want non-default behavior.

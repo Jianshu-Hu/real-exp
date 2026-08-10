@@ -1,3 +1,10 @@
+"""Inspect trained policies or serve them for remote robot-side execution.
+
+Usage:
+    python deploy/deploy_lerobot_policy.py inspect --policy-path outputs/my_policy
+    python deploy/deploy_lerobot_policy.py server --host 0.0.0.0 --port 8080
+"""
+
 from __future__ import annotations
 
 import argparse

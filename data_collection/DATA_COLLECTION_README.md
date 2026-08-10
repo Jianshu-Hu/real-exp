@@ -22,6 +22,15 @@ Environment split used in this repo:
 
 ## Before launching
 
+Install the GELLO USB aliases once on the robot-control host:
+
+```bash
+sudo ./scripts/setup_usb_rules.sh
+```
+
+The aliases depend on the host USB topology. Verify `/dev/ttyUSB_left` and
+`/dev/ttyUSB_right` before launching the ROS 2 nodes after reconnecting devices.
+
 - Test offset if the gello connection is unplugged.
 ```bash
 source /opt/ros/humble/setup.sh

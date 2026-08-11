@@ -4,8 +4,9 @@ Usage:
     python data_collection/replay_lerobot_episode.py \\
         --dataset-root data/my_dataset --episode 0 --dry-run
 
-The tool publishes the same arm and gripper command topics used during data
-collection. Running without ``--dry-run`` commands real hardware.
+The tool first moves both arms to the first selected ``observation.state``, then
+publishes the same arm and gripper command topics used during data collection.
+Running without ``--dry-run`` commands real hardware.
 """
 
 from __future__ import annotations
@@ -28,6 +29,15 @@ TRACE_FILENAME = "trace.csv"
 SUMMARY_FILENAME = "summary.json"
 RUN_CONFIG_FILENAME = "run_config.json"
 JOINT_NAMES = [f"fr3_joint{index}" for index in range(1, 8)]
+DEFAULT_INITIAL_STATE_POSITION_TOLERANCE_RAD = 0.06
+INITIAL_STATE_VELOCITY_TOLERANCE_RAD_PER_S = 0.05
+INITIAL_STATE_PUBLISH_PERIOD_S = 0.02
+INITIAL_STATE_STABLE_SAMPLES = 5
+INITIAL_STATE_PRIME_DURATION_S = 0.5
+DEFAULT_INITIAL_STATE_TIMEOUT_S = 120.0
+DEFAULT_INITIAL_STATE_MAX_VELOCITY_RAD_PER_S = 0.10
+DEFAULT_INITIAL_STATE_MAX_ACCELERATION_RAD_PER_S2 = 0.20
+INITIAL_STATE_TRACKING_GAIN_PER_S = 1.5
 
 
 @dataclass
@@ -59,6 +69,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-frame", type=int, default=0, help="Inclusive dataset frame_index to start from.")
     parser.add_argument("--end-frame", type=int, default=None, help="Exclusive dataset frame_index to stop at.")
     parser.add_argument("--max-frames", type=int, default=None, help="Maximum number of selected frames to replay.")
+    parser.add_argument(
+        "--initial-state-timeout",
+        type=float,
+        default=DEFAULT_INITIAL_STATE_TIMEOUT_S,
+        help=(
+            "Maximum seconds to wait for both arms to reach the first selected observation.state "
+            f"before replaying actions. Defaults to {DEFAULT_INITIAL_STATE_TIMEOUT_S:g}."
+        ),
+    )
+    parser.add_argument(
+        "--initial-state-max-velocity",
+        type=float,
+        default=DEFAULT_INITIAL_STATE_MAX_VELOCITY_RAD_PER_S,
+        help=(
+            "Maximum commanded joint velocity while moving to the initial state in rad/s. "
+            f"Defaults to {DEFAULT_INITIAL_STATE_MAX_VELOCITY_RAD_PER_S:g}."
+        ),
+    )
+    parser.add_argument(
+        "--initial-state-max-acceleration",
+        type=float,
+        default=DEFAULT_INITIAL_STATE_MAX_ACCELERATION_RAD_PER_S2,
+        help=(
+            "Maximum commanded joint acceleration while moving to the initial state in rad/s^2. "
+            f"Defaults to {DEFAULT_INITIAL_STATE_MAX_ACCELERATION_RAD_PER_S2:g}."
+        ),
+    )
+    parser.add_argument(
+        "--initial-state-position-tolerance",
+        type=float,
+        default=DEFAULT_INITIAL_STATE_POSITION_TOLERANCE_RAD,
+        help=(
+            "Maximum per-joint position error accepted for the initial-state gate in rad. "
+            f"Defaults to {DEFAULT_INITIAL_STATE_POSITION_TOLERANCE_RAD:g}."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Load and summarize targets without publishing.")
     parser.add_argument("--no-gripper", action="store_true", help="Skip gripper command publishing and trace targets.")
     parser.add_argument(
@@ -204,7 +250,15 @@ def continuous_gripper_targets(values: np.ndarray) -> np.ndarray:
     return np.clip(values, 0.0, 1.0)
 
 
-def print_dry_run_summary(data: EpisodeData, fps: float, no_gripper: bool) -> None:
+def print_dry_run_summary(
+    data: EpisodeData,
+    fps: float,
+    no_gripper: bool,
+    initial_state_timeout: float,
+    initial_state_max_velocity: float,
+    initial_state_max_acceleration: float,
+    initial_state_position_tolerance: float,
+) -> None:
     targets = split_targets(data)
     print("Controller-matched replay dry run")
     print("----------------------------------")
@@ -212,6 +266,13 @@ def print_dry_run_summary(data: EpisodeData, fps: float, no_gripper: bool) -> No
     print(f"frame range: {int(data.frame_indices[0])}..{int(data.frame_indices[-1])}")
     print(f"dataset fps: {data.fps:g}")
     print(f"replay fps: {fps:g}")
+    print(f"initial state source: observation.state at frame {int(data.frame_indices[0])}")
+    print(f"left arm initial q: {data.states[0, 0:7].round(6).tolist()}")
+    print(f"right arm initial q: {data.states[0, 8:15].round(6).tolist()}")
+    print(f"initial move timeout: {initial_state_timeout:g} s")
+    print(f"initial move max joint velocity: {initial_state_max_velocity:g} rad/s")
+    print(f"initial move max joint acceleration: {initial_state_max_acceleration:g} rad/s^2")
+    print(f"initial-state position tolerance: {initial_state_position_tolerance:g} rad")
     print("target source: action")
     print(f"arm action config: {data.action_config.get('arm_action_representation')} / {data.action_config.get('arm_action_definition')}")
     for arm_name in ("left_arm", "right_arm"):
@@ -257,9 +318,10 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
-def import_ros_dependencies() -> tuple[Any, Any, Any, Any]:
+def import_ros_dependencies() -> tuple[Any, Any, Any, Any, Any]:
     try:
         import rclpy
+        from rclpy.executors import ExternalShutdownException
         from rclpy.node import Node
         from sensor_msgs.msg import JointState
         from std_msgs.msg import Float32
@@ -268,7 +330,7 @@ def import_ros_dependencies() -> tuple[Any, Any, Any, Any]:
             "ROS 2 Python dependencies are required for LeRobot episode replay. "
             "Run this script in the robot_control Docker/devcontainer environment."
         ) from exc
-    return rclpy, Node, JointState, Float32
+    return rclpy, ExternalShutdownException, Node, JointState, Float32
 
 
 def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
@@ -285,6 +347,8 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
             self.right_gripper_publisher = self.create_publisher(Float32, args.right_gripper_topic, 10)
             self.left_actual_q: np.ndarray | None = None
             self.right_actual_q: np.ndarray | None = None
+            self.left_actual_dq: np.ndarray | None = None
+            self.right_actual_dq: np.ndarray | None = None
             self.left_gripper_actual: float | None = None
             self.right_gripper_actual: float | None = None
             self.create_subscription(
@@ -312,27 +376,31 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
                 10,
             )
 
-        def _ordered_arm_values(self, msg: Any) -> np.ndarray | None:
-            if len(msg.position) < 7:
+        def _ordered_arm_values(self, msg: Any, field_name: str) -> np.ndarray | None:
+            raw_values = getattr(msg, field_name, [])
+            if len(raw_values) < 7:
                 return None
             if len(msg.name) >= 7:
                 values: list[float | None] = [None] * 7
-                for name, position in zip(msg.name, msg.position, strict=False):
+                for name, value in zip(msg.name, raw_values, strict=False):
                     for joint_index in range(1, 8):
                         if name.endswith(f"joint{joint_index}"):
-                            values[joint_index - 1] = float(position)
+                            values[joint_index - 1] = float(value)
                 if all(value is not None for value in values):
                     return np.asarray([float(value) for value in values], dtype=float)
-            return np.asarray(msg.position[:7], dtype=float)
+            return np.asarray(raw_values[:7], dtype=float)
 
         def _store_arm_state(self, arm_name: str, msg: Any) -> None:
-            values = self._ordered_arm_values(msg)
-            if values is None:
+            q = self._ordered_arm_values(msg, "position")
+            if q is None:
                 return
+            dq = self._ordered_arm_values(msg, "velocity")
             if arm_name == "left":
-                self.left_actual_q = values
+                self.left_actual_q = q
+                self.left_actual_dq = dq
             else:
-                self.right_actual_q = values
+                self.right_actual_q = q
+                self.right_actual_dq = dq
 
         def _store_gripper_state(self, arm_name: str, msg: Any) -> None:
             if not msg.position:
@@ -449,10 +517,21 @@ def wait_for_start(
     no_gripper: bool,
     allow_missing_state: bool,
 ) -> bool:
-    print("Waiting for ROS state samples. Type `s` + Enter to start, or `q` + Enter to abort.")
+    print(
+        "Waiting for ROS state samples. Type `s` + Enter to move to the initial state "
+        "and replay, or `q` + Enter to abort."
+    )
     last_missing: tuple[str, ...] | None = None
+    left_hold_q: np.ndarray | None = None
+    right_hold_q: np.ndarray | None = None
     while rclpy.ok():
         rclpy.spin_once(node, timeout_sec=0.05)
+        if left_hold_q is None and node.left_actual_q is not None and node.right_actual_q is not None:
+            left_hold_q = np.asarray(node.left_actual_q, dtype=float).copy()
+            right_hold_q = np.asarray(node.right_actual_q, dtype=float).copy()
+            print("Priming arm controllers with the measured current pose.")
+        if left_hold_q is not None and right_hold_q is not None:
+            node.publish_targets(left_hold_q, right_hold_q, None, None)
         missing = tuple(node.missing_state_topics(no_gripper))
         if missing != last_missing:
             if missing:
@@ -495,8 +574,186 @@ def sleep_with_spin_and_abort(
     return True
 
 
+def arm_reached_initial_state(
+    actual_q: np.ndarray | None,
+    actual_dq: np.ndarray | None,
+    target_q: np.ndarray,
+    position_tolerance_rad: float = DEFAULT_INITIAL_STATE_POSITION_TOLERANCE_RAD,
+) -> bool:
+    if actual_q is None:
+        return False
+    position_error = float(np.max(np.abs(np.asarray(actual_q, dtype=float) - target_q)))
+    if position_error > position_tolerance_rad:
+        return False
+    if actual_dq is None:
+        return True
+    joint_speed = float(np.max(np.abs(np.asarray(actual_dq, dtype=float))))
+    return joint_speed <= INITIAL_STATE_VELOCITY_TOLERANCE_RAD_PER_S
+
+
+def ramp_initial_state_command(
+    commanded_q: np.ndarray,
+    commanded_velocity: np.ndarray,
+    target_q: np.ndarray,
+    dt: float,
+    max_velocity: float,
+    max_acceleration: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    dt = min(max(float(dt), 1e-6), 2.0 * INITIAL_STATE_PUBLISH_PERIOD_S)
+    position_error = target_q - commanded_q
+    target_velocity = np.clip(
+        INITIAL_STATE_TRACKING_GAIN_PER_S * position_error,
+        -max_velocity,
+        max_velocity,
+    )
+    velocity_delta = np.clip(
+        target_velocity - commanded_velocity,
+        -max_acceleration * dt,
+        max_acceleration * dt,
+    )
+    next_velocity = np.clip(commanded_velocity + velocity_delta, -max_velocity, max_velocity)
+    position_step = next_velocity * dt
+    position_step = np.where(
+        np.abs(position_step) > np.abs(position_error),
+        position_error,
+        position_step,
+    )
+    next_q = commanded_q + position_step
+    next_velocity = np.where(position_step == position_error, 0.0, next_velocity)
+    return next_q, next_velocity
+
+
+def move_arms_to_initial_state(
+    rclpy: Any,
+    node: Any,
+    commands: Queue[str],
+    data: EpisodeData,
+    timeout_s: float,
+    max_velocity: float,
+    max_acceleration: float,
+    position_tolerance_rad: float = DEFAULT_INITIAL_STATE_POSITION_TOLERANCE_RAD,
+    prime_duration_s: float = INITIAL_STATE_PRIME_DURATION_S,
+) -> bool:
+    """Command and verify the first selected observation before replay starts."""
+    left_target = np.asarray(data.states[0, 0:7], dtype=float)
+    right_target = np.asarray(data.states[0, 8:15], dtype=float)
+    if not np.all(np.isfinite(left_target)) or not np.all(np.isfinite(right_target)):
+        raise ValueError("Episode initial arm state must contain only finite values.")
+    if consume_commands(commands) == "q":
+        return False
+    if node.left_actual_q is None or node.right_actual_q is None:
+        raise RuntimeError("Actual state from both arms is required for a velocity-limited initial move.")
+
+    left_command = np.asarray(node.left_actual_q, dtype=float).copy()
+    right_command = np.asarray(node.right_actual_q, dtype=float).copy()
+    left_commanded_velocity = np.zeros(7, dtype=float)
+    right_commanded_velocity = np.zeros(7, dtype=float)
+    frame_index = int(data.frame_indices[0])
+    start_time = time.perf_counter()
+    deadline_s = start_time + timeout_s
+    next_status_time = start_time
+    stable_samples = 0
+
+    print(
+        f"Moving both arms to observation.state at frame {frame_index} before replay "
+        f"(max velocity={max_velocity:g} rad/s, max acceleration={max_acceleration:g} rad/s^2). "
+        f"Position tolerance={position_tolerance_rad:g} rad. "
+        "Type `q` + Enter to abort."
+    )
+
+    prime_deadline_s = min(start_time + prime_duration_s, deadline_s)
+    next_publish_time = start_time
+    while rclpy.ok() and time.perf_counter() < prime_deadline_s:
+        node.publish_targets(left_command, right_command, None, None)
+        next_publish_time += INITIAL_STATE_PUBLISH_PERIOD_S
+        if sleep_with_spin_and_abort(rclpy, node, commands, next_publish_time):
+            return False
+
+    last_command_time = time.perf_counter()
+    next_publish_time = last_command_time
+    while rclpy.ok():
+        if consume_commands(commands) == "q":
+            return False
+
+        now = time.perf_counter()
+        dt = now - last_command_time
+        left_command, left_commanded_velocity = ramp_initial_state_command(
+            left_command,
+            left_commanded_velocity,
+            left_target,
+            dt,
+            max_velocity,
+            max_acceleration,
+        )
+        right_command, right_commanded_velocity = ramp_initial_state_command(
+            right_command,
+            right_commanded_velocity,
+            right_target,
+            dt,
+            max_velocity,
+            max_acceleration,
+        )
+        node.publish_targets(left_command, right_command, None, None)
+        last_command_time = now
+        next_publish_time += INITIAL_STATE_PUBLISH_PERIOD_S
+        if sleep_with_spin_and_abort(rclpy, node, commands, next_publish_time):
+            return False
+
+        left_reached = arm_reached_initial_state(
+            node.left_actual_q,
+            node.left_actual_dq,
+            left_target,
+            position_tolerance_rad,
+        )
+        right_reached = arm_reached_initial_state(
+            node.right_actual_q,
+            node.right_actual_dq,
+            right_target,
+            position_tolerance_rad,
+        )
+        if left_reached and right_reached:
+            stable_samples += 1
+            if stable_samples >= INITIAL_STATE_STABLE_SAMPLES:
+                print("Both arms reached the episode initial state. Starting action replay.")
+                return True
+        else:
+            stable_samples = 0
+
+        now = time.perf_counter()
+        if now >= deadline_s:
+            left_error = (
+                None
+                if node.left_actual_q is None
+                else float(np.max(np.abs(left_target - np.asarray(node.left_actual_q, dtype=float))))
+            )
+            right_error = (
+                None
+                if node.right_actual_q is None
+                else float(np.max(np.abs(right_target - np.asarray(node.right_actual_q, dtype=float))))
+            )
+            raise TimeoutError(
+                f"Arms did not reach the episode initial state within {timeout_s:g}s "
+                f"(left max error={left_error}, right max error={right_error})."
+            )
+        if now >= next_status_time:
+            left_error = (
+                "unavailable"
+                if node.left_actual_q is None
+                else f"{np.max(np.abs(left_target - np.asarray(node.left_actual_q, dtype=float))):.4f} rad"
+            )
+            right_error = (
+                "unavailable"
+                if node.right_actual_q is None
+                else f"{np.max(np.abs(right_target - np.asarray(node.right_actual_q, dtype=float))):.4f} rad"
+            )
+            print(f"Initial-state max joint error: left={left_error}, right={right_error}")
+            next_status_time = now + 1.0
+
+    return False
+
+
 def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
-    rclpy, Node, JointState, Float32 = import_ros_dependencies()
+    rclpy, ExternalShutdownException, Node, JointState, Float32 = import_ros_dependencies()
     ReplayNode = build_replay_node_class(Node, JointState, Float32)
 
     targets = split_targets(data)
@@ -514,6 +771,11 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
             "start_frame": args.start_frame,
             "end_frame": args.end_frame,
             "max_frames": args.max_frames,
+            "initial_state_frame": int(data.frame_indices[0]),
+            "initial_state_timeout_s": args.initial_state_timeout,
+            "initial_state_max_velocity_rad_per_s": args.initial_state_max_velocity,
+            "initial_state_max_acceleration_rad_per_s2": args.initial_state_max_acceleration,
+            "initial_state_position_tolerance_rad": args.initial_state_position_tolerance,
             "no_gripper": args.no_gripper,
             "allow_missing_state": args.allow_missing_state,
             "trace_file": TRACE_FILENAME,
@@ -529,6 +791,8 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
     aborted = False
     published_frames = 0
     last_controller_ready = False
+    initial_state_reached = False
+    initial_state_duration_s = 0.0
     start_time = 0.0
     try:
         if not wait_for_start(
@@ -540,6 +804,23 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
         ):
             aborted = True
             return
+
+        initial_state_start_time = time.perf_counter()
+        if not move_arms_to_initial_state(
+            rclpy,
+            node,
+            commands,
+            data,
+            args.initial_state_timeout,
+            args.initial_state_max_velocity,
+            args.initial_state_max_acceleration,
+            args.initial_state_position_tolerance,
+        ):
+            aborted = True
+            print("Abort requested while moving to the episode initial state.")
+            return
+        initial_state_duration_s = time.perf_counter() - initial_state_start_time
+        initial_state_reached = True
 
         print("Starting LeRobot episode replay. Type `q` + Enter to abort.")
         start_time = time.perf_counter()
@@ -594,6 +875,9 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
     except KeyboardInterrupt:
         aborted = True
         print("Abort requested by KeyboardInterrupt.")
+    except ExternalShutdownException:
+        aborted = True
+        print("ROS shut down while replay was running; stopping replay.")
     finally:
         write_json(
             args.output / SUMMARY_FILENAME,
@@ -602,13 +886,16 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
                 "completed": bool((not aborted) and published_frames == len(data.frame_indices)),
                 "published_frames": published_frames,
                 "selected_frames": int(len(data.frame_indices)),
+                "initial_state_reached": initial_state_reached,
+                "initial_state_duration_s": initial_state_duration_s,
                 "controller_ready_at_last_frame": bool(last_controller_ready),
                 "duration_s": float(time.perf_counter() - start_time) if start_time else 0.0,
                 "trace_path": str(trace_path),
             },
         )
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def main() -> None:
@@ -618,9 +905,37 @@ def main() -> None:
     fps = float(args.fps if args.fps is not None else data.fps)
     if not np.isfinite(fps) or fps <= 0:
         raise ValueError(f"Replay FPS must be a finite positive number, got {fps!r}.")
+    if not np.isfinite(args.initial_state_timeout) or args.initial_state_timeout <= 0:
+        raise ValueError(
+            "Initial-state timeout must be a finite positive number, "
+            f"got {args.initial_state_timeout!r}."
+        )
+    if not np.isfinite(args.initial_state_max_velocity) or args.initial_state_max_velocity <= 0:
+        raise ValueError(
+            "Initial-state maximum velocity must be a finite positive number, "
+            f"got {args.initial_state_max_velocity!r}."
+        )
+    if not np.isfinite(args.initial_state_max_acceleration) or args.initial_state_max_acceleration <= 0:
+        raise ValueError(
+            "Initial-state maximum acceleration must be a finite positive number, "
+            f"got {args.initial_state_max_acceleration!r}."
+        )
+    if not np.isfinite(args.initial_state_position_tolerance) or args.initial_state_position_tolerance <= 0:
+        raise ValueError(
+            "Initial-state position tolerance must be a finite positive number, "
+            f"got {args.initial_state_position_tolerance!r}."
+        )
 
     if args.dry_run:
-        print_dry_run_summary(data, fps, args.no_gripper)
+        print_dry_run_summary(
+            data,
+            fps,
+            args.no_gripper,
+            args.initial_state_timeout,
+            args.initial_state_max_velocity,
+            args.initial_state_max_acceleration,
+            args.initial_state_position_tolerance,
+        )
         return
 
     run_replay(args, data, fps)

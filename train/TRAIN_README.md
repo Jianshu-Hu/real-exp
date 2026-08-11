@@ -44,24 +44,6 @@ local/pick_and_place_test
 
 You can override both with CLI flags if needed.
 
-Before training, validate the selected dataset from the repository root:
-
-```bash
-python data_collection/process_dataset.py validate \
-  --dataset-root data/pick_and_place_test
-```
-
-If recordings contain an initial stationary period, inspect automatic trimming
-before creating a cleaned sibling dataset:
-
-```bash
-python data_collection/process_dataset.py trim-initial \
-  --dataset-root data/pick_and_place_test \
-  --motion-threshold 0.002 \
-  --min-static-frames 5 \
-  --dry-run
-```
-
 The training entry point requires `meta/real_exp_action_config.json` with
 `arm_action_representation=absolute_joint_position`. Current collection also
 uses `gripper_action_representation=absolute_width`, which preserves continuous

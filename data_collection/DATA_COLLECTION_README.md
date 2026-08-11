@@ -6,7 +6,8 @@
 - `replay_lerobot_episode.py`: Replay a recorded LeRobot episode through the same ROS 2 arm and gripper controller topics used during collection.
 - `reset_pylibfranka.py`: Reset both Franka arms to a selected dataset `observation.state` frame or a measured hardware-specific fallback pose.
 - `delete_lerobot_episode.py`: Remove one or more episodes from a local LeRobot dataset while preserving the remaining metadata, videos, and parquet data.
-- `process_dataset.py`: Validate and process local LeRobot datasets, including automatic initial-static-segment trimming.
+- `process_dataset.py`: Process local LeRobot datasets, including automatic initial-static-segment trimming.
+- `validate_dataset.py`: Validate local LeRobot dataset metadata, parquet data, semantics, and videos.
 
 Quick links:
 
@@ -135,6 +136,16 @@ bash scripts/replay.sh \
   --dataset-root data/test-pick-and-place-new \
   --episode 0
 ```
+
+After you enter `s`, replay first commands both arms to the first selected
+`observation.state` and waits for them to settle. The replay clock and recorded
+action sequence start only after both arms are within the required position and
+velocity tolerances. The initial move is ramped from the measured pose with
+`0.10 rad/s` velocity and `0.20 rad/s^2` acceleration limits by default. Use
+`--initial-state-max-velocity`, `--initial-state-max-acceleration`, and
+`--initial-state-timeout` to tune the move. The default initial-state position
+acceptance tolerance is `0.06 rad` per joint; override it with
+`--initial-state-position-tolerance` if needed.
 
 The supervisor forwards replay options such as `--fps`, `--start-frame`,
 `--end-frame`, `--max-frames`, `--output`, and `--dry-run`. Use `--no-gripper`
@@ -287,44 +298,8 @@ python data_collection/lerobot_collection.py
 
 ## Dataset Validation
 
-After recording or editing a dataset, validate that the metadata, parquet data, and videos still agree.
-
-Run the default validation:
-
-```bash
-python3 data_collection/process_dataset.py validate \
-  --dataset-root data/pick_and_place_test
-```
-
-Print one row per episode:
-
-```bash
-python3 data_collection/process_dataset.py validate \
-  --dataset-root data/pick_and_place_test \
-  --verbose
-```
-
-The validator checks:
-
-- `meta/info.json` totals against actual episode metadata and data rows
-- continuous episode indices and global frame indices
-- per-episode `length` against state/action row counts
-- per-episode `frame_index` and timestamp continuity
-- `observation.state` and `action` dimensions against `info.json`
-- video timestamp ranges against episode lengths
-- physical MP4 frame counts when OpenCV is available
-
-If OpenCV is not available in the active Python environment, either install it or skip physical video checks:
-
-```bash
-python3 data_collection/process_dataset.py validate \
-  --dataset-root data/pick_and_place_test \
-  --skip-video-frames
-```
-
-### Trim Initial Static Segments
-
-Automatically detect and remove the initial static arm segment from every episode:
+After recording a dataset, process it before validation. First preview the initial
+static-segment trimming plan:
 
 ```bash
 python3 data_collection/process_dataset.py trim-initial \
@@ -334,12 +309,64 @@ python3 data_collection/process_dataset.py trim-initial \
   --dry-run
 ```
 
+Review the proposed trim counts, then remove `--dry-run` to create the processed
+dataset:
+
+```bash
+python3 data_collection/process_dataset.py trim-initial \
+  --dataset-root data/pick_and_place_test \
+  --motion-threshold 0.002 \
+  --min-static-frames 5
+```
+
 Detection uses the 14 arm joints in `observation.state` and ignores gripper
 motion. It stops at the first frame whose maximum arm-joint displacement exceeds
-the threshold and keeps that first moving frame. Remove `--dry-run` to create a
-sibling dataset named `<dataset>_trimmed`. Use `--episode-indices 0,1,4-8` to
-process selected episodes. In-place replacement is available only with the
-explicit `--in-place` option and keeps the original dataset as a backup.
+the threshold and keeps that first moving frame. Use `--episode-indices 0,1,4-8`
+to process selected episodes. Processing renames the original dataset to
+`<dataset>_backup` and writes the processed dataset at the original path. The
+command stops without changing either directory if that backup already exists.
+The processed dataset's `meta/info.json` contains `"processed": true`.
+
+After processing, validate that the processed metadata, parquet data, and videos
+still agree.
+
+Run the default validation:
+
+```bash
+python3 data_collection/validate_dataset.py \
+  --dataset-root data/pick_and_place_test
+```
+
+Print one row per episode:
+
+```bash
+python3 data_collection/validate_dataset.py \
+  --dataset-root data/pick_and_place_test \
+  --verbose
+```
+
+The validator checks:
+
+- whether `meta/info.json` marks the dataset as processed
+- `meta/info.json` totals against actual episode metadata and data rows
+- continuous episode indices and global frame indices
+- per-episode `length` against state/action row counts
+- per-episode `frame_index` and timestamp continuity
+- `observation.state` and `action` dimensions against `info.json`
+- video timestamp ranges against episode lengths
+- physical MP4 frame counts when OpenCV is available
+
+If `processed` is missing, false, or not the JSON boolean `true`, validation
+prints a warning before the dataset summary and continues with the remaining
+checks.
+
+If OpenCV is not available in the active Python environment, either install it or skip physical video checks:
+
+```bash
+python3 data_collection/validate_dataset.py \
+  --dataset-root data/pick_and_place_test \
+  --skip-video-frames
+```
 
 ## Episode Deletion
 

@@ -11,9 +11,18 @@ import argparse
 import json
 import math
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils.limit import arm_joint_slices, validate_joint_trajectory  # noqa: E402
 
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
@@ -328,6 +337,85 @@ def check_state_action_semantics(
     return issues, metrics
 
 
+def check_joint_safety_constraints(
+    rows: list[dict[str, Any]],
+    arm_action_representation: str,
+) -> tuple[list[str], list[str], dict[str, int]]:
+    """Validate state and absolute action trajectories against shared FR3 limits."""
+    if not rows:
+        return [], [], {"state_violation_steps": 0, "action_violation_steps": 0}
+
+    sorted_rows = sorted(rows, key=lambda row: int(row["frame_index"]))
+    states = [flatten_numeric(row.get("observation.state")) for row in sorted_rows]
+    actions = [flatten_numeric(row.get("action")) for row in sorted_rows]
+    timestamps = np.asarray(
+        [float(row["timestamp"]) for row in sorted_rows],
+        dtype=np.float64,
+    )
+    issues: list[str] = []
+    warnings: list[str] = []
+    metrics = {"state_violation_steps": 0, "action_violation_steps": 0}
+
+    if not states or any(len(state) != len(states[0]) for state in states):
+        return [
+            "joint safety check skipped because state vector lengths are inconsistent"
+        ], warnings, metrics
+    if not actions or any(len(action) != len(actions[0]) for action in actions):
+        return [
+            "joint safety check skipped because action vector lengths are inconsistent"
+        ], warnings, metrics
+
+    try:
+        state_layout = dict(arm_joint_slices(len(states[0])))
+        action_layout = dict(arm_joint_slices(len(actions[0])))
+    except ValueError as exc:
+        return [f"joint safety check skipped: {exc}"], warnings, metrics
+
+    state_array = np.asarray(states, dtype=np.float64)
+    action_array = np.asarray(actions, dtype=np.float64)
+    shared_arms = [arm_name for arm_name in state_layout if arm_name in action_layout]
+    if not shared_arms:
+        return [
+            "joint safety check found no matching arms in state and action layouts"
+        ], warnings, metrics
+
+    for arm_name in shared_arms:
+        state_trajectory = state_array[:, state_layout[arm_name]]
+        state_counts = validate_joint_trajectory(state_trajectory, timestamps)
+        metrics["state_violation_steps"] += state_counts.any_steps
+        if state_counts.any:
+            counts = asdict(state_counts)
+            warnings.append(
+                f"{arm_name} state safety violations: total={counts['any_steps']}, "
+                f"position={counts['position_steps']}, velocity={counts['velocity_steps']}, "
+                f"acceleration={counts['acceleration_steps']}, "
+                f"non_finite={counts['non_finite_steps']}"
+            )
+
+        action_trajectory = action_array[:, action_layout[arm_name]]
+        if arm_action_representation == "delta_joint_position":
+            action_trajectory = state_trajectory + action_trajectory
+        elif arm_action_representation != "absolute_joint_position":
+            issues.append(
+                f"joint action safety check does not support representation "
+                f"'{arm_action_representation}'"
+            )
+            continue
+
+        action_counts = validate_joint_trajectory(action_trajectory, timestamps)
+        metrics["action_violation_steps"] += action_counts.any_steps
+        if action_counts.any:
+            counts = asdict(action_counts)
+            warnings.append(
+                f"{arm_name} action safety violations: total={counts['any_steps']}, "
+                f"position={counts['position_steps']}, velocity={counts['velocity_steps']}, "
+                f"acceleration={counts['acceleration_steps']}, "
+                f"non_finite={counts['non_finite_steps']}"
+            )
+
+    return issues, warnings, metrics
+
+
 def check_physical_video_frames(
     dataset_root: Path,
     info: dict[str, Any],
@@ -465,6 +553,8 @@ def validate_dataset(
     total_arm_action_outlier_frames = 0
     total_gripper_outlier_frames = 0
     total_non_finite_frames = 0
+    total_state_safety_violation_steps = 0
+    total_action_safety_violation_steps = 0
 
     if verbose:
         print("\nEpisodes")
@@ -569,6 +659,17 @@ def validate_dataset(
         total_gripper_outlier_frames += len(set(semantic_metrics["gripper_outlier_frames"]))
         total_non_finite_frames += len(set(semantic_metrics["non_finite_frames"]))
 
+        safety_issues, safety_warnings, safety_metrics = check_joint_safety_constraints(
+            rows,
+            arm_action_representation,
+        )
+        episode_issues.extend(safety_issues)
+        total_state_safety_violation_steps += safety_metrics["state_violation_steps"]
+        total_action_safety_violation_steps += safety_metrics["action_violation_steps"]
+        warning_issues.extend(
+            f"episode {episode_index}: {warning}" for warning in safety_warnings
+        )
+
         if verbose:
             video_status = "ok" if not bad_video_ranges else "BAD"
             print(
@@ -606,6 +707,10 @@ def validate_dataset(
     else:
         print("  delta-action consistency check: skipped for absolute_joint_position actions")
 
+    print("\nJoint safety checks")
+    print(f"  state violation steps: {total_state_safety_violation_steps}")
+    print(f"  action violation steps: {total_action_safety_violation_steps}")
+
     if not skip_video_frames and video_keys:
         print("\nPhysical video checks")
         physical_video_issues = check_physical_video_frames(dataset_root, info, episodes, video_keys)
@@ -626,6 +731,8 @@ def validate_dataset(
     print("\nValidation summary")
     if warning_issues:
         print(f"  warnings: {len(warning_issues)}")
+        for warning in warning_issues:
+            print(f"  - {warning}")
     if issues:
         print(f"  status: FAILED")
         print(f"  issues: {len(issues)}")

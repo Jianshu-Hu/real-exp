@@ -20,7 +20,7 @@ if str(LOCAL_LEROBOT_SRC) not in sys.path:
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-from utils.dataset_stats import ensure_dataset_stats
+from utils.dataset_stats import ensure_dataset_stats, normalize_episode_metadata
 
 LEROBOT_INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
@@ -329,6 +329,9 @@ def main() -> None:
             )
         dataset_root.rmdir()
 
+    if normalize_episode_metadata(dataset_root):
+        print(f"Normalized episode metadata schemas in {dataset_root}")
+
     context = zmq.Context()
     socket = context.socket(zmq.SUB)
     socket.connect(f"tcp://{args.host}:{args.port}")
@@ -432,7 +435,10 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nStopping collection...")
         if dataset is None or not dataset.has_pending_frames():
-            print("No samples received. Nothing was saved.")
+            if dataset is None:
+                print("No samples received. Nothing was saved.")
+            else:
+                print("No unsaved episode in the recording buffer.")
         else:
             dataset.save_episode()
             episode_count += 1

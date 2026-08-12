@@ -239,6 +239,68 @@ The recording path has three components:
 - A ROS 2 bridge node in `gello_software/ros2/src/franka_lerobot_data_bridge/` that subscribes to robot, teleop, gripper, and camera topics and publishes synchronized samples over ZMQ.
 - `lerobot_collection.py`, which subscribes to that sample stream and writes a local LeRobot dataset.
 
+### Split control/data-server setup
+
+The recommended layout puts the USB cameras and all recording work on the data
+server (`192.168.50.13`), while the robot-control computer runs only GELLO,
+Franka, and gripper teleoperation:
+
+```text
+control host                         data server (192.168.50.13)
+GELLO + FR3 + gripper  --ROS 2-->    RealSense publisher + bridge
+                                     bridge ZMQ PUB :5555 --TCP--> recorder
+```
+
+ROS 2 must be reachable between both computers. Configure the same
+`ROS_DOMAIN_ID` and the same RMW implementation on both hosts, and make sure
+DDS discovery/data traffic is allowed by the firewall. For Cyclone DDS, use a
+network interface reachable from both machines; localhost-only DDS settings
+will prevent the server bridge from seeing robot and action topics.
+
+On the control host, start teleoperation:
+
+```bash
+./scripts/start_data_collection_client.sh --duo --gripper
+```
+
+On `192.168.50.13`, with the cameras connected there, source the ROS workspace
+and start the camera publisher and bridge:
+
+```bash
+./scripts/start_data_collection_server.sh --duo --gripper
+```
+
+The server supervisor binds the bridge to `192.168.50.13:5555`. To use a
+different interface or port, pass `--bridge-host` and `--bridge-port`. The
+single-arm variant is:
+
+```bash
+./scripts/start_data_collection_server.sh --single --gripper
+```
+
+Start the recorder on the server (in the `lerobot` environment) and leave its
+host set to the server address:
+
+```bash
+conda activate lerobot
+python data_collection/lerobot_collection.py \
+  --host 192.168.50.13 --port 5555 \
+  --local-dir ./lerobot_data
+```
+
+You can have the server supervisor start it as well:
+
+```bash
+./scripts/start_data_collection_server.sh --duo --record \
+  --gripper \
+  --local-dir ./lerobot_data
+```
+
+Do not start `franka_realsense_camera_publisher` or the LeRobot bridge on the
+control host; it has no camera USB devices in this layout. The server bridge
+still subscribes to `/left/...` and `/right/...` robot/action topics over ROS 2
+and to `/cameras/...` image topics locally.
+
 The dataset currently records:
 
 - `observation.state`: actual robot joint positions, plus gripper width if enabled
@@ -261,40 +323,20 @@ between `0` and `1` and clamps only out-of-range gripper values at serialization
 This normalized command is distinct from the physical gripper widths used by
 `reset_pylibfranka.py`.
 
-Run the data-collection support stack from the repository root. This starts the
-teleoperation supervisor, RealSense camera publisher, and LeRobot data bridge:
+The control-host supervisor supports the same four arm/gripper combinations as
+the teleoperation script:
 
 ```bash
-cd ~/real-exp
-./scripts/start_data_collection.sh --duo --gripper
+./scripts/start_data_collection_client.sh --duo --gripper
+./scripts/start_data_collection_client.sh --duo --no-gripper
+./scripts/start_data_collection_client.sh --single --gripper
+./scripts/start_data_collection_client.sh --single --no-gripper
 ```
 
-The script supports the same four arm/gripper combinations as the teleoperation
-script:
-
-```bash
-./scripts/start_data_collection.sh --duo --gripper
-./scripts/start_data_collection.sh --duo --no-gripper
-./scripts/start_data_collection.sh --single --gripper
-./scripts/start_data_collection.sh --single --no-gripper
-```
-
-In duo mode, the bridge uses its default `example_duo.yaml` configuration and
-records `cam_left`, `cam_front`, and `cam_right`. In single mode, it uses
-`example_single.yaml`; that bridge configuration records only `cam_left` and
-`cam_front`, even though the standard camera publisher may publish all three
-configured streams.
-
-Press `Ctrl-C` once to stop teleoperation, the camera publisher, and the bridge.
-If any component fails, the supervisor stops the complete support stack and
-returns the failing component's status.
-
-Then run the LeRobot recorder from the repo root:
-
-```bash
-source ~/anaconda3/bin/activate && conda activate lerobot
-python data_collection/lerobot_collection.py
-```
+In duo mode, the server bridge uses `example_duo.yaml` and records `cam_left`,
+`cam_front`, and `cam_right`. In single mode, it uses `example_single.yaml` and
+records `cam_left` and `cam_front`. Press `Ctrl-C` independently on each host to
+stop its processes.
 
 ## Dataset Validation
 

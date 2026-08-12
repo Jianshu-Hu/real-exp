@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 from pathlib import Path
@@ -51,7 +52,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Record robot state, teleop actions, and three RGB camera streams into LeRobot format."
     )
-    parser.add_argument("--host", default="127.0.0.1", help="ZMQ host used by the ROS 2 bridge.")
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("DATA_COLLECTION_SERVER_IP", "127.0.0.1"),
+        help=(
+            "ZMQ host used by the ROS 2 bridge (default: DATA_COLLECTION_SERVER_IP "
+            "or 127.0.0.1). Set --host 192.168.50.13 for the split server setup."
+        ),
+    )
     parser.add_argument("--port", type=int, default=5555, help="ZMQ port used by the ROS 2 bridge.")
     parser.add_argument(
         "--repo-id",

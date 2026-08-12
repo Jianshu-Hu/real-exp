@@ -3,8 +3,8 @@
 The hardware constants mirror the installed Franka description and libfranka.
 The command limits are intentionally more conservative: position bounds use
 the narrower legacy FR3 range with an additional 0.05 rad margin so the same
-envelope remains valid across robot system-image versions, while velocity and
-acceleration match the controller's existing 0.2-speed startup trajectory.
+envelope remains valid across robot system-image versions. The selected
+operational velocity and acceleration limits are defined below.
 """
 
 from __future__ import annotations
@@ -50,19 +50,19 @@ FR3_POSITION_MARGIN_RAD = 0.05
 FR3_SAFE_POSITION_LOWER_RAD = FR3_LEGACY_POSITION_LOWER_RAD + FR3_POSITION_MARGIN_RAD
 FR3_SAFE_POSITION_UPPER_RAD = FR3_LEGACY_POSITION_UPPER_RAD - FR3_POSITION_MARGIN_RAD
 
-# Use a 0.5 operational speed factor on the local MotionGenerator's base
-# velocity limits. The independently selected acceleration limit remains 2.0 rad/s^2.
+# Apply the selected operational speed factor to the local MotionGenerator's
+# base velocity limits. Acceleration is selected independently.
 FR3_CONTROLLER_BASE_MAX_VELOCITY_RAD_S = np.array(
     [2.0, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5],
     dtype=np.float64,
 )
-FR3_SAFE_SPEED_FACTOR = 0.7
+FR3_SAFE_SPEED_FACTOR = 0.8
 FR3_SAFE_MAX_VELOCITY_RAD_S = (
     FR3_CONTROLLER_BASE_MAX_VELOCITY_RAD_S * FR3_SAFE_SPEED_FACTOR
 )
-FR3_SAFE_MAX_ACCELERATION_RAD_S2 = 5.0 * np.ones(
-    FR3_JOINT_COUNT,
-    dtype=np.float64,
+FR3_SAFE_VELOCITY_FACTOR = 0.8
+FR3_SAFE_MAX_ACCELERATION_RAD_S2 =  (
+    FR3_HARD_MAX_ACCELERATION_RAD_S2 * FR3_SAFE_VELOCITY_FACTOR
 )
 
 SAFETY_TOLERANCE = 1e-9
@@ -110,13 +110,20 @@ class JointLimitResult:
 
 @dataclass(frozen=True)
 class TrajectoryViolationCounts:
-    """Number of trajectory steps violating each safety constraint."""
+    """Counts and frame offsets for per-timestep trajectory violations."""
 
     non_finite_steps: int
+    timing_steps: int
     position_steps: int
     velocity_steps: int
     acceleration_steps: int
     any_steps: int
+    non_finite_indices: tuple[int, ...]
+    timing_indices: tuple[int, ...]
+    position_indices: tuple[int, ...]
+    velocity_indices: tuple[int, ...]
+    acceleration_indices: tuple[int, ...]
+    any_indices: tuple[int, ...]
 
     @property
     def any(self) -> bool:
@@ -336,7 +343,23 @@ def validate_joint_trajectory(
     positions: Sequence[Sequence[float]] | np.ndarray,
     timestamps: Sequence[float] | np.ndarray,
 ) -> TrajectoryViolationCounts:
-    """Count unsafe steps in a sampled 7-DoF absolute-position trajectory."""
+    """Check every eligible timestep in a sampled absolute-position trajectory.
+
+    Position is checked directly at every frame. Velocity at frame ``i`` is
+    estimated over the preceding sample interval::
+
+        v[i] = (q[i] - q[i - 1]) / (t[i] - t[i - 1])
+
+    Acceleration at frame ``i`` is estimated from the two adjacent interval
+    velocities. Since those velocities occur at interval midpoints, the time
+    between them is half the sum of the adjacent sample intervals::
+
+        a[i] = 2 * (v[i] - v[i - 1]) / (dt[i] + dt[i - 1])
+
+    Frame 0 has no velocity estimate, and frames 0-1 have no acceleration
+    estimate. Invalid or non-increasing timestamps are reported separately as
+    timing violations instead of being mislabeled as velocity violations.
+    """
     position_array = np.asarray(positions, dtype=np.float64)
     timestamp_array = np.asarray(timestamps, dtype=np.float64)
     if position_array.ndim != 2 or position_array.shape[1] != FR3_JOINT_COUNT:
@@ -348,11 +371,24 @@ def validate_joint_trajectory(
             f"timestamps must have shape ({position_array.shape[0]},), got {timestamp_array.shape}."
         )
     if position_array.shape[0] == 0:
-        return TrajectoryViolationCounts(0, 0, 0, 0, 0)
+        return TrajectoryViolationCounts(
+            non_finite_steps=0,
+            timing_steps=0,
+            position_steps=0,
+            velocity_steps=0,
+            acceleration_steps=0,
+            any_steps=0,
+            non_finite_indices=(),
+            timing_indices=(),
+            position_indices=(),
+            velocity_indices=(),
+            acceleration_indices=(),
+            any_indices=(),
+        )
 
     finite_position = np.all(np.isfinite(position_array), axis=1)
     finite_timestamp = np.isfinite(timestamp_array)
-    non_finite_steps = np.logical_not(np.logical_and(finite_position, finite_timestamp))
+    non_finite_steps = ~finite_position
     sanitized = np.where(np.isfinite(position_array), position_array, 0.0)
     position_steps = np.any(
         np.logical_or(
@@ -363,12 +399,17 @@ def validate_joint_trajectory(
     )
     position_steps = np.logical_and(position_steps, finite_position)
 
+    timing_steps = ~finite_timestamp
     velocity_steps = np.zeros(position_array.shape[0], dtype=bool)
     acceleration_steps = np.zeros(position_array.shape[0], dtype=bool)
     if position_array.shape[0] >= 2:
         dt = np.diff(timestamp_array)
+        valid_timing = np.logical_and.reduce(
+            (finite_timestamp[:-1], finite_timestamp[1:], dt > 0.0)
+        )
+        timing_steps[1:] = np.logical_or(timing_steps[1:], ~valid_timing)
         valid_velocity = np.logical_and.reduce(
-            (dt > 0.0, np.isfinite(dt), finite_position[:-1], finite_position[1:])
+            (valid_timing, finite_position[:-1], finite_position[1:])
         )
         velocities = np.zeros(
             (position_array.shape[0] - 1, FR3_JOINT_COUNT), dtype=np.float64
@@ -376,8 +417,8 @@ def validate_joint_trajectory(
         velocities[valid_velocity] = (
             np.diff(sanitized, axis=0)[valid_velocity] / dt[valid_velocity, None]
         )
-        velocity_steps[1:] = np.logical_or(
-            ~valid_velocity,
+        velocity_steps[1:] = np.logical_and(
+            valid_velocity,
             np.any(
                 np.abs(velocities) > FR3_SAFE_MAX_VELOCITY_RAD_S + SAFETY_TOLERANCE,
                 axis=1,
@@ -385,10 +426,10 @@ def validate_joint_trajectory(
         )
 
         if position_array.shape[0] >= 3:
-            acceleration_dt = dt[1:]
             valid_acceleration = np.logical_and.reduce(
-                (valid_velocity[:-1], valid_velocity[1:], acceleration_dt > 0.0)
+                (valid_velocity[:-1], valid_velocity[1:])
             )
+            acceleration_dt = 0.5 * (dt[:-1] + dt[1:])
             accelerations = np.zeros(
                 (position_array.shape[0] - 2, FR3_JOINT_COUNT),
                 dtype=np.float64,
@@ -397,8 +438,8 @@ def validate_joint_trajectory(
                 np.diff(velocities, axis=0)[valid_acceleration]
                 / acceleration_dt[valid_acceleration, None]
             )
-            acceleration_steps[2:] = np.logical_or(
-                ~valid_acceleration,
+            acceleration_steps[2:] = np.logical_and(
+                valid_acceleration,
                 np.any(
                     np.abs(accelerations)
                     > FR3_SAFE_MAX_ACCELERATION_RAD_S2 + SAFETY_TOLERANCE,
@@ -407,12 +448,29 @@ def validate_joint_trajectory(
             )
 
     any_steps = np.logical_or.reduce(
-        (non_finite_steps, position_steps, velocity_steps, acceleration_steps)
+        (
+            non_finite_steps,
+            timing_steps,
+            position_steps,
+            velocity_steps,
+            acceleration_steps,
+        )
     )
+
+    def indices(mask: np.ndarray) -> tuple[int, ...]:
+        return tuple(int(index) for index in np.flatnonzero(mask))
+
     return TrajectoryViolationCounts(
         non_finite_steps=int(np.count_nonzero(non_finite_steps)),
+        timing_steps=int(np.count_nonzero(timing_steps)),
         position_steps=int(np.count_nonzero(position_steps)),
         velocity_steps=int(np.count_nonzero(velocity_steps)),
         acceleration_steps=int(np.count_nonzero(acceleration_steps)),
         any_steps=int(np.count_nonzero(any_steps)),
+        non_finite_indices=indices(non_finite_steps),
+        timing_indices=indices(timing_steps),
+        position_indices=indices(position_steps),
+        velocity_indices=indices(velocity_steps),
+        acceleration_indices=indices(acceleration_steps),
+        any_indices=indices(any_steps),
     )

@@ -11,7 +11,6 @@ import argparse
 import json
 import math
 import sys
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +21,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from utils.limit import arm_joint_slices, validate_joint_trajectory  # noqa: E402
+from utils.limit import (  # noqa: E402
+    TrajectoryViolationCounts,
+    arm_joint_slices,
+    validate_joint_trajectory,
+)
 
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
@@ -337,6 +340,33 @@ def check_state_action_semantics(
     return issues, metrics
 
 
+def format_joint_safety_warning(
+    arm_name: str,
+    trajectory_name: str,
+    counts: TrajectoryViolationCounts,
+    frame_indices: list[int],
+) -> str:
+    """Format per-constraint counts and episode frame indices for one arm."""
+
+    def episode_frames(offsets: tuple[int, ...]) -> str:
+        return format_indices([frame_indices[offset] for offset in offsets])
+
+    return (
+        f"{arm_name} {trajectory_name} safety violations: "
+        f"total={counts.any_steps} frames=[{episode_frames(counts.any_indices)}], "
+        f"position={counts.position_steps} "
+        f"frames=[{episode_frames(counts.position_indices)}], "
+        f"velocity={counts.velocity_steps} "
+        f"frames=[{episode_frames(counts.velocity_indices)}], "
+        f"acceleration={counts.acceleration_steps} "
+        f"frames=[{episode_frames(counts.acceleration_indices)}], "
+        f"non_finite={counts.non_finite_steps} "
+        f"frames=[{episode_frames(counts.non_finite_indices)}], "
+        f"timing={counts.timing_steps} "
+        f"frames=[{episode_frames(counts.timing_indices)}]"
+    )
+
+
 def check_joint_safety_constraints(
     rows: list[dict[str, Any]],
     arm_action_representation: str,
@@ -373,6 +403,7 @@ def check_joint_safety_constraints(
 
     state_array = np.asarray(states, dtype=np.float64)
     action_array = np.asarray(actions, dtype=np.float64)
+    frame_indices = [int(row["frame_index"]) for row in sorted_rows]
     shared_arms = [arm_name for arm_name in state_layout if arm_name in action_layout]
     if not shared_arms:
         return [
@@ -384,12 +415,13 @@ def check_joint_safety_constraints(
         state_counts = validate_joint_trajectory(state_trajectory, timestamps)
         metrics["state_violation_steps"] += state_counts.any_steps
         if state_counts.any:
-            counts = asdict(state_counts)
             warnings.append(
-                f"{arm_name} state safety violations: total={counts['any_steps']}, "
-                f"position={counts['position_steps']}, velocity={counts['velocity_steps']}, "
-                f"acceleration={counts['acceleration_steps']}, "
-                f"non_finite={counts['non_finite_steps']}"
+                format_joint_safety_warning(
+                    arm_name,
+                    "state",
+                    state_counts,
+                    frame_indices,
+                )
             )
 
         action_trajectory = action_array[:, action_layout[arm_name]]
@@ -405,12 +437,13 @@ def check_joint_safety_constraints(
         action_counts = validate_joint_trajectory(action_trajectory, timestamps)
         metrics["action_violation_steps"] += action_counts.any_steps
         if action_counts.any:
-            counts = asdict(action_counts)
             warnings.append(
-                f"{arm_name} action safety violations: total={counts['any_steps']}, "
-                f"position={counts['position_steps']}, velocity={counts['velocity_steps']}, "
-                f"acceleration={counts['acceleration_steps']}, "
-                f"non_finite={counts['non_finite_steps']}"
+                format_joint_safety_warning(
+                    arm_name,
+                    "action",
+                    action_counts,
+                    frame_indices,
+                )
             )
 
     return issues, warnings, metrics

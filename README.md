@@ -44,6 +44,8 @@ Data collection and replay instructions live in [data_collection/DATA_COLLECTION
 ### Deploy
 
 - Deployment instructions live in [deploy/DEPLOY_README.md](deploy/DEPLOY_README.md).
+- [`scripts/start_deployment_server.sh`](scripts/start_deployment_server.sh): start the cameras, deployment bridge, and policy server on the inference server.
+- [`scripts/start_deployment_client.sh`](scripts/start_deployment_client.sh): start deployment-gated FR3 controllers and gripper managers on the robot computer.
 
 ## Notes
 

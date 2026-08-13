@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle  # nosec
 import subprocess  # nosec
 import threading
@@ -31,7 +32,8 @@ from lerobot.async_inference.helpers import RemotePolicyConfig, TimedAction, Tim
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_DEPLOYMENT_LOG_ROOT = DEFAULT_OUTPUT_ROOT / "deployment_logs"
-DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
+DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "test-limit-pick-and-place"
+DEFAULT_DEPLOYMENT_SERVER_IP = os.environ.get("DEPLOYMENT_SERVER_IP", "192.168.50.13")
 ACTION_CONFIG_REL_PATH = Path("meta/real_exp_action_config.json")
 INFO_REL_PATH = Path("meta/info.json")
 
@@ -64,9 +66,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Robot-side Franka executor for a remote diffusion LeRobot policy server."
     )
-    parser.add_argument("--policy-path", type=Path, required=True)
+    parser.add_argument(
+        "--policy-path",
+        type=Path,
+        required=True,
+        help="Checkpoint path resolved by the policy server.",
+    )
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
-    parser.add_argument("--server-address", default="127.0.0.1:8080")
+    parser.add_argument("--server-address", default=f"{DEFAULT_DEPLOYMENT_SERVER_IP}:8080")
     parser.add_argument("--policy-device", default="cuda")
     parser.add_argument(
         "--actions-per-chunk",
@@ -76,7 +83,7 @@ def parse_args() -> argparse.Namespace:
             "Number of actions to request per deployment chunk. Required for diffusion deployment."
         ),
     )
-    parser.add_argument("--zmq-host", default="127.0.0.1")
+    parser.add_argument("--zmq-host", default=DEFAULT_DEPLOYMENT_SERVER_IP)
     parser.add_argument("--zmq-port", type=int, default=5555)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--task", default="pick and place")
@@ -91,7 +98,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--command-zmq-host", default="127.0.0.1")
+    parser.add_argument("--command-zmq-host", default=DEFAULT_DEPLOYMENT_SERVER_IP)
     parser.add_argument("--command-zmq-port", type=int, default=5556)
     parser.add_argument("--bridge-activation-service", default="/set_deployment_active")
     parser.add_argument("--no-auto-activate-bridge", action="store_true")

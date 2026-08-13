@@ -34,7 +34,7 @@ from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.transport.utils import receive_bytes_in_chunks
 
-DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
+DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "test-limit-pick-and-place"
 DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"
 ACTION_CONFIG_REL_PATH = Path("meta/real_exp_action_config.json")
 INFO_REL_PATH = Path("meta/info.json")

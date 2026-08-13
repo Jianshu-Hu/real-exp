@@ -243,6 +243,27 @@ def make_deployment_policy_server(
             self.lerobot_features = policy_specs.lerobot_features
             self.actions_per_chunk = policy_specs.actions_per_chunk
 
+            pretrained_path = Path(policy_specs.pretrained_name_or_path).expanduser()
+            if not pretrained_path.exists():
+                raise FileNotFoundError(
+                    f"Policy checkpoint does not exist on the policy server: {pretrained_path}"
+                )
+            if not pretrained_path.is_dir():
+                raise NotADirectoryError(
+                    f"Policy checkpoint must be a directory on the policy server: {pretrained_path}"
+                )
+            required_files = ("config.json", "model.safetensors")
+            missing_files = [name for name in required_files if not (pretrained_path / name).is_file()]
+            if missing_files:
+                raise FileNotFoundError(
+                    f"Policy checkpoint {pretrained_path} is missing required files: "
+                    + ", ".join(missing_files)
+                )
+            self.logger.info(
+                "Policy checkpoint preflight passed: "
+                f"path={pretrained_path}, model_bytes={(pretrained_path / 'model.safetensors').stat().st_size}"
+            )
+
             policy_class = get_policy_class(self.policy_type)
             cli_overrides = [f"--device={self.device}"]
             if self.policy_type == "diffusion" and diffusion_cli_overrides:
@@ -250,10 +271,20 @@ def make_deployment_policy_server(
                 self.logger.info(f"Applying diffusion CLI overrides: {diffusion_cli_overrides}")
 
             start = time.perf_counter()
-            self.policy = policy_class.from_pretrained(
-                policy_specs.pretrained_name_or_path,
-                cli_overrides=cli_overrides,
-            )
+            try:
+                self.policy = policy_class.from_pretrained(
+                    str(pretrained_path),
+                    cli_overrides=cli_overrides,
+                )
+            except Exception as exc:
+                self.logger.error(
+                    "Policy checkpoint loading failed for "
+                    f"{pretrained_path} on device {self.device}: {exc}"
+                )
+                self.logger.error(traceback.format_exc())
+                raise RuntimeError(
+                    f"Could not load policy checkpoint {pretrained_path} on device {self.device}: {exc}"
+                ) from exc
             self.policy.to(self.device)
             self.policy.eval()
             max_actions_per_chunk = infer_actions_per_chunk(self.policy_type, asdict(self.policy.config))
@@ -266,7 +297,7 @@ def make_deployment_policy_server(
             device_override = {"device": self.device}
             self.preprocessor, self.postprocessor = make_pre_post_processors(
                 self.policy.config,
-                pretrained_path=policy_specs.pretrained_name_or_path,
+                pretrained_path=str(pretrained_path),
                 preprocessor_overrides={
                     "device_processor": device_override,
                     "rename_observations_processor": {"rename_map": policy_specs.rename_map},

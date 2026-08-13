@@ -14,6 +14,7 @@ Quick links:
 - [GELLO docs](../gello_software/README.md)
 - [FR3 ROS 2 docs](../gello_software/ros2/README.md)
 - [LeRobot docs](../lerobot/README.md)
+- [Wuji glove teleoperation](wuji/README.md)
 
 Environment split used in this repo:
 

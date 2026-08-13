@@ -60,6 +60,12 @@ class WujiGloveDevice:
                 "Could not import a Wuji SDK module. Install the vendor SDK or pass --device-module. "
                 + "; ".join(import_errors)
             )
+        self._manager = None
+        self._subscription = None
+        self._last_gripper = 1.0
+        if module.__name__ == "wuji_sdk" and hasattr(module, "SdkManager"):
+            self._device = self._connect_official_sdk(module, device_id)
+            return
         cls = getattr(module, class_name, None)
         if cls is None:
             for candidate in ("WujiGlove", "Glove", "Wuji"):
@@ -71,6 +77,32 @@ class WujiGloveDevice:
                 f"{module.__name__!r} exposes no {class_name!r}, WujiGlove, Glove, or Wuji class"
             )
         self._device = self._construct(cls, device_id)
+
+    def _connect_official_sdk(self, module: Any, device_id: str | None) -> Any:
+        """Connect using the API documented by the official ``wuji-sdk`` package."""
+        manager = module.SdkManager.instance()
+        devices = [
+            device
+            for device in manager.scan()
+            if device.device_type == module.DeviceType.WujiGlove
+        ]
+        if device_id is not None:
+            devices = [
+                device
+                for device in devices
+                if device.sn == device_id or device.address == device_id
+            ]
+        if not devices:
+            selector = f" matching {device_id!r}" if device_id else ""
+            raise RuntimeError(f"No Wuji Glove found{selector}")
+        if len(devices) > 1:
+            serials = ", ".join(device.sn for device in devices)
+            raise RuntimeError(f"Multiple Wuji Gloves found ({serials}); select one with --device-id")
+        discovered = devices[0]
+        glove = manager.connect(sn=discovered.sn, device_name="fr3_teleop_glove")
+        self._manager = manager
+        self._subscription = glove.hand_joint_angles().subscribe()
+        return glove
 
     @staticmethod
     def _construct(cls: Any, device_id: str | None) -> Any:
@@ -100,6 +132,20 @@ class WujiGloveDevice:
         raise RuntimeError("could not construct/connect Wuji glove device") from last
 
     def read(self) -> tuple[list[float], float]:
+        if self._subscription is not None:
+            frame = None
+            while frame is None:
+                frame = self._subscription.recv()
+                if frame is None:
+                    time.sleep(0.001)
+            # Drain queued frames so control follows the newest available glove pose.
+            while True:
+                newer = self._subscription.recv()
+                if newer is None:
+                    break
+                frame = newer
+            joints = [angle for finger in frame.fingers for angle in finger.angles]
+            return [float(value) for value in joints], self._last_gripper
         raw = None
         for method in (
             "read",
@@ -154,6 +200,13 @@ class WujiGloveDevice:
         return [float(v) for v in joints], float(gripper)
 
     def close(self) -> None:
+        if self._subscription is not None:
+            self._subscription.close()
+            self._subscription = None
+        if self._manager is not None:
+            self._manager.disconnect_all()
+            self._manager = None
+            return
         for method in ("close", "disconnect", "stop"):
             fn = getattr(self._device, method, None)
             if callable(fn):
@@ -170,10 +223,16 @@ def parse_args() -> argparse.Namespace:
         help="SDK module to import (default: probe wuji, wuji_glove, then wuji_sdk)",
     )
     p.add_argument("--device-class", default="WujiGlove")
-    p.add_argument("--device-id", default=None)
+    p.add_argument("--device-id", default=None, help="Wuji glove serial number or discovered address")
     p.add_argument("--rate", type=float, default=50.0)
     p.add_argument("--max-step-rad", type=float, default=0.15)
-    p.add_argument("--joint-indices", nargs=7, type=int, default=list(range(7)))
+    p.add_argument(
+        "--joint-indices",
+        nargs=7,
+        type=int,
+        default=list(range(7)),
+        help="seven indices selected from the SDK's 21-DoF hand_joint_angles frame",
+    )
     p.add_argument("--joint-signs", nargs=7, type=float, default=[1, -1, 1, 1, 1, -1, 1])
     p.add_argument("--joint-offsets", nargs=7, type=float, default=[0.0] * 7)
     p.add_argument("--joint-min", nargs=7, type=float, default=None)
@@ -194,6 +253,8 @@ def run(args: argparse.Namespace) -> None:
     from sensor_msgs.msg import JointState
     from std_msgs.msg import Float32
 
+    if args.rate <= 0:
+        raise ValueError("--rate must be positive")
     rclpy.init()
     node = Node("wuji_glove_teleop")
     ns = args.namespace.strip("/")
@@ -210,36 +271,42 @@ def run(args: argparse.Namespace) -> None:
     device = None if args.stdin else WujiGloveDevice(args.device_module, args.device_class, args.device_id)
     try:
         period = 1.0 / args.rate
-        while rclpy.ok():
-            if args.stdin:
-                line = input().strip()
-                if not line:
-                    continue
-                values = [float(v) for v in line.split()]
-                if len(values) != 8:
-                    raise ValueError("stdin samples require 7 joint angles and one gripper value")
-                joints, gripper = values[:7], values[7]
-            else:
-                joints, gripper = device.read()
-            if args.input_unit == "degrees":
-                joints = [value * 3.141592653589793 / 180.0 for value in joints]
-            msg = JointState()
-            msg.header.stamp = node.get_clock().now().to_msg()
-            msg.name = [f"fr3_joint{i}" for i in range(1, 8)]
-            msg.header.frame_id = "fr3_link0"
-            msg.position = mapper.map(joints).tolist()
-            arm_pub.publish(msg)
-            grip = Float32()
-            grip.data = mapper.gripper(gripper)
-            grip_pub.publish(grip)
-            rclpy.spin_once(node, timeout_sec=0.0)
-            if not args.stdin:
+        try:
+            while rclpy.ok():
+                if args.stdin:
+                    try:
+                        line = input().strip()
+                    except EOFError:
+                        break
+                    if not line:
+                        continue
+                    values = [float(v) for v in line.split()]
+                    if len(values) != 8:
+                        raise ValueError("stdin samples require 7 joint angles and one gripper value")
+                    joints, gripper = values[:7], values[7]
+                else:
+                    joints, gripper = device.read()
+                if args.input_unit == "degrees":
+                    joints = [value * 3.141592653589793 / 180.0 for value in joints]
+                msg = JointState()
+                msg.header.stamp = node.get_clock().now().to_msg()
+                msg.name = [f"fr3_joint{i}" for i in range(1, 8)]
+                msg.header.frame_id = "fr3_link0"
+                msg.position = mapper.map(joints).tolist()
+                arm_pub.publish(msg)
+                grip = Float32()
+                grip.data = mapper.gripper(gripper)
+                grip_pub.publish(grip)
+                rclpy.spin_once(node, timeout_sec=0.0)
                 time.sleep(period)
+        except KeyboardInterrupt:
+            pass
     finally:
         if device is not None:
             device.close()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

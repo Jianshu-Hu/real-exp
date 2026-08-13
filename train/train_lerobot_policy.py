@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
         help="Directory where checkpoints and logs will be written.",
     )
     parser.add_argument("--steps", type=int, default=50_000, help="Number of optimizer steps.")
-    parser.add_argument("--batch-size", type=int, default=16, help="Training batch size.")
+    parser.add_argument("--batch-size", type=int, default=128, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader worker count.")
     parser.add_argument("--save-freq", type=int, default=2_500, help="Checkpoint save frequency.")
     parser.add_argument("--log-freq", type=int, default=100, help="Logging frequency in steps.")

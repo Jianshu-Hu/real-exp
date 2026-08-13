@@ -32,6 +32,9 @@ Options:
                         (default: ${DATA_COLLECTION_SERVER_IP:-192.168.50.13}).
   --bridge-port PORT    ZMQ sample port (default: 5555).
   --ros-domain-id ID    Set ROS_DOMAIN_ID for this process (default: preserve env).
+  --ros-distro DISTRO   ROS 2 distribution installed under /opt/ros (default:
+                        DATA_SERVER_ROS_DISTRO, current ROS_DISTRO, or the only
+                        locally installed distribution).
   --help                Show this help.
 EOF
 }
@@ -46,6 +49,7 @@ repo_id="local/franka_gello_teleop"
 bridge_host="${DATA_COLLECTION_SERVER_IP:-192.168.50.13}"
 bridge_port="5555"
 ros_domain_id=""
+ros_distro="${DATA_SERVER_ROS_DISTRO:-${ROS_DISTRO:-}}"
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -75,6 +79,9 @@ while [[ "$#" -gt 0 ]]; do
     --ros-domain-id)
       [[ "$#" -ge 2 ]] || die "--ros-domain-id requires an id"
       ros_domain_id="$2"; shift 2 ;;
+    --ros-distro)
+      [[ "$#" -ge 2 ]] || die "--ros-distro requires a distribution name"
+      ros_distro="$2"; shift 2 ;;
     --help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -85,9 +92,22 @@ done
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
 
+if [[ -n "${ros_distro}" ]]; then
+  ros_setup_file="/opt/ros/${ros_distro}/setup.bash"
+else
+  shopt -s nullglob
+  ros_setup_candidates=(/opt/ros/*/setup.bash)
+  shopt -u nullglob
+  case "${#ros_setup_candidates[@]}" in
+    0) die "no ROS 2 installation found under /opt/ros" ;;
+    1) ros_setup_file="${ros_setup_candidates[0]}" ;;
+    *) die "multiple ROS 2 distributions are installed; pass --ros-distro DISTRO" ;;
+  esac
+  ros_distro="$(basename -- "$(dirname -- "${ros_setup_file}")")"
+fi
+
 setup_files=(
-  "/opt/ros/humble/setup.bash"
-  "${HOME}/franka_ros2_ws/install/setup.bash"
+  "${ros_setup_file}"
   "${repository_root}/gello_software/ros2/install/setup.bash"
 )
 
@@ -105,6 +125,19 @@ if [[ -n "${ros_domain_id}" ]]; then
 fi
 
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
+command -v ros2 >/dev/null 2>&1 || die "ros2 is unavailable after sourcing ROS ${ros_distro}"
+
+ros_python="/usr/bin/python3"
+[[ -x "${ros_python}" ]] || die "ROS Python interpreter is missing: ${ros_python}"
+missing_ros_modules="$(${ros_python} - <<'PY'
+import importlib.util
+
+modules = ("controller_manager_msgs", "pyrealsense2", "rclpy", "zmq")
+print(" ".join(module for module in modules if importlib.util.find_spec(module) is None))
+PY
+)"
+[[ -z "${missing_ros_modules}" ]] || die \
+  "missing ROS Python modules for ${ros_python}: ${missing_ros_modules}"
 
 config_file="example_${arm_mode}.yaml"
 declare -a child_pids=()
@@ -142,7 +175,7 @@ trap shutdown EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo "Data-server mode: ${arm_mode}; bridge: tcp://${bridge_host}:${bridge_port}"
+echo "Data-server mode: ${arm_mode}; ROS: ${ros_distro}; bridge: tcp://${bridge_host}:${bridge_port}"
 
 start_process "RealSense camera publisher" \
   ros2 launch franka_realsense_camera_publisher cameras.launch.py

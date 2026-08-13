@@ -864,7 +864,34 @@ class FrankaPolicyExecutor:
             "std_srvs/srv/SetBool",
             f"{{data: {state}}}",
         ]
-        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=5.0)  # nosec B603
+        ros_env = os.environ.copy()
+        ros_env.setdefault("ROS_DOMAIN_ID", "0")
+        ros_env["ROS_LOCALHOST_ONLY"] = "0"
+        last_timeout: subprocess.TimeoutExpired | None = None
+        for attempt in range(3):
+            try:
+                result = subprocess.run(  # nosec B603
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                    env=ros_env,
+                )
+                last_timeout = None
+                break
+            except subprocess.TimeoutExpired as exc:
+                last_timeout = exc
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"Timed out waiting for ROS 2 service {self.args.bridge_activation_service!r} "
+                        "after 3 attempts. The deployment bridge must be running in deployment mode "
+                        "and discoverable from this computer; verify ROS_DOMAIN_ID, "
+                        "RMW_IMPLEMENTATION, and ROS_LOCALHOST_ONLY on both hosts."
+                    ) from exc
+                time.sleep(1.0)
+        if last_timeout is not None:  # pragma: no cover - loop either returns or raises
+            raise RuntimeError("ROS 2 bridge activation did not produce a result.") from last_timeout
         if result.returncode != 0 or "success=True" not in result.stdout:
             raise RuntimeError(
                 f"Failed to {'activate' if active else 'deactivate'} bridge via "

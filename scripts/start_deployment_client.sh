@@ -22,7 +22,7 @@ EOF
 }
 die() { echo "Error: $*" >&2; exit 1; }
 robot_config=example_fr3_duo_config.yaml; gripper_config=example_fr3_duo_config_franka_hand.yaml
-start_gripper=1; ros_domain_id=""; ros_distro="${DEPLOYMENT_ROS_DISTRO:-${ROS_DISTRO:-}}"
+start_gripper=1; ros_domain_id="${ROS_DOMAIN_ID:-0}"; ros_distro="${DEPLOYMENT_ROS_DISTRO:-${ROS_DISTRO:-}}"
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --robot-config) [[ "$#" -ge 2 ]] || die "$1 requires a value"; robot_config="$2"; shift 2 ;;
@@ -46,7 +46,11 @@ for setup_file in "${setup_files[@]}"; do
   # shellcheck disable=SC1090
   source "${setup_file}"
 done
-set -u; [[ -z "${ros_domain_id}" ]] || export ROS_DOMAIN_ID="${ros_domain_id}"
+set -u
+# Deployment spans two computers, so keep DDS on the selected domain and do
+# not inherit a localhost-only setting from an unrelated ROS shell.
+export ROS_DOMAIN_ID="${ros_domain_id}"
+export ROS_LOCALHOST_ONLY=0
 command -v setsid >/dev/null || die "setsid is required"; command -v ros2 >/dev/null || die "ros2 is unavailable after sourcing ROS"
 robot_config_source="${repository_root}/gello_software/ros2/src/franka_fr3_arm_controllers/config/${robot_config}"
 gripper_config_source="${repository_root}/gello_software/ros2/src/franka_gripper_manager/config/${gripper_config}"

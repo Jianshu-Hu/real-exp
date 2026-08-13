@@ -27,7 +27,7 @@ validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535)); }
 
 server_ip="${DEPLOYMENT_SERVER_IP:-192.168.50.13}"
 publish_port=5555; command_port=5556; policy_port=8080
-bridge_config=deployment_duo.yaml; ros_domain_id=""
+bridge_config=deployment_duo.yaml; ros_domain_id="${ROS_DOMAIN_ID:-0}"
 ros_distro="${DEPLOYMENT_ROS_DISTRO:-${ROS_DISTRO:-}}"
 policy_python="${DEPLOYMENT_PYTHON:-python}"
 
@@ -68,7 +68,10 @@ for setup_file in "${setup_files[@]}"; do
   source "${setup_file}"
 done
 set -u
-[[ -z "${ros_domain_id}" ]] || export ROS_DOMAIN_ID="${ros_domain_id}"
+# Deployment spans two computers, so keep DDS on the selected domain and do
+# not inherit a localhost-only setting from an unrelated ROS shell.
+export ROS_DOMAIN_ID="${ros_domain_id}"
+export ROS_LOCALHOST_ONLY=0
 command -v setsid >/dev/null || die "setsid is required"
 command -v ros2 >/dev/null || die "ros2 is unavailable after sourcing ROS"
 command -v "${policy_python}" >/dev/null || die "policy Python not found: ${policy_python}"

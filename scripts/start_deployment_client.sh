@@ -51,6 +51,7 @@ set -u
 # not inherit a localhost-only setting from an unrelated ROS shell.
 export ROS_DOMAIN_ID="${ros_domain_id}"
 export ROS_LOCALHOST_ONLY=0
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 command -v setsid >/dev/null || die "setsid is required"; command -v ros2 >/dev/null || die "ros2 is unavailable after sourcing ROS"
 robot_config_source="${repository_root}/gello_software/ros2/src/franka_fr3_arm_controllers/config/${robot_config}"
 gripper_config_source="${repository_root}/gello_software/ros2/src/franka_gripper_manager/config/${gripper_config}"

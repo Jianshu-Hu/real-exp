@@ -31,7 +31,7 @@ Options:
   --bridge-host IP      Address on which the bridge publishes samples
                         (default: ${DATA_COLLECTION_SERVER_IP:-192.168.50.13}).
   --bridge-port PORT    ZMQ sample port (default: 5555).
-  --ros-domain-id ID    Set ROS_DOMAIN_ID for this process (default: preserve env).
+  --ros-domain-id ID    Set ROS_DOMAIN_ID for this process (default: environment or 0).
   --ros-distro DISTRO   ROS 2 distribution installed under /opt/ros (default:
                         DATA_SERVER_ROS_DISTRO, current ROS_DISTRO, or the only
                         locally installed distribution).
@@ -48,7 +48,7 @@ local_dir="./lerobot_data"
 repo_id="local/franka_gello_teleop"
 bridge_host="${DATA_COLLECTION_SERVER_IP:-192.168.50.13}"
 bridge_port="5555"
-ros_domain_id=""
+ros_domain_id="${ROS_DOMAIN_ID:-0}"
 ros_distro="${DATA_SERVER_ROS_DISTRO:-${ROS_DISTRO:-}}"
 
 while [[ "$#" -gt 0 ]]; do
@@ -120,11 +120,12 @@ for setup_file in "${setup_files[@]}"; do
 done
 set -u
 
-if [[ -n "${ros_domain_id}" ]]; then
-  export ROS_DOMAIN_ID="${ros_domain_id}"
-fi
+export ROS_DOMAIN_ID="${ros_domain_id}"
+export ROS_LOCALHOST_ONLY=0
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
+command -v timeout >/dev/null 2>&1 || die "required command not found: timeout"
 command -v ros2 >/dev/null 2>&1 || die "ros2 is unavailable after sourcing ROS ${ros_distro}"
 
 ros_python="/usr/bin/python3"
@@ -184,6 +185,19 @@ start_process "LeRobot data bridge" \
   "config_file:=${config_file}" \
   "publish_host:=${bridge_host}" "publish_port:=${bridge_port}" \
   "include_gripper:=$([[ "${gripper_mode}" == "gripper" ]] && echo true || echo false)"
+
+required_bridge_topics=("/left/joint_states" "/left/gello/joint_states")
+if [[ "${arm_mode}" == "duo" ]]; then
+  required_bridge_topics+=("/right/joint_states" "/right/gello/joint_states")
+fi
+for topic in "${required_bridge_topics[@]}"; do
+  if ! timeout 10s ros2 topic echo \
+    "${topic}" sensor_msgs/msg/JointState --once --no-daemon \
+    >/dev/null 2>&1; then
+    die "no JointState payload received from ${topic}; check cross-host ROS 2 discovery and the control stack"
+  fi
+  echo "Ready: ${topic} is publishing on the data server"
+done
 
 if [[ "${record}" -eq 1 ]]; then
   command -v python >/dev/null 2>&1 || die "python is required for --record (activate the lerobot environment)"

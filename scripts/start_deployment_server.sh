@@ -72,6 +72,7 @@ set -u
 # not inherit a localhost-only setting from an unrelated ROS shell.
 export ROS_DOMAIN_ID="${ros_domain_id}"
 export ROS_LOCALHOST_ONLY=0
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 command -v setsid >/dev/null || die "setsid is required"
 command -v ros2 >/dev/null || die "ros2 is unavailable after sourcing ROS"
 command -v "${policy_python}" >/dev/null || die "policy Python not found: ${policy_python}"

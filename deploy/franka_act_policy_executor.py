@@ -593,6 +593,7 @@ class FrankaPolicyExecutor:
         ros_env = os.environ.copy()
         ros_env.setdefault("ROS_DOMAIN_ID", "0")
         ros_env["ROS_LOCALHOST_ONLY"] = "0"
+        ros_env["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "SUBNET"
         last_timeout: subprocess.TimeoutExpired | None = None
         for attempt in range(3):
             try:

@@ -25,4 +25,7 @@ fi
 
 echo "Starting control-host teleoperation only."
 echo "Run scripts/start_data_collection_server.sh on 192.168.50.13 for cameras and recording."
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
+export ROS_LOCALHOST_ONLY=0
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 exec "${script_dir}/start_teleoperation.sh" "$@"

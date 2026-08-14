@@ -1,100 +1,151 @@
-# Wuji glove teleoperation
+# Wuji Glove to Wuji Hand 2 teleoperation
 
-This directory provides a Python teleoperator for a Wuji glove. It publishes
-the same ROS 2 topics consumed by the existing FR3 controllers and LeRobot
-bridge:
+This directory uses only Wuji's Python SDK. `teleop.py` drives one right Wuji
+Hand 2 from one right Wuji Glove by reading `hand_skeleton`, passing its 21
+MediaPipe-order landmarks through `RetargetSession`, and sending the returned 20
+firmware-order joint positions directly through `joint_command()`.
 
-* `/<namespace>/gello/joint_states` (`sensor_msgs/msg/JointState`), seven FR3
-  joint targets in radians;
-* `/<namespace>/gripper/gripper_client/target_gripper_width_percent`
-  (`std_msgs/msg/Float32`), normalized open-width command.
+The implementation follows Wuji's official Python example:
 
-The hardware path uses Wuji's official `wuji-sdk` package. It discovers Wuji
-Gloves over USB and UDP, connects by serial number, and consumes the glove's
-21-DoF `hand_joint_angles` stream. The seven values selected by
-`--joint-indices` are mapped to the FR3 command. Legacy SDK-style classes are
-also supported through `--device-module` and `--device-class`.
+- [Retargeting documentation](https://docs.wuji.tech/docs/en/wuji-sdk/latest/retargeting/)
+- [`retargeting/1.teleop_real.py`](https://github.com/wuji-technology/wuji-sdk/blob/main/examples/python/retargeting/1.teleop_real.py)
 
-## Install and run
+The Wuji Hand ROS 2 documentation is for the separately installed USB
+`WujiHand` driver and supported ROS distributions. It is not used for this
+Ethernet `WujiHand2` setup.
 
-This computer uses ROS 2 Jazzy and Python 3.12. Install the Wuji SDK into the
-same Python environment used to launch the node:
+## Requirements
+
+- Linux x86_64 or aarch64
+- Python 3.12 in this repository's `lerobot` environment
+- `wuji-sdk==2026.8.3` and NumPy
+- right glove and right hand on the same Ethernet LAN as the computer
+- computer address `192.168.1.10/24`, right glove `192.168.1.101`, and right
+  hand `192.168.1.111` for the current hardware setup
+
+Install the Python dependencies if needed:
 
 ```bash
-cd ~/real-exp
+cd /home/pair1/real-exp
 python3 -m pip install -r data_collection/wuji/requirements.txt
-source /opt/ros/jazzy/setup.bash
-source ~/franka_ros2_ws/install/setup.bash
-source ~/real-exp/gello_software/ros2/install/setup.bash
-python3 data_collection/wuji/teleop.py --namespace left
 ```
 
-The Jazzy setup must be sourced before running so Python can import `rclpy`,
-`sensor_msgs`, and `std_msgs`. Do not install `rclpy` with pip. The ROS package
-provided under `/opt/ros/jazzy` must match the active Python ABI.
+No ROS installation, ROS node, or ROS topic is required.
 
-Verify passive glove discovery before starting any FR3 controller:
+## 1. Passive glove verification
+
+Start the browser visualizer before enabling the robotic hand:
 
 ```bash
-python3 - <<'PY'
-from wuji_sdk import DeviceType, SdkManager
-
-for device in SdkManager.instance().scan():
-    print(device.sn, device.device_type, device.address)
-PY
+python3 data_collection/wuji/visualize.py
 ```
 
-If more than one glove is discovered, select one with
-`--device-id <serial-number>`. The glove and this computer must be on the same
-subnet for UDP discovery, and the firewall must permit the Wuji SDK's discovery
-and data traffic. See the [Wuji glove documentation](https://docs.wuji.tech/docs/en/wuji-glove/latest/)
-for device network configuration and calibration.
+Open `http://127.0.0.1:8765`. It displays the live 21-landmark glove skeleton
+and the 20 retargeted Wuji Hand 2 joint commands. The visualizer connects only
+to the glove; it does not connect to, enable, or command the robotic hand. Stop
+it with `Ctrl-C` before starting `teleop.py`.
 
-Being connected to the same router or Ethernet switch is not sufficient when
-the assigned IPv4 networks differ. Confirm both addresses and the selected
-route:
+## 2. Passive end-to-end verification
+
+Keep the hand disabled and run:
 
 ```bash
-ip -br -4 address
-ip route get <glove-ip>
+python3 data_collection/wuji/teleop.py --dry-run --duration 10
 ```
 
-For example, a host at `192.168.50.13/23` and a glove at
-`192.168.1.101/24` are in different subnets. Configure the glove with an unused
-address in `192.168.50.0/23` (preferred when that is the router LAN), configure
-inter-subnet routing on the router, or add an appropriate secondary address to
-the Ethernet interface. Also make sure a VPN route does not capture the glove
-address; `ip route get` must show the physical Ethernet interface.
+This connects to both devices and checks discovery, handedness, all 20 joints,
+glove frames, retargeting, tuning, and diagnostics. It never creates a command
+publisher and never calls `hand.enable()`. In dry-run mode, diagnostics are
+reported for the full duration instead of triggering the live-enable interlock.
+The output also separates host Ethernet E2E loss from each hand joint's internal
+bus response rate and timeout counters. `command_delta_from_hand_start` is the
+intentional difference between the glove target and the disabled physical-hand
+pose; use `raw_target_speed_p95` and `raw_target_speed_max` to assess stationary
+glove/retargeting jitter.
 
-The default mapping assumes the same joint sign convention as the calibrated
-GELLO setup. Override it at launch when the glove is worn on the opposite hand
-or mounted differently, for example:
+Do not continue if the output contains `Enc1BitRate`, `BusFrameLossHigh`, an
+unknown error, an offline joint, or another hand diagnostic. `Enc1BitRate`
+points to encoder/magnet signal quality; `BusFrameLossHigh` points to the hand's
+internal bus or wiring. They are not caused by the host-side velocity limiter.
+
+## 3. Stationary actuator test
+
+Only after the passive check is clean, clear the workspace and run a five-second
+fixed-pose hold:
 
 ```bash
-python3 data_collection/wuji/teleop.py --namespace right \
-  --joint-signs 1 1 1 1 1 1 1 \
-  --joint-offsets 0 0 0 0 0 0 0
+python3 data_collection/wuji/teleop.py --hold-only --duration 5
 ```
 
-Start the normal FR3 controller for the selected namespace before running this
-node (the node intentionally only replaces the GELLO publisher). The existing
-`scripts/start_teleoperation.sh` remains the GELLO-specific launcher.
+After the typed confirmation, this applies Wuji's official Hand 2 teleoperation
+settings (`effort_limit=1.5 A`, `kp=3.0`, `kd=0.05`), enables the hand, and
+repeatedly sends only the measured starting pose at 120 Hz. It does not follow
+the glove. The process disables the hand if any joint moves more than 0.05 rad
+or a diagnostic appears.
 
-`hand_joint_angles` describes finger articulation, whereas the FR3 controller
-expects seven arm joints. The default indices are only a transport smoke-test
-mapping. Before enabling a physical FR3, explicitly calibrate and validate
-`--joint-indices`, `--joint-signs`, `--joint-offsets`, `--joint-min`, and
-`--joint-max` for the intended glove-to-arm convention. Test the resulting ROS
-topic while the robot controller is stopped:
+If the hand shakes during this fixed-pose test, the glove, retargeting, and speed
+limit are excluded from the command path. Disable power and investigate the
+reported encoder/internal-bus condition with Wuji support before continuing.
+
+## 4. Live teleoperation
+
+Clear the hand workspace, keep an emergency-stop method within reach, and run:
 
 ```bash
-ros2 topic echo /left/gello/joint_states
+python3 data_collection/wuji/teleop.py
 ```
 
-For two gloves, run one process per namespace (`left` and `right`) and set a
-different `--device-id` if the SDK supports device selection. Keep the robot
-in a safe pose while starting; the node holds the first received target and
-applies a per-cycle step limit. `Ctrl-C` closes the SDK device cleanly.
+The program prints both serial numbers and requires the exact confirmation
+`ENABLE RIGHT HAND`. It first performs a three-second stationary hold check and
+only then follows the glove. Press `Ctrl-C` to stop. On normal exit, input
+timeout, invalid tracking, a reported diagnostic, `SIGTERM`, or `SIGHUP`, it
+disables the hand, closes every stream, disconnects both devices, and restores
+the previously selected SDK user.
 
-Use `--stdin` to test the mapping without hardware. Each input line is seven
-space-separated joint angles followed by a normalized gripper value.
+For supervised non-interactive launch, confirmation can be bypassed explicitly:
+
+```bash
+python3 data_collection/wuji/teleop.py --yes
+```
+
+Do not use `--yes` until interactive operation has been validated.
+
+## Safety behavior
+
+- Requires exactly one selected Wuji Glove and one Wuji Hand 2.
+- Requires both devices to report right handedness.
+- Requires all 20 hand joints online and refuses to enable on active diagnostic
+  warnings, unknown errors, or stop-severity faults.
+- Rejects malformed, non-finite, degenerate, reordered, or low-confidence
+  glove skeleton frames.
+- Applies the official Hand 2 settings: 1.5 A effort limit, MIT `kp=3.0`, and
+  MIT `kd=0.05`, and verifies the device accepted them before enabling.
+- Streams at the official example's 120 Hz rate.
+- Holds the measured pose before allowing glove targets, then starts command
+  filtering from the latest measured pose to prevent an initial jump.
+- Limits each joint to `1.0 rad/s` by default.
+- Stops after `0.25 s` without a valid new glove frame.
+- Sends zero velocity and zero feed-forward effort with each position command.
+- Disables the hand in cleanup after any handled stop or runtime exception.
+
+The safety thresholds can be made more conservative at launch. Raising them
+should be treated as a hardware-risk decision, not routine configuration:
+
+```bash
+python3 data_collection/wuji/teleop.py \
+  --max-velocity-rad-s 0.3 \
+  --min-confidence 0.35 \
+  --frame-timeout 0.20
+```
+
+`--allow-diagnostic-warnings` exists only to isolate a fault under Wuji's
+direction. It bypasses the pre-enable interlock and must not be used for normal
+teleoperation.
+
+When multiple devices are present, select the intended pair by serial number:
+
+```bash
+python3 data_collection/wuji/teleop.py \
+  --glove-id WG1KA06260623515 \
+  --hand-id WH2KA01260730039
+```

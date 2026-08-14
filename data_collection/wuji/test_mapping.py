@@ -3,23 +3,31 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from .mapping import WujiJointMapper
+from .mapping import WujiHandCommandLimiter
 
 
-def test_mapping_applies_signs_offsets_and_rate_limit() -> None:
-    mapper = WujiJointMapper(joint_offsets=[1] * 7, max_step_rad=0.25)
-    np.testing.assert_allclose(mapper.map([0] * 7), [1] * 7)
-    np.testing.assert_allclose(mapper.map([1] * 7), [1.25, 0.75, 1.25, 1.25, 1.25, 0.75, 1.25])
+def test_hand_command_limiter_starts_at_actual_position_and_limits_each_step() -> None:
+    limiter = WujiHandCommandLimiter(
+        [0.0] * 20, max_velocity_rad_s=1.0, rate_hz=50.0
+    )
+    np.testing.assert_allclose(limiter.limit([1.0] * 20), [0.02] * 20)
+    np.testing.assert_allclose(limiter.limit([-1.0] * 20), [0.0] * 20)
 
 
-def test_mapping_rejects_short_or_nonfinite_samples() -> None:
-    mapper = WujiJointMapper()
+@pytest.mark.parametrize(
+    "initial, velocity, rate",
+    [([0.0] * 19, 1.0, 50.0), ([0.0] * 20, 0.0, 50.0), ([0.0] * 20, 1.0, 0.0)],
+)
+def test_hand_command_limiter_rejects_invalid_configuration(initial, velocity, rate) -> None:
     with pytest.raises(ValueError):
-        mapper.map([0] * 6)
+        WujiHandCommandLimiter(initial, max_velocity_rad_s=velocity, rate_hz=rate)
+
+
+def test_hand_command_limiter_rejects_invalid_target() -> None:
+    limiter = WujiHandCommandLimiter(
+        [0.0] * 20, max_velocity_rad_s=1.0, rate_hz=50.0
+    )
     with pytest.raises(ValueError):
-        mapper.map([0, 0, 0, 0, 0, 0, float("nan")])
-
-
-def test_gripper_is_normalized() -> None:
-    assert WujiJointMapper.gripper(-1) == 0.0
-    assert WujiJointMapper.gripper(2) == 1.0
+        limiter.limit([0.0] * 19)
+    with pytest.raises(ValueError):
+        limiter.limit([0.0] * 19 + [float("nan")])

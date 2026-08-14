@@ -1,5 +1,5 @@
-"""Wuji glove teleoperation for the real-exp data-collection stack."""
+"""Python SDK teleoperation from Wuji Glove to Wuji Hand 2."""
 
-from .mapping import GloveSample, WujiJointMapper
+from .mapping import WujiHandCommandLimiter
 
-__all__ = ["GloveSample", "WujiJointMapper"]
+__all__ = ["WujiHandCommandLimiter"]

@@ -216,4 +216,3 @@ class QuinticJointTrajectory:
                 return
             duration *= 1.25
         raise RuntimeError("Could not construct a quintic trajectory within configured limits.")
-

@@ -50,17 +50,17 @@ FR3_POSITION_MARGIN_RAD = 0.05
 FR3_SAFE_POSITION_LOWER_RAD = FR3_LEGACY_POSITION_LOWER_RAD + FR3_POSITION_MARGIN_RAD
 FR3_SAFE_POSITION_UPPER_RAD = FR3_LEGACY_POSITION_UPPER_RAD - FR3_POSITION_MARGIN_RAD
 
-# Apply the selected operational speed factor to the local MotionGenerator's
-# base velocity limits. Acceleration is selected independently.
+# Apply conservative operational limits to position targets before they reach
+# the deployment controller.
 FR3_CONTROLLER_BASE_MAX_VELOCITY_RAD_S = np.array(
     [2.0, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5],
     dtype=np.float64,
 )
-FR3_SAFE_SPEED_FACTOR = 0.8
+FR3_SAFE_SPEED_FACTOR = 0.3
 FR3_SAFE_MAX_VELOCITY_RAD_S = (
     FR3_CONTROLLER_BASE_MAX_VELOCITY_RAD_S * FR3_SAFE_SPEED_FACTOR
 )
-FR3_SAFE_VELOCITY_FACTOR = 0.8
+FR3_SAFE_VELOCITY_FACTOR = 0.2
 FR3_SAFE_MAX_ACCELERATION_RAD_S2 =  (
     FR3_HARD_MAX_ACCELERATION_RAD_S2 * FR3_SAFE_VELOCITY_FACTOR
 )
@@ -284,13 +284,11 @@ class JointPositionLimiter:
             FR3_SAFE_MAX_VELOCITY_RAD_S,
         )
 
-        # Reserve enough distance to decelerate before reaching either position bound.
-        distance_to_upper = np.maximum(
-            FR3_SAFE_POSITION_UPPER_RAD - self._position, 0.0
-        )
-        distance_to_lower = np.maximum(
-            self._position - FR3_SAFE_POSITION_LOWER_RAD, 0.0
-        )
+        # Reserve enough distance to decelerate before the requested target.
+        # The target has already been clipped to the position envelope, so this
+        # also keeps a motion toward it inside the hardware-safe bounds.
+        distance_to_upper = np.maximum(bounded_target - self._position, 0.0)
+        distance_to_lower = np.maximum(self._position - bounded_target, 0.0)
         acceleration = FR3_SAFE_MAX_ACCELERATION_RAD_S2
         upper_braking_velocity = -acceleration * dt + np.sqrt(
             np.square(acceleration * dt) + 2.0 * acceleration * distance_to_upper

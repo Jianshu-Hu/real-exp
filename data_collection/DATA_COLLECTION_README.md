@@ -45,7 +45,11 @@ source ~/real-exp/gello_software/ros2/install/setup.bash
 ros2 launch franka_gello_state_publisher main.launch.py \
 config_file:=gello_duo.yaml
 
-# read states
+# Raw 15 Hz waypoints recorded as dataset actions
+ros2 topic echo /left/gello/raw_joint_states
+ros2 topic echo /right/gello/raw_joint_states
+
+# Quintic references consumed by the impedance controllers
 ros2 topic echo /left/gello/joint_states
 ros2 topic echo /right/gello/joint_states
 ```
@@ -162,7 +166,8 @@ With `--dry-run`, the supervisor skips all ROS and robot startup and only
 prints the episode summary. During a normal replay, it waits for each gripper
 client's command subscription before starting the replay process. The replay
 process then advertises `/left/gello/joint_states` and `/right/gello/joint_states`
-while it waits for you to press `s`.
+while it waits for you to press `s`. Replay actions are already sampled dataset
+targets, so these topics remain the controller-reference inputs during replay.
 
 The supervisor preserves the terminal for this prompt even though the ROS
 launches run in separate process groups. Press `s` and Enter to begin, or `q`

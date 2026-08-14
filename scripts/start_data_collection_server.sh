@@ -186,9 +186,17 @@ start_process "LeRobot data bridge" \
   "publish_host:=${bridge_host}" "publish_port:=${bridge_port}" \
   "include_gripper:=$([[ "${gripper_mode}" == "gripper" ]] && echo true || echo false)"
 
-required_bridge_topics=("/left/joint_states" "/left/gello/joint_states")
+required_bridge_topics=(
+  "/left/joint_states"
+  "/left/gello/raw_joint_states"
+  "/left/gello/joint_states"
+)
 if [[ "${arm_mode}" == "duo" ]]; then
-  required_bridge_topics+=("/right/joint_states" "/right/gello/joint_states")
+  required_bridge_topics+=(
+    "/right/joint_states"
+    "/right/gello/raw_joint_states"
+    "/right/gello/joint_states"
+  )
 fi
 for topic in "${required_bridge_topics[@]}"; do
   if ! timeout 10s ros2 topic echo \

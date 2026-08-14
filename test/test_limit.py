@@ -7,6 +7,7 @@ from utils.limit import (
     FR3_SAFE_MAX_VELOCITY_RAD_S,
     FR3_SAFE_POSITION_LOWER_RAD,
     FR3_SAFE_POSITION_UPPER_RAD,
+    JointPositionLimiter,
     validate_joint_trajectory,
 )
 
@@ -70,3 +71,75 @@ def test_trajectory_reports_bad_timing_separately_from_joint_limits() -> None:
     assert counts.non_finite_indices == ()
     assert counts.velocity_indices == ()
     assert counts.acceleration_indices == ()
+
+
+def test_position_limiter_brakes_at_a_constant_target_without_overshoot() -> None:
+    dt = 1.0 / 15.0
+    initial = safe_midpoint()
+    target = initial.copy()
+    target[0] += 0.02
+    limiter = JointPositionLimiter(max_dt=2.0 * dt)
+    limiter.reset(initial, 0.0)
+
+    positions = [initial[0]]
+    velocities = [0.0]
+    for step in range(1, 31):
+        result = limiter.filter(target, step * dt)
+        positions.append(result.position[0])
+        velocities.append(result.velocity[0])
+
+    position_steps = np.diff(positions)
+    accelerations = np.diff(velocities) / dt
+    assert np.all(position_steps >= -1e-12)
+    assert np.all(np.asarray(positions) <= target[0] + 1e-12)
+    assert positions[-1] == target[0]
+    assert velocities[-1] == 0.0
+    assert np.max(np.abs(np.asarray(velocities))) <= (
+        FR3_SAFE_MAX_VELOCITY_RAD_S[0] + 1e-12
+    )
+    assert np.max(np.abs(accelerations)) <= (
+        FR3_SAFE_MAX_ACCELERATION_RAD_S2[0] + 1e-10
+    )
+
+
+def test_position_limiter_large_timestamp_gap_does_not_pass_small_step() -> None:
+    dt = 1.0 / 15.0
+    initial = safe_midpoint()
+    target = initial.copy()
+    target[0] += 0.02
+    limiter = JointPositionLimiter(max_dt=2.0 * dt)
+    limiter.reset(initial, 0.0)
+
+    result = limiter.filter(target, 10.0)
+
+    assert initial[0] < result.position[0] < target[0]
+    assert result.velocity[0] <= FR3_SAFE_MAX_VELOCITY_RAD_S[0] + 1e-12
+    assert result.velocity[0] <= (
+        FR3_SAFE_MAX_ACCELERATION_RAD_S2[0] * limiter.max_dt + 1e-12
+    )
+
+
+def test_position_limiter_bounds_motion_when_target_reverses() -> None:
+    dt = 1.0 / 15.0
+    initial = safe_midpoint()
+    forward_target = initial.copy()
+    forward_target[0] += 0.5
+    reverse_target = initial.copy()
+    reverse_target[0] -= 0.5
+    limiter = JointPositionLimiter(max_dt=2.0 * dt)
+    limiter.reset(initial, 0.0)
+
+    results = []
+    for step in range(1, 6):
+        results.append(limiter.filter(forward_target, step * dt))
+    for step in range(6, 21):
+        results.append(limiter.filter(reverse_target, step * dt))
+
+    velocities = np.asarray([0.0, *(result.velocity[0] for result in results)])
+    accelerations = np.diff(velocities) / dt
+    assert np.max(np.abs(velocities)) <= FR3_SAFE_MAX_VELOCITY_RAD_S[0] + 1e-12
+    assert np.max(np.abs(accelerations)) <= (
+        FR3_SAFE_MAX_ACCELERATION_RAD_S2[0] + 1e-10
+    )
+    assert velocities[5] > 0.0
+    assert np.any(velocities[6:] < 0.0)

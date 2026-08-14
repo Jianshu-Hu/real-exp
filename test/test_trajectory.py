@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from utils.trajectory import _polynomial_extrema
 from utils.limit import (
     FR3_SAFE_MAX_ACCELERATION_RAD_S2,
     FR3_SAFE_MAX_VELOCITY_RAD_S,
@@ -9,6 +10,24 @@ from utils.limit import (
     FR3_SAFE_POSITION_UPPER_RAD,
 )
 from utils.trajectory import QuinticJointTrajectory
+
+
+def test_polynomial_extrema_uses_derivative_roots() -> None:
+    """Acceleration can peak where acceleration itself is nonzero.
+
+    For q(t) = t^4 - 2t^3 on [0, 1], acceleration is
+    ``12t² - 12t`` and reaches |a| = 3 at t = 0.5, where jerk is zero.
+    Looking for roots of acceleration would only inspect the endpoints and
+    miss this interior peak.
+    """
+    coefficients = np.tile(
+        np.array([0.0, 0.0, 0.0, -2.0, 1.0, 0.0]),
+        (7, 1),
+    )
+    peak_velocity, peak_acceleration = _polynomial_extrema(coefficients, 1.0)
+
+    np.testing.assert_allclose(peak_velocity, 2.0, atol=1e-12)
+    np.testing.assert_allclose(peak_acceleration, 3.0, atol=1e-12)
 
 
 def midpoint() -> np.ndarray:

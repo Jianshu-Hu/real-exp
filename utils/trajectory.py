@@ -69,8 +69,42 @@ def _quintic_coefficients(
     return coefficients
 
 
+def _roots_in_interval(
+    coefficients: np.ndarray,
+    duration: float,
+    *,
+    tolerance: float = 1e-12,
+) -> list[float]:
+    """Return real roots of a low-order polynomial in ``(0, duration)``.
+
+    Coefficients are in ascending order (constant term first).  Trimming
+    leading zero coefficients is important for degenerate velocity,
+    acceleration, or jerk polynomials because ``numpy.roots`` otherwise
+    emits spurious warnings or treats the polynomial as having a higher
+    degree than it really does.
+    """
+    polynomial = np.asarray(coefficients, dtype=np.float64)
+    while polynomial.size > 1 and abs(polynomial[-1]) <= tolerance:
+        polynomial = polynomial[:-1]
+    if polynomial.size <= 1:
+        return []
+    roots = np.roots(polynomial[::-1])
+    return [
+        float(root.real)
+        for root in roots
+        if abs(root.imag) < 1e-8 and tolerance < root.real < duration - tolerance
+    ]
+
+
 def _polynomial_extrema(coefficients: np.ndarray, duration: float) -> tuple[np.ndarray, np.ndarray]:
-    """Return exact sampled maxima of |velocity| and |acceleration|."""
+    """Return exact maxima of |velocity| and |acceleration|.
+
+    Extrema of velocity occur where acceleration is zero.  Extrema of
+    acceleration occur where jerk (the derivative of acceleration) is zero.
+    The previous implementation found roots of velocity and acceleration
+    themselves, which can miss the true peaks and eventually make replanning
+    impossible after an unsafe segment has been accepted.
+    """
     max_velocity = np.zeros(FR3_JOINT_COUNT, dtype=np.float64)
     max_acceleration = np.zeros(FR3_JOINT_COUNT, dtype=np.float64)
     for joint in range(FR3_JOINT_COUNT):
@@ -79,18 +113,15 @@ def _polynomial_extrema(coefficients: np.ndarray, duration: float) -> tuple[np.n
         acceleration_coefficients = np.array(
             [2.0 * c[2], 6.0 * c[3], 12.0 * c[4], 20.0 * c[5]]
         )
-        velocity_roots = np.roots(velocity_coefficients[::-1])
-        acceleration_roots = np.roots(acceleration_coefficients[::-1])
-        velocity_times = [0.0, duration] + [
-            float(root.real)
-            for root in velocity_roots
-            if abs(root.imag) < 1e-8 and 0.0 < root.real < duration
-        ]
-        acceleration_times = [0.0, duration] + [
-            float(root.real)
-            for root in acceleration_roots
-            if abs(root.imag) < 1e-8 and 0.0 < root.real < duration
-        ]
+        jerk_coefficients = np.array(
+            [6.0 * c[3], 24.0 * c[4], 60.0 * c[5]]
+        )
+        velocity_times = [0.0, duration] + _roots_in_interval(
+            acceleration_coefficients, duration
+        )
+        acceleration_times = [0.0, duration] + _roots_in_interval(
+            jerk_coefficients, duration
+        )
         velocity_values = np.polyval(velocity_coefficients[::-1], velocity_times)
         acceleration_values = np.polyval(acceleration_coefficients[::-1], acceleration_times)
         max_velocity[joint] = np.max(np.abs(velocity_values))
@@ -215,4 +246,8 @@ class QuinticJointTrajectory:
                 self._duration_s = duration
                 return
             duration *= 1.25
-        raise RuntimeError("Could not construct a quintic trajectory within configured limits.")
+        raise RuntimeError(
+            "Could not construct a quintic trajectory within configured limits "
+            f"(velocity peak ratio={float(np.max(peak_velocity / self.max_velocity)):.3f}, "
+            f"acceleration peak ratio={float(np.max(peak_acceleration / self.max_acceleration)):.3f})."
+        )

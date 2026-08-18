@@ -183,8 +183,9 @@ intentionally need to begin without those samples, pass
 ## Teleoperation Quick Start
 
 Run the teleoperation supervisor from the repository root. It sources the ROS 2
-and Franka workspaces, validates the required GELLO USB aliases, starts the GELLO
-publisher and matching FR3 controller, and optionally starts gripper control.
+and Franka workspaces, validates the required GELLO USB aliases, starts and
+verifies the matching FR3 controller before starting GELLO (the controller owns
+the accepted-target topic), and optionally starts gripper control.
 
 Dual-arm teleoperation with gripper control:
 
@@ -403,8 +404,20 @@ The validator checks:
 - per-episode `length` against state/action row counts
 - per-episode `frame_index` and timestamp continuity
 - `observation.state` and `action` dimensions against `info.json`
+- measured arm-state and accepted action-target position validity
+- approximate measured-state motion from 15 Hz position finite differences
+- accepted-waypoint slew as a command-distribution diagnostic
 - video timestamp ranges against episode lengths
 - physical MP4 frame counts when OpenCV is available
+
+For `absolute_joint_position` datasets, consecutive actions are accepted 15 Hz
+waypoints, not samples of the constrained controller reference. Their finite
+differences therefore do not validate physical velocity or acceleration. The
+validator reports them as waypoint-slew diagnostics. The robot-side controller
+generates the constrained reference internally at 1 kHz. Measured-state motion
+warnings are also approximate because the dataset contains 15 Hz positions,
+not the controller's analytic reference derivatives or the robot's full-rate
+velocity signal.
 
 If `processed` is missing, false, or not the JSON boolean `true`, validation
 prints a warning before the dataset summary and continues with the remaining

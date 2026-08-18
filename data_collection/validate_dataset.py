@@ -340,26 +340,77 @@ def check_state_action_semantics(
     return issues, metrics
 
 
-def format_joint_safety_warning(
+def format_sampled_state_warning(
     arm_name: str,
-    trajectory_name: str,
     counts: TrajectoryViolationCounts,
     frame_indices: list[int],
+    *,
+    motion: bool,
 ) -> str:
-    """Format per-constraint counts and episode frame indices for one arm."""
+    """Format state validity or sampled finite-difference motion warnings."""
 
     def episode_frames(offsets: tuple[int, ...]) -> str:
         return format_indices([frame_indices[offset] for offset in offsets])
 
+    if motion:
+        warning_indices = tuple(
+            sorted(set(counts.velocity_indices) | set(counts.acceleration_indices))
+        )
+        return (
+            f"{arm_name} sampled state motion warnings: "
+            f"total={len(warning_indices)} frames=[{episode_frames(warning_indices)}], "
+            f"velocity={counts.velocity_steps} "
+            f"frames=[{episode_frames(counts.velocity_indices)}], "
+            f"acceleration={counts.acceleration_steps} "
+            f"frames=[{episode_frames(counts.acceleration_indices)}]"
+        )
+
+    validity_indices = tuple(
+        sorted(
+            set(counts.non_finite_indices)
+            | set(counts.timing_indices)
+            | set(counts.position_indices)
+        )
+    )
     return (
-        f"{arm_name} {trajectory_name} safety violations: "
-        f"total={counts.any_steps} frames=[{episode_frames(counts.any_indices)}], "
+        f"{arm_name} measured-state validity violations: "
+        f"total={len(validity_indices)} frames=[{episode_frames(validity_indices)}], "
         f"position={counts.position_steps} "
         f"frames=[{episode_frames(counts.position_indices)}], "
-        f"velocity={counts.velocity_steps} "
-        f"frames=[{episode_frames(counts.velocity_indices)}], "
-        f"acceleration={counts.acceleration_steps} "
-        f"frames=[{episode_frames(counts.acceleration_indices)}], "
+        f"non_finite={counts.non_finite_steps} "
+        f"frames=[{episode_frames(counts.non_finite_indices)}], "
+        f"timing={counts.timing_steps} "
+        f"frames=[{episode_frames(counts.timing_indices)}]"
+    )
+
+
+def format_accepted_target_warning(
+    arm_name: str,
+    counts: TrajectoryViolationCounts,
+    frame_indices: list[int],
+) -> str:
+    """Format validity violations for accepted low-rate joint waypoints.
+
+    Velocity and acceleration are deliberately omitted. Consecutive accepted
+    targets are waypoints for the robot-side trajectory generator, not samples
+    of the generated controller reference.
+    """
+
+    def episode_frames(offsets: tuple[int, ...]) -> str:
+        return format_indices([frame_indices[offset] for offset in offsets])
+
+    target_indices = tuple(
+        sorted(
+            set(counts.non_finite_indices)
+            | set(counts.timing_indices)
+            | set(counts.position_indices)
+        )
+    )
+    return (
+        f"{arm_name} accepted action-target validity violations: "
+        f"total={len(target_indices)} frames=[{episode_frames(target_indices)}], "
+        f"position={counts.position_steps} "
+        f"frames=[{episode_frames(counts.position_indices)}], "
         f"non_finite={counts.non_finite_steps} "
         f"frames=[{episode_frames(counts.non_finite_indices)}], "
         f"timing={counts.timing_steps} "
@@ -371,9 +422,24 @@ def check_joint_safety_constraints(
     rows: list[dict[str, Any]],
     arm_action_representation: str,
 ) -> tuple[list[str], list[str], dict[str, int]]:
-    """Validate state and absolute action trajectories against shared FR3 limits."""
+    """Validate measured states and accepted action targets.
+
+    Measured states are sampled trajectories, so their finite differences are
+    useful (but approximate) motion diagnostics. Absolute actions are accepted
+    low-rate waypoints. Their finite differences are *not* the velocity or
+    acceleration of the 1 kHz reference generated inside the robot controller.
+    For actions, only finite values, timestamps, and the position envelope are
+    safety-validity checks; waypoint derivatives are reported separately as a
+    slew diagnostic.
+    """
+    empty_metrics = {
+        "state_violation_steps": 0,
+        "state_motion_warning_steps": 0,
+        "action_violation_steps": 0,
+        "action_waypoint_slew_steps": 0,
+    }
     if not rows:
-        return [], [], {"state_violation_steps": 0, "action_violation_steps": 0}
+        return [], [], empty_metrics.copy()
 
     sorted_rows = sorted(rows, key=lambda row: int(row["frame_index"]))
     states = [flatten_numeric(row.get("observation.state")) for row in sorted_rows]
@@ -384,7 +450,7 @@ def check_joint_safety_constraints(
     )
     issues: list[str] = []
     warnings: list[str] = []
-    metrics = {"state_violation_steps": 0, "action_violation_steps": 0}
+    metrics = empty_metrics.copy()
 
     if not states or any(len(state) != len(states[0]) for state in states):
         return [
@@ -413,14 +479,33 @@ def check_joint_safety_constraints(
     for arm_name in shared_arms:
         state_trajectory = state_array[:, state_layout[arm_name]]
         state_counts = validate_joint_trajectory(state_trajectory, timestamps)
-        metrics["state_violation_steps"] += state_counts.any_steps
-        if state_counts.any:
+        state_validity_indices = (
+            set(state_counts.non_finite_indices)
+            | set(state_counts.timing_indices)
+            | set(state_counts.position_indices)
+        )
+        state_motion_indices = (
+            set(state_counts.velocity_indices)
+            | set(state_counts.acceleration_indices)
+        )
+        metrics["state_violation_steps"] += len(state_validity_indices)
+        metrics["state_motion_warning_steps"] += len(state_motion_indices)
+        if state_validity_indices:
             warnings.append(
-                format_joint_safety_warning(
+                format_sampled_state_warning(
                     arm_name,
-                    "state",
                     state_counts,
                     frame_indices,
+                    motion=False,
+                )
+            )
+        if state_motion_indices:
+            warnings.append(
+                format_sampled_state_warning(
+                    arm_name,
+                    state_counts,
+                    frame_indices,
+                    motion=True,
                 )
             )
 
@@ -435,12 +520,21 @@ def check_joint_safety_constraints(
             continue
 
         action_counts = validate_joint_trajectory(action_trajectory, timestamps)
-        metrics["action_violation_steps"] += action_counts.any_steps
-        if action_counts.any:
+        target_violation_indices = (
+            set(action_counts.non_finite_indices)
+            | set(action_counts.timing_indices)
+            | set(action_counts.position_indices)
+        )
+        waypoint_slew_indices = (
+            set(action_counts.velocity_indices)
+            | set(action_counts.acceleration_indices)
+        )
+        metrics["action_violation_steps"] += len(target_violation_indices)
+        metrics["action_waypoint_slew_steps"] += len(waypoint_slew_indices)
+        if target_violation_indices:
             warnings.append(
-                format_joint_safety_warning(
+                format_accepted_target_warning(
                     arm_name,
-                    "action",
                     action_counts,
                     frame_indices,
                 )
@@ -587,7 +681,9 @@ def validate_dataset(
     total_gripper_outlier_frames = 0
     total_non_finite_frames = 0
     total_state_safety_violation_steps = 0
+    total_state_motion_warning_steps = 0
     total_action_safety_violation_steps = 0
+    total_action_waypoint_slew_steps = 0
 
     if verbose:
         print("\nEpisodes")
@@ -698,7 +794,9 @@ def validate_dataset(
         )
         episode_issues.extend(safety_issues)
         total_state_safety_violation_steps += safety_metrics["state_violation_steps"]
+        total_state_motion_warning_steps += safety_metrics["state_motion_warning_steps"]
         total_action_safety_violation_steps += safety_metrics["action_violation_steps"]
+        total_action_waypoint_slew_steps += safety_metrics["action_waypoint_slew_steps"]
         warning_issues.extend(
             f"episode {episode_index}: {warning}" for warning in safety_warnings
         )
@@ -741,8 +839,26 @@ def validate_dataset(
         print("  delta-action consistency check: skipped for absolute_joint_position actions")
 
     print("\nJoint safety checks")
-    print(f"  state violation steps: {total_state_safety_violation_steps}")
-    print(f"  action violation steps: {total_action_safety_violation_steps}")
+    print(
+        "  measured-state validity violation steps: "
+        f"{total_state_safety_violation_steps}"
+    )
+    print(
+        "  sampled measured-state motion warning steps: "
+        f"{total_state_motion_warning_steps}"
+    )
+    print(
+        "  accepted action-target validity violation steps: "
+        f"{total_action_safety_violation_steps}"
+    )
+    print(
+        "  accepted waypoint slew diagnostic steps: "
+        f"{total_action_waypoint_slew_steps}"
+    )
+    print(
+        "  note: waypoint slew is not controller-reference velocity/acceleration; "
+        "the constrained reference is generated internally at 1 kHz"
+    )
 
     if not skip_video_frames and video_keys:
         print("\nPhysical video checks")

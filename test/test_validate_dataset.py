@@ -39,16 +39,20 @@ def test_dataset_warning_reports_violation_frame_indices() -> None:
     )
 
     assert issues == []
-    assert len(warnings) == 1
-    assert warnings[0].startswith("left state safety violations:")
+    assert len(warnings) == 2
+    assert warnings[0].startswith("left measured-state validity violations:")
     assert "position=1 frames=[12]" in warnings[0]
-    assert "velocity=2 frames=[12, 13]" in warnings[0]
-    assert "acceleration=2 frames=[12, 13]" in warnings[0]
-    assert metrics["state_violation_steps"] == 2
+    assert any(
+        warning.startswith("left sampled state motion warnings:")
+        for warning in warnings
+    )
+    assert metrics["state_violation_steps"] == 1
+    assert metrics["state_motion_warning_steps"] == 2
     assert metrics["action_violation_steps"] == 0
+    assert metrics["action_waypoint_slew_steps"] == 0
 
 
-def test_dataset_checks_absolute_action_at_each_timestep() -> None:
+def test_dataset_treats_absolute_action_derivatives_as_waypoint_slew() -> None:
     midpoint = 0.5 * (FR3_SAFE_POSITION_LOWER_RAD + FR3_SAFE_POSITION_UPPER_RAD)
     states = [dual_arm_vector(midpoint, midpoint) for _ in range(4)]
     actions = [dual_arm_vector(midpoint, midpoint) for _ in range(4)]
@@ -71,10 +75,38 @@ def test_dataset_checks_absolute_action_at_each_timestep() -> None:
     )
 
     assert issues == []
-    assert len(warnings) == 1
-    assert warnings[0].startswith("left action safety violations:")
-    assert "position=0 frames=[none]" in warnings[0]
-    assert "velocity=2 frames=[1, 2]" in warnings[0]
-    assert "acceleration=2 frames=[2, 3]" in warnings[0]
+    assert warnings == []
     assert metrics["state_violation_steps"] == 0
-    assert metrics["action_violation_steps"] == 3
+    assert metrics["action_violation_steps"] == 0
+    assert metrics["action_waypoint_slew_steps"] == 3
+
+
+def test_dataset_still_checks_accepted_action_position_envelope() -> None:
+    midpoint = 0.5 * (FR3_SAFE_POSITION_LOWER_RAD + FR3_SAFE_POSITION_UPPER_RAD)
+    states = [dual_arm_vector(midpoint, midpoint) for _ in range(3)]
+    actions = [dual_arm_vector(midpoint, midpoint) for _ in range(3)]
+    unsafe_action = midpoint.copy()
+    unsafe_action[0] = FR3_SAFE_POSITION_UPPER_RAD[0] + 0.01
+    actions[1] = dual_arm_vector(unsafe_action, midpoint)
+    rows = [
+        {
+            "frame_index": frame_index,
+            "timestamp": frame_index * 0.1,
+            "observation.state": state,
+            "action": action,
+        }
+        for frame_index, (state, action) in enumerate(zip(states, actions))
+    ]
+
+    issues, warnings, metrics = check_joint_safety_constraints(
+        rows,
+        "absolute_joint_position",
+    )
+
+    assert issues == []
+    assert len(warnings) == 1
+    assert warnings[0].startswith("left accepted action-target validity violations:")
+    assert "position=1 frames=[1]" in warnings[0]
+    assert metrics["state_violation_steps"] == 0
+    assert metrics["action_violation_steps"] == 1
+    assert metrics["action_waypoint_slew_steps"] == 2

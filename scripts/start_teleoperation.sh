@@ -311,25 +311,28 @@ echo "Teleoperation mode: ${arm_mode}; gripper: ${gripper_mode}"
 echo "Keep the GELLO arm(s) in a safe pose while the FR3 controller starts."
 
 start_process \
-  "GELLO publisher" \
-  ros2 launch franka_gello_state_publisher main.launch.py "config_file:=${gello_config}"
-gello_pid="${child_pids[0]}"
-
-for topic in "${required_topics[@]}"; do
-  wait_for_topic "${topic}" "${gello_pid}"
-done
-
-start_process \
   "FR3 controller" \
   ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py \
   "robot_config_file:=${robot_config}"
 arm_controller_pid="${child_pids[${#child_pids[@]} - 1]}"
 
-if [[ "${gripper_mode}" == "gripper" ]]; then
-  for namespace in "${arm_namespaces[@]}"; do
-    wait_for_arm_controller "${namespace}" "${arm_controller_pid}"
-  done
+# The accepted Gello target topics are published by the FR3 controllers. Start
+# and verify those controllers before starting Gello; otherwise waiting for an
+# accepted target before launching the controller creates a startup deadlock.
+for namespace in "${arm_namespaces[@]}"; do
+  wait_for_arm_controller "${namespace}" "${arm_controller_pid}"
+done
 
+start_process \
+  "GELLO publisher" \
+  ros2 launch franka_gello_state_publisher main.launch.py "config_file:=${gello_config}"
+gello_pid="${child_pids[${#child_pids[@]} - 1]}"
+
+for topic in "${required_topics[@]}"; do
+  wait_for_topic "${topic}" "${gello_pid}"
+done
+
+if [[ "${gripper_mode}" == "gripper" ]]; then
   start_process \
     "Franka-hand manager" \
     ros2 launch franka_gripper_manager franka_gripper_client.launch.py \

@@ -1,8 +1,8 @@
-"""Test a small constant joint target through the deployment bridge without a policy.
+"""Test a constant joint target through the deployment bridge without a policy.
 
 The script enters through the bridge's production ZMQ command socket. The
-bridge applies ``JointPositionLimiter`` before publishing to the unchanged
-deployment impedance controller.
+bridge generates a constrained quintic position reference before publishing
+to the unchanged deployment impedance controller.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import zmq
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SERVER_IP = os.environ.get("DEPLOYMENT_SERVER_IP", "192.168.50.13")
+MAX_DIAGNOSTIC_OFFSET_RAD = 0.1
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,8 +49,11 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.duration_s <= 0.0 or args.settle_s < 0.0 or args.fps <= 0.0:
         parser.error("duration-s and fps must be positive; settle-s must be non-negative")
-    if abs(args.offset_rad) > 0.05:
-        parser.error("For this diagnostic, --offset-rad must be within [-0.05, 0.05].")
+    if abs(args.offset_rad) > MAX_DIAGNOSTIC_OFFSET_RAD:
+        parser.error(
+            "For this diagnostic, --offset-rad must be within "
+            f"[-{MAX_DIAGNOSTIC_OFFSET_RAD}, {MAX_DIAGNOSTIC_OFFSET_RAD}]."
+        )
     return args
 
 

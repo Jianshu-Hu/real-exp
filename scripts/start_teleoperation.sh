@@ -4,6 +4,62 @@ set -euo pipefail
 # Start the GELLO publisher, FR3 controller, and optional Franka-hand manager.
 # Usage: ./scripts/start_teleoperation.sh --duo|--single --gripper|--no-gripper
 
+watchdog_mode="--internal-process-group-watchdog"
+
+process_start_time() {
+  local process_pid="$1"
+  awk '{print $22}' "/proc/${process_pid}/stat" 2>/dev/null
+}
+
+process_group_is_running() {
+  local group_pid="$1"
+  ps -o stat= --sid "${group_pid}" 2>/dev/null | grep -qv '^[[:space:]]*Z'
+}
+
+wait_for_process_group_to_stop() {
+  local group_pid="$1"
+  local attempts="$2"
+  local attempt
+
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    process_group_is_running "${group_pid}" || return 0
+    sleep 0.1
+  done
+
+  ! process_group_is_running "${group_pid}"
+}
+
+run_process_group_watchdog() {
+  local launcher_pid="$1"
+  local launcher_start_time="$2"
+  local group_pid="$3"
+  local current_start_time
+
+  while true; do
+    current_start_time="$(process_start_time "${launcher_pid}" || true)"
+    [[ -n "${current_start_time}" && "${current_start_time}" == "${launcher_start_time}" ]] || break
+    sleep 0.2
+  done
+
+  process_group_is_running "${group_pid}" || return 0
+  kill -s INT -- "-${group_pid}" 2>/dev/null || true
+  wait_for_process_group_to_stop "${group_pid}" 10 && return 0
+
+  kill -s TERM -- "-${group_pid}" 2>/dev/null || true
+  wait_for_process_group_to_stop "${group_pid}" 30 && return 0
+
+  kill -s KILL -- "-${group_pid}" 2>/dev/null || true
+}
+
+# This detached mode survives loss of the top-level launcher and cleans only the
+# process group associated with that exact launcher instance.
+if [[ "${1:-}" == "${watchdog_mode}" ]]; then
+  [[ "$#" -eq 4 ]] || exit 2
+  exec 9>&-
+  run_process_group_watchdog "$2" "$3" "$4"
+  exit 0
+fi
+
 usage() {
   cat <<'EOF'
 Usage: ./scripts/start_teleoperation.sh --duo|--single --gripper|--no-gripper
@@ -83,6 +139,13 @@ set -u
 
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
 command -v timeout >/dev/null 2>&1 || die "required command not found: timeout"
+command -v flock >/dev/null 2>&1 || die "required command not found: flock"
+command -v fuser >/dev/null 2>&1 || die "required command not found: fuser"
+
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
+launcher_lock_path="${runtime_dir}/real-exp-teleoperation-${UID}.lock"
+exec 9>"${launcher_lock_path}"
+flock -n 9 || die "another start_teleoperation.sh instance is already running"
 
 required_ports=("/dev/ttyUSB_left")
 required_topics=("/left/gello/raw_joint_states" "/left/gello/joint_states")
@@ -96,6 +159,9 @@ fi
 for port in "${required_ports[@]}"; do
   [[ -e "${port}" ]] || die "GELLO serial alias not found: ${port}. Run sudo ./scripts/setup_usb_rules.sh and reconnect the device."
   [[ -r "${port}" && -w "${port}" ]] || die "GELLO serial port is not readable and writable: ${port}. Check dialout group membership."
+  port_owners="$(fuser "${port}" 2>/dev/null || true)"
+  [[ -z "${port_owners//[[:space:]]/}" ]] || die \
+    "GELLO serial port is already in use: ${port} (PID(s):${port_owners}). Stop the existing publisher before retrying."
 done
 
 if [[ "${arm_mode}" == "duo" ]]; then
@@ -111,16 +177,27 @@ fi
 declare -a child_pids=()
 declare -A child_names=()
 shutdown_started=0
+launcher_start_time="$(process_start_time "$$")"
+[[ -n "${launcher_start_time}" ]] || die "could not determine launcher process identity"
+
+start_process_group_watchdog() {
+  local group_pid="$1"
+
+  setsid -- "${script_dir}/start_teleoperation.sh" \
+    "${watchdog_mode}" "$$" "${launcher_start_time}" "${group_pid}" \
+    </dev/null >/dev/null 2>&1 &
+}
 
 start_process() {
   local process_name="$1"
   shift
 
   echo "Starting ${process_name}: $*"
-  setsid -- bash -c 'trap - INT QUIT; exec "$@"' _ "$@" &
+  setsid -- bash -c 'exec 9>&-; trap - INT QUIT; exec "$@"' _ "$@" &
   local child_pid=$!
   child_pids+=("${child_pid}")
   child_names["${child_pid}"]="${process_name}"
+  start_process_group_watchdog "${child_pid}"
 }
 
 signal_running_groups() {

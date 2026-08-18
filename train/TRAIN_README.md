@@ -23,7 +23,8 @@ It currently:
 - Uses the local dataset at `data/pick_and_place_test` by default
 - Redirects Hugging Face cache writes into `./.hf-cache`
 - Supports `act` and `diffusion` policy types
-- Writes checkpoints and logs into `./outputs/`
+- Writes checkpoints and durable local JSONL logs into `./outputs/`
+- Saves at most 10 model checkpoints per run by default
 - Can split episodes into training and validation subsets
 - Can run periodic validation loss evaluation with `--val-freq`
 - Disables online evaluation during training, which fits this real-data workflow
@@ -90,7 +91,7 @@ Important options:
 - `--steps`: total number of optimizer steps
 - `--batch-size`: training batch size
 - `--num-workers`: dataloader worker count
-- `--save-freq`: save a checkpoint every N optimizer steps
+- `--save-freq`: optionally request a checkpoint interval; when omitted, the default is derived to target 10 checkpoints for a standard run
 - `--device`: force `cpu`, `cuda`, or `cuda:0`
 - `--resume`: resume from an existing output directory
 - `--disable-wandb`: fully disable Weights & Biases logging
@@ -129,6 +130,32 @@ Validation runs only when both conditions are true:
 If you do not pass `--val-freq`, the script uses `--save-freq`. Passing `--val-freq 0` disables validation entirely.
 
 At each validation step, the script computes validation loss on the held-out episodes and prints it to stdout. If wandb is enabled, it also logs `val_loss`.
+
+## Local Training Logs
+
+Training metrics are saved even when Weights & Biases is disabled. For a run at
+`outputs/test-limit-pick-and-place_act`, the files are:
+
+```text
+outputs/test-limit-pick-and-place_act/
+├── checkpoints/
+└── logs/
+    ├── train_metrics.jsonl
+    └── epoch_metrics.jsonl
+```
+
+`train_metrics.jsonl` stores the rolling metrics at every `--log-freq` interval,
+including loss, learning rate, timing, elapsed time, and ETA. `epoch_metrics.jsonl`
+stores the sample-weighted training loss for each dataset-sized epoch. Validation
+events are appended to both files with `"record_type": "validation"` and a
+`val_loss` field. Training rows use `"record_type": "train"`. The final epoch
+record can have `"complete": false` when training stops partway through an epoch.
+Both files are newline-delimited JSON and are appended when a run is resumed.
+
+When `--save-freq` is omitted, the checkpoint interval is computed as
+`ceil(steps / 10)`. The final step is always saved, producing exactly 10 model
+checkpoint directories for the standard 50,000-step run. An explicit
+`--save-freq` is honored as provided.
 
 ACT-specific options:
 

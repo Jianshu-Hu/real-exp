@@ -189,13 +189,13 @@ start_process "LeRobot data bridge" \
 required_bridge_topics=(
   "/left/joint_states"
   "/left/gello/raw_joint_states"
-  "/left/gello/joint_states"
+  "/left/gello/accepted_joint_states"
 )
 if [[ "${arm_mode}" == "duo" ]]; then
   required_bridge_topics+=(
     "/right/joint_states"
     "/right/gello/raw_joint_states"
-    "/right/gello/joint_states"
+    "/right/gello/accepted_joint_states"
   )
 fi
 for topic in "${required_bridge_topics[@]}"; do

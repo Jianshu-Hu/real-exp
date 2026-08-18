@@ -46,13 +46,13 @@ source ~/real-exp/gello_software/ros2/install/setup.bash
 ros2 launch franka_gello_state_publisher main.launch.py \
 config_file:=gello_duo.yaml
 
-# Raw 15 Hz waypoints recorded as dataset actions
-ros2 topic echo /left/gello/raw_joint_states
-ros2 topic echo /right/gello/raw_joint_states
+# Robot-accepted 15 Hz waypoints recorded as dataset actions
+ros2 topic echo /left/gello/accepted_joint_states
+ros2 topic echo /right/gello/accepted_joint_states
 
-# Quintic references consumed by the impedance controllers
-ros2 topic echo /left/gello/joint_states
-ros2 topic echo /right/gello/joint_states
+# The controller's generated reference is available for diagnostics here
+ros2 topic echo /left/franka/commanded_joint_states
+ros2 topic echo /right/franka/commanded_joint_states
 ```
 
 Compare the results with the joint angles reported by
@@ -166,9 +166,10 @@ bash scripts/replay.sh \
 With `--dry-run`, the supervisor skips all ROS and robot startup and only
 prints the episode summary. During a normal replay, it waits for each gripper
 client's command subscription before starting the replay process. The replay
-process then advertises `/left/gello/joint_states` and `/right/gello/joint_states`
-while it waits for you to press `s`. Replay actions are already sampled dataset
-targets, so these topics remain the controller-reference inputs during replay.
+process then advertises `/left/gello/raw_joint_states` and
+`/right/gello/raw_joint_states` while it waits for you to press `s`. Replay
+actions are sampled absolute targets; the robot-side impedance controller
+generates the constrained 1 kHz reference from them.
 
 The supervisor preserves the terminal for this prompt even though the ROS
 launches run in separate process groups. Press `s` and Enter to begin, or `q`
@@ -316,12 +317,13 @@ The dataset currently records:
 The bridge expects:
 
 - Robot joint states on a topic like `/left/franka/joint_states`
-- Arm-controller target joint states on a topic like `/left/franka/commanded_joint_states`
+- Robot-accepted 15 Hz action targets on a topic like `/left/gello/accepted_joint_states`
+- Generated controller references on a topic like `/left/franka/commanded_joint_states`
 - Robot gripper joint states on a topic like `/left/franka_gripper/joint_states`
 - Gripper commands on a topic like `/left/gripper/gripper_client/target_gripper_width_percent`
 - RGB image topics for each camera enabled by the selected bridge configuration
 
-By default the bridge publishes current measured robot joint states as `observation.state` and uses the arm-controller target topic (`/left|right/franka/commanded_joint_states`) as the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
+By default the bridge publishes current measured robot joint states as `observation.state` and uses the robot-accepted target topic (`/left|right/gello/accepted_joint_states`) as the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
 
 New datasets use continuous normalized gripper commands with
 `gripper_action_representation=absolute_width`. The recorder preserves values

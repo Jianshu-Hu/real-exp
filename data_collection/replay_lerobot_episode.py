@@ -112,8 +112,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow replay to start before all required actual arm/gripper state topics have produced a sample.",
     )
-    parser.add_argument("--left-target-topic", default="/left/gello/joint_states")
-    parser.add_argument("--right-target-topic", default="/right/gello/joint_states")
+    parser.add_argument("--left-target-topic", default="/left/gello/raw_joint_states")
+    parser.add_argument("--right-target-topic", default="/right/gello/raw_joint_states")
     parser.add_argument("--left-gripper-topic", default="/left/gripper/gripper_client/target_gripper_width_percent")
     parser.add_argument("--right-gripper-topic", default="/right/gripper/gripper_client/target_gripper_width_percent")
     parser.add_argument("--left-state-topic", default="/left/franka/joint_states")

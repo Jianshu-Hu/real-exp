@@ -148,11 +148,11 @@ exec 9>"${launcher_lock_path}"
 flock -n 9 || die "another start_teleoperation.sh instance is already running"
 
 required_ports=("/dev/ttyUSB_left")
-required_topics=("/left/gello/raw_joint_states" "/left/gello/joint_states")
+required_topics=("/left/gello/raw_joint_states" "/left/gello/accepted_joint_states")
 arm_namespaces=("left")
 if [[ "${arm_mode}" == "duo" ]]; then
   required_ports+=("/dev/ttyUSB_right")
-  required_topics+=("/right/gello/raw_joint_states" "/right/gello/joint_states")
+  required_topics+=("/right/gello/raw_joint_states" "/right/gello/accepted_joint_states")
   arm_namespaces+=("right")
 fi
 

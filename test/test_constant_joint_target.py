@@ -1,8 +1,9 @@
 """Test a constant joint target through the deployment bridge without a policy.
 
 The script enters through the bridge's production ZMQ command socket. The
-bridge generates a constrained quintic position reference before publishing
-to the unchanged deployment impedance controller.
+bridge sends one absolute waypoint per 15 Hz cycle; the robot-side controller
+generates the constrained reference at 1 kHz before applying the unchanged
+impedance torque law.
 """
 
 from __future__ import annotations

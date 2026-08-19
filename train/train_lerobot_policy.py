@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import math
 import os
@@ -83,7 +84,10 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Directory where checkpoints and logs will be written.",
+        help=(
+            "Parent directory for a new timestamped run. With --resume, this must be the "
+            "exact existing run directory containing the checkpoints."
+        ),
     )
     parser.add_argument("--steps", type=int, default=50_000, help="Number of optimizer steps.")
     parser.add_argument("--batch-size", type=int, default=128, help="Training batch size.")
@@ -247,10 +251,35 @@ def resolve_resize_pad_config(args: argparse.Namespace) -> ResizePadConfig:
     )
 
 
-def resolve_output_dir(args: argparse.Namespace) -> Path:
-    if args.output_dir is not None:
+def format_run_timestamp(now: dt.datetime) -> str:
+    """Return a filesystem-safe, chronologically sortable local run timestamp."""
+    return now.strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def resolve_output_dir(
+    args: argparse.Namespace,
+    now: dt.datetime | None = None,
+) -> Path:
+    """Resolve the concrete directory that owns one training run.
+
+    New runs live below a dataset/policy parent in a timestamped directory. A
+    resumed run must name its existing concrete directory explicitly so there is
+    no ambiguity when several timestamped runs share the same parent.
+    """
+    if args.resume:
+        if args.output_dir is None:
+            raise ValueError(
+                "--resume requires --output-dir to point to the exact existing run directory."
+            )
         return args.output_dir.resolve()
-    return (DEFAULT_OUTPUT_ROOT / f"{args.dataset_root.name}_{args.policy_type}").resolve()
+
+    output_parent = (
+        args.output_dir
+        if args.output_dir is not None
+        else DEFAULT_OUTPUT_ROOT / f"{args.dataset_root.name}_{args.policy_type}"
+    ).resolve()
+    timestamp = format_run_timestamp(now if now is not None else dt.datetime.now())
+    return output_parent / timestamp
 
 
 def resolve_save_freq(total_steps: int, requested_save_freq: int | None) -> int:
@@ -583,6 +612,7 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
 
     if is_main_process:
+        print(f"Run output directory: {cfg.output_dir}")
         print(f"Train episodes: {train_episodes}")
         print(f"Validation episodes: {val_episodes}")
         print(f"Validation frequency: {val_freq}")

@@ -23,7 +23,7 @@ It currently:
 - Uses the local dataset at `data/pick_and_place_test` by default
 - Redirects Hugging Face cache writes into `./.hf-cache`
 - Supports `act` and `diffusion` policy types
-- Writes checkpoints and durable local JSONL logs into `./outputs/`
+- Writes each run's checkpoints and durable local JSONL logs into a timestamped directory under `./outputs/`
 - Saves at most 10 model checkpoints per run by default
 - Can split episodes into training and validation subsets
 - Can run periodic validation loss evaluation with `--val-freq`
@@ -87,7 +87,7 @@ Important options:
 - `--dataset-root`: override the local dataset path
 - `--dataset-repo-id`: override the LeRobot dataset repo id
 - `--policy-type {act,diffusion}`: choose the imitation-learning policy
-- `--output-dir`: choose a custom checkpoint/log directory
+- `--output-dir`: choose the parent directory for a new timestamped run; with `--resume`, specify the exact existing run directory
 - `--steps`: total number of optimizer steps
 - `--batch-size`: training batch size
 - `--num-workers`: dataloader worker count
@@ -133,16 +133,22 @@ At each validation step, the script computes validation loss on the held-out epi
 
 ## Local Training Logs
 
-Training metrics are saved even when Weights & Biases is disabled. For a run at
-`outputs/test-limit-pick-and-place_act`, the files are:
+Training metrics are saved even when Weights & Biases is disabled. Each new run
+gets a local-time timestamp such as `2026-08-19_14-05-07`. For example, the
+files for an ACT run are:
 
 ```text
 outputs/test-limit-pick-and-place_act/
-├── checkpoints/
-└── logs/
-    ├── train_metrics.jsonl
-    └── epoch_metrics.jsonl
+└── 2026-08-19_14-05-07/
+    ├── checkpoints/
+    └── logs/
+        ├── train_metrics.jsonl
+        └── epoch_metrics.jsonl
 ```
+
+Passing `--output-dir outputs/experiments` for a new run produces
+`outputs/experiments/<timestamp>/`. The script prints the concrete run output
+directory at startup.
 
 `train_metrics.jsonl` stores the rolling metrics at every `--log-freq` interval,
 including loss, learning rate, timing, elapsed time, and ETA. `epoch_metrics.jsonl`
@@ -188,11 +194,12 @@ If you want to continue a previous run:
 ```bash
 python train/train_lerobot_policy.py \
   --policy-type act \
-  --output-dir outputs/pick_and_place_test_act \
+  --output-dir outputs/pick_and_place_test_act/2026-08-19_14-05-07 \
   --resume
 ```
 
-Use the same output directory as the prior run.
+Use the exact timestamped output directory of the prior run. Resume never adds
+a second timestamp directory.
 
 ## Policy Hub Helpers
 
@@ -200,7 +207,7 @@ Push a saved local policy to Hugging Face:
 
 ```bash
 python train/push_lerobot_policy.py \
-  --policy-path outputs/pick_and_place_test_act/checkpoints/last \
+  --policy-path outputs/pick_and_place_test_act/2026-08-19_14-05-07/checkpoints/last \
   --repo-id Jianshu1/pick_and_place_test_act
 ```
 

@@ -85,6 +85,7 @@ wuji_launcher="${script_dir}/start_wuji_only_teleop.sh"
 [[ "${end_effector}" != "hand" || -x "${wuji_launcher}" ]] || die \
   "Wuji launcher is missing or not executable: ${wuji_launcher}"
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
+command -v env >/dev/null 2>&1 || die "required command not found: env"
 
 declare -a child_pids=()
 declare -A child_names=()
@@ -94,10 +95,47 @@ start_component() {
   local component_name="$1"
   shift
   echo "Starting ${component_name}: $*"
-  setsid -- "$@" &
+  # Bash starts asynchronous jobs with SIGINT and SIGQUIT ignored. That signal
+  # disposition survives setsid and exec, and an ignored signal cannot be
+  # restored from inside a newly started Bash script. Reset it in env before
+  # executing the component so the nested supervisor can handle our SIGINT.
+  setsid -- env --default-signal=INT,QUIT,TERM -- "$@" &
   local child_pid=$!
   child_pids+=("${child_pid}")
   child_names["${child_pid}"]="${component_name}"
+}
+
+signal_running_groups() {
+  local signal_name="$1"
+  local child_pid
+
+  for child_pid in "${child_pids[@]}"; do
+    if kill -0 -- "-${child_pid}" 2>/dev/null; then
+      kill -s "${signal_name}" -- "-${child_pid}" 2>/dev/null || true
+    fi
+  done
+}
+
+groups_are_running() {
+  local child_pid
+
+  for child_pid in "${child_pids[@]}"; do
+    if ps -o stat= --sid "${child_pid}" 2>/dev/null | grep -qv '^[[:space:]]*Z'; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+wait_for_groups_to_stop() {
+  local attempts="$1"
+  local attempt
+
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    groups_are_running || return 0
+    sleep 0.1
+  done
+  return 1
 }
 
 shutdown() {
@@ -109,9 +147,15 @@ shutdown() {
 
   if [[ "${#child_pids[@]}" -gt 0 ]]; then
     echo "Stopping the complete teleoperation stack..."
-    for child_pid in "${child_pids[@]}"; do
-      kill -s INT -- "-${child_pid}" 2>/dev/null || true
-    done
+    signal_running_groups INT
+    if ! wait_for_groups_to_stop 60; then
+      echo "Teleoperation processes did not stop after SIGINT; sending SIGTERM..." >&2
+      signal_running_groups TERM
+    fi
+    if ! wait_for_groups_to_stop 30; then
+      echo "Force-stopping unresponsive teleoperation processes..." >&2
+      signal_running_groups KILL
+    fi
     for child_pid in "${child_pids[@]}"; do
       wait "${child_pid}" 2>/dev/null || true
     done

@@ -146,6 +146,7 @@ done
 set -u
 
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
+command -v env >/dev/null 2>&1 || die "required command not found: env"
 command -v timeout >/dev/null 2>&1 || die "required command not found: timeout"
 command -v flock >/dev/null 2>&1 || die "required command not found: flock"
 command -v fuser >/dev/null 2>&1 || die "required command not found: fuser"
@@ -235,7 +236,10 @@ start_process() {
   shift
 
   echo "Starting ${process_name}: $*"
-  setsid -- bash -c 'exec 9>&-; trap - INT QUIT; exec "$@"' _ "$@" &
+  # Background jobs inherit SIGINT/SIGQUIT as ignored from Bash. Reset their
+  # dispositions before Bash starts so ROS launch can handle graceful signals.
+  setsid -- env --default-signal=INT,QUIT,TERM -- \
+    bash -c 'exec 9>&-; exec "$@"' _ "$@" &
   local child_pid=$!
   child_pids+=("${child_pid}")
   child_names["${child_pid}"]="${process_name}"

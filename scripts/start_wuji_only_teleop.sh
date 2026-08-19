@@ -120,6 +120,7 @@ teleop_program="${example_dir}/teleop_real.py"
 [[ -r "${teleop_program}" ]] || die "Wuji teleoperation program not found: ${teleop_program}"
 command -v python >/dev/null 2>&1 || die "python is not available in the current environment"
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
+command -v env >/dev/null 2>&1 || die "required command not found: env"
 command -v flock >/dev/null 2>&1 || die "required command not found: flock"
 
 declare -a selected_sides=()
@@ -179,7 +180,9 @@ start_wuji_side() {
   (
     cd -- "${example_dir}"
     exec 9>&-
-    exec setsid -- "${command[@]}"
+    # Restore signals ignored by Bash for asynchronous jobs before starting
+    # the per-hand process in its own session.
+    exec setsid -- env --default-signal=INT,QUIT,TERM -- "${command[@]}"
   ) &
   local child_pid=$!
   child_pids+=("${child_pid}")

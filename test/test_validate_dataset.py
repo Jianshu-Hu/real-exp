@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from fractions import Fraction
+
+import av
 import numpy as np
 
-from data_collection.validate_dataset import check_joint_safety_constraints
+from data_collection.validate_dataset import (
+    check_joint_safety_constraints,
+    check_physical_video_frames,
+)
 from utils.limit import (
     FR3_SAFE_POSITION_LOWER_RAD,
     FR3_SAFE_POSITION_UPPER_RAD,
@@ -110,3 +116,72 @@ def test_dataset_still_checks_accepted_action_position_envelope() -> None:
     assert metrics["state_violation_steps"] == 0
     assert metrics["action_violation_steps"] == 1
     assert metrics["action_waypoint_slew_steps"] == 2
+
+
+def write_test_video(path, *, frame_count: int, fps: int = 10) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with av.open(str(path), mode="w") as container:
+        stream = container.add_stream("mpeg4", rate=fps)
+        stream.width = 16
+        stream.height = 12
+        stream.pix_fmt = "yuv420p"
+        for frame_index in range(frame_count):
+            image = np.full((12, 16, 3), frame_index, dtype=np.uint8)
+            frame = av.VideoFrame.from_ndarray(image, format="rgb24")
+            frame.pts = frame_index
+            frame.time_base = Fraction(1, fps)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+
+def video_fixture_metadata(frame_count: int, fps: int = 10):
+    video_key = "observation.images.test"
+    info = {
+        "fps": fps,
+        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+        "features": {video_key: {"dtype": "video", "shape": [3, 12, 16]}},
+    }
+    episodes = [
+        {
+            "episode_index": 0,
+            "length": frame_count,
+            f"videos/{video_key}/chunk_index": 0,
+            f"videos/{video_key}/file_index": 0,
+        }
+    ]
+    return video_key, info, episodes
+
+
+def test_physical_video_quality_fully_decodes_valid_stream(tmp_path) -> None:
+    video_key, info, episodes = video_fixture_metadata(frame_count=5)
+    video_path = tmp_path / info["video_path"].format(
+        video_key=video_key,
+        chunk_index=0,
+        file_index=0,
+    )
+    write_test_video(video_path, frame_count=5)
+
+    assert check_physical_video_frames(tmp_path, info, episodes, [video_key]) == []
+
+
+def test_physical_video_quality_rejects_truncated_stream(tmp_path) -> None:
+    video_key, info, episodes = video_fixture_metadata(frame_count=5)
+    video_path = tmp_path / info["video_path"].format(
+        video_key=video_key,
+        chunk_index=0,
+        file_index=0,
+    )
+    write_test_video(video_path, frame_count=5)
+    video_bytes = video_path.read_bytes()
+    video_path.write_bytes(video_bytes[: len(video_bytes) // 2])
+
+    issues = check_physical_video_frames(tmp_path, info, episodes, [video_key])
+
+    assert any(
+        "full decode failed" in issue
+        or "physical frames" in issue
+        or "invalid ffprobe output" in issue
+        for issue in issues
+    )

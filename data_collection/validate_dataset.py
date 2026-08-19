@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -42,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-video-frames",
         action="store_true",
-        help="Skip physical MP4 frame count checks.",
+        help="Skip full MP4 decode, frame count, resolution, and FPS checks.",
     )
     parser.add_argument(
         "--verbose",
@@ -549,11 +551,22 @@ def check_physical_video_frames(
     episodes: list[dict[str, Any]],
     video_keys: list[str],
 ) -> list[str]:
-    try:
-        import cv2
-    except ModuleNotFoundError:
+    """Fully decode each referenced video and compare it with dataset metadata.
+
+    Strict FFmpeg decoding rejects codec/packet errors, while ``ffprobe
+    -count_frames`` counts decoded frames instead of trusting the MP4 header. Both
+    run out of process so malformed native codec input cannot crash the validator.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if ffmpeg is None or ffprobe is None:
+        missing_tools = ", ".join(
+            tool_name
+            for tool_name, tool_path in (("ffmpeg", ffmpeg), ("ffprobe", ffprobe))
+            if tool_path is None
+        )
         return [
-            "physical video frame checks skipped because OpenCV (cv2) is not installed"
+            f"physical video quality checks require {missing_tools}, but it is not installed"
         ]
 
     issues: list[str] = []
@@ -580,24 +593,94 @@ def check_physical_video_frames(
                 issues.append(f"{video_key} file {chunk_index}/{file_index}: missing {video_path}")
                 continue
 
-            capture = cv2.VideoCapture(str(video_path))
-            if not capture.isOpened():
-                issues.append(f"{video_key} file {chunk_index}/{file_index}: failed to open {video_path}")
+            strict_decode = subprocess.run(
+                [
+                    ffmpeg,
+                    "-v",
+                    "error",
+                    "-xerror",
+                    "-i",
+                    str(video_path),
+                    "-map",
+                    "0:v:0",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if strict_decode.returncode != 0:
+                issues.append(
+                    f"{video_key} file {chunk_index}/{file_index}: full decode failed: "
+                    f"{strict_decode.stderr.strip() or 'ffmpeg returned a non-zero status'}"
+                )
                 continue
 
-            actual_frames = round(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-            actual_fps = capture.get(cv2.CAP_PROP_FPS)
-            capture.release()
+            expected_spec = info.get("features", {}).get(video_key, {})
+            expected_shape = expected_spec.get("shape")
+            expected_height = int(expected_shape[-2]) if expected_shape and len(expected_shape) >= 2 else None
+            expected_width = int(expected_shape[-1]) if expected_shape and len(expected_shape) >= 1 else None
+            probe = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-count_frames",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height,avg_frame_rate,nb_read_frames",
+                    "-of",
+                    "json",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if probe.returncode != 0:
+                issues.append(
+                    f"{video_key} file {chunk_index}/{file_index}: full decode failed: "
+                    f"{probe.stderr.strip() or 'ffprobe returned a non-zero status'}"
+                )
+                continue
+
+            try:
+                streams = json.loads(probe.stdout).get("streams", [])
+                stream = streams[0]
+                actual_frames = int(stream["nb_read_frames"])
+                actual_fps = float(stream["avg_frame_rate"].split("/")[0]) / float(
+                    stream["avg_frame_rate"].split("/")[1]
+                )
+                actual_width = int(stream["width"])
+                actual_height = int(stream["height"])
+            except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError) as exc:
+                issues.append(
+                    f"{video_key} file {chunk_index}/{file_index}: invalid ffprobe output: {exc}"
+                )
+                continue
 
             if actual_frames != expected_frames:
                 issues.append(
                     f"{video_key} file {chunk_index}/{file_index}: "
                     f"physical frames {actual_frames} != expected {expected_frames}"
                 )
-            if actual_fps and abs(actual_fps - float(info["fps"])) > 1e-3:
+            if abs(actual_fps - float(info["fps"])) > 1e-3:
                 issues.append(
                     f"{video_key} file {chunk_index}/{file_index}: "
                     f"physical fps {actual_fps:.6f} != dataset fps {float(info['fps']):.6f}"
+                )
+            if (
+                expected_width is not None
+                and expected_height is not None
+                and (actual_width != expected_width or actual_height != expected_height)
+            ):
+                issues.append(
+                    f"{video_key} file {chunk_index}/{file_index}: decoded frame shape "
+                    f"{actual_width}x{actual_height} != expected "
+                    f"{expected_width}x{expected_height}"
                 )
 
     return issues
@@ -864,7 +947,7 @@ def validate_dataset(
         print("\nPhysical video checks")
         physical_video_issues = check_physical_video_frames(dataset_root, info, episodes, video_keys)
         for issue in physical_video_issues:
-            if issue.startswith("physical video frame checks skipped"):
+            if issue.startswith("physical video quality checks skipped"):
                 warning_issues.append(issue)
             else:
                 issues.append(issue)
@@ -872,7 +955,7 @@ def validate_dataset(
             print("  ok")
         else:
             for issue in physical_video_issues:
-                prefix = "  warning:" if issue.startswith("physical video frame checks skipped") else "  issue:"
+                prefix = "  warning:" if issue.startswith("physical video quality checks skipped") else "  issue:"
                 print(f"{prefix} {issue}")
     elif skip_video_frames:
         print("\nPhysical video checks skipped by --skip-video-frames")

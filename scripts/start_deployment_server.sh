@@ -16,7 +16,7 @@ Options:
   --bridge-config FILE Bridge config (default: deployment_duo.yaml)
   --ros-domain-id ID   Set ROS_DOMAIN_ID
   --ros-distro NAME    ROS distribution under /opt/ros
-  --python PATH        Policy Python (default: DEPLOYMENT_PYTHON or python)
+  --python PATH        Explicit policy Python interpreter (default: lerobot Conda environment)
   --help               Show this help
 
 The robot executor supplies the checkpoint path during the gRPC setup handshake;
@@ -30,7 +30,7 @@ server_ip="${DEPLOYMENT_SERVER_IP:-192.168.50.13}"
 publish_port=5555; command_port=5556; camera_cache_port=5557; policy_port=8080
 bridge_config=deployment_duo.yaml; ros_domain_id="${ROS_DOMAIN_ID:-0}"
 ros_distro="${DEPLOYMENT_ROS_DISTRO:-${ROS_DISTRO:-}}"
-policy_python="${DEPLOYMENT_PYTHON:-python}"
+policy_python="${DEPLOYMENT_PYTHON:-}"
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -58,6 +58,8 @@ validate_port "${policy_port}" || die "invalid policy port: ${policy_port}"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
+# shellcheck source=scripts/conda_env.sh
+source "${script_dir}/conda_env.sh"
 if [[ -n "${ros_distro}" ]]; then
   ros_setup_file="/opt/ros/${ros_distro}/setup.bash"
 else
@@ -80,9 +82,18 @@ export ROS_LOCALHOST_ONLY=0
 export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 command -v setsid >/dev/null || die "setsid is required"
 command -v ros2 >/dev/null || die "ros2 is unavailable after sourcing ROS"
-command -v "${policy_python}" >/dev/null || die "policy Python not found: ${policy_python}"
-"${policy_python}" -c 'import grpc, torch, zmq' >/dev/null 2>&1 || die \
-  "policy Python is missing grpc, torch, or zmq: ${policy_python}"
+declare -a policy_command=()
+if [[ -n "${policy_python}" ]]; then
+  command -v "${policy_python}" >/dev/null || die "policy Python not found: ${policy_python}"
+  policy_command=("${policy_python}")
+  "${policy_command[@]}" -c 'import grpc, torch, zmq' >/dev/null 2>&1 || die \
+    "policy Python is missing grpc, torch, or zmq: ${policy_python}"
+else
+  deployment_conda_env="${DEPLOYMENT_CONDA_ENV:-${LEROBOT_CONDA_ENV:-lerobot}}"
+  real_exp_build_conda_python_command "${deployment_conda_env}" policy_command || exit 1
+  real_exp_require_conda_python_modules "${deployment_conda_env}" grpc torch zmq || die \
+    "the '${deployment_conda_env}' Conda environment is missing policy dependencies"
+fi
 bridge_config_source="${repository_root}/gello_software/ros2/src/franka_lerobot_data_bridge/config/${bridge_config}"
 if [[ "${bridge_config}" = /* ]]; then bridge_config_source="${bridge_config}"; fi
 [[ -f "${bridge_config_source}" ]] || die "bridge config not found: ${bridge_config}"
@@ -107,7 +118,7 @@ start_process "Deployment observation bridge" ros2 launch franka_lerobot_data_br
   "config_file:=${bridge_config}" "publish_host:=${server_ip}" "publish_port:=${publish_port}" \
   "command_host:=${server_ip}" "command_port:=${command_port}" \
   "camera_cache_host:=127.0.0.1" "camera_cache_port:=${camera_cache_port}"
-start_process "Policy server" "${policy_python}" "${repository_root}/deploy/deploy_lerobot_policy.py" server \
+start_process "Policy server" "${policy_command[@]}" "${repository_root}/deploy/deploy_lerobot_policy.py" server \
   --host 0.0.0.0 --port "${policy_port}" --fps 15 \
   --camera-cache-address "tcp://127.0.0.1:${camera_cache_port}"
 echo "Deployment server is running. Press Ctrl-C to stop all children."

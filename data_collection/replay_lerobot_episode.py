@@ -14,15 +14,24 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
 
 import numpy as np
 import pyarrow.parquet as pq
+import zmq
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from data_collection.trajectory_metadata import load_trajectory_config, validate_setting
 
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 TRACE_FILENAME = "trace.csv"
@@ -48,6 +57,9 @@ class EpisodeData:
     timestamps: np.ndarray
     fps: float
     action_config: dict[str, Any]
+    trajectory_config: dict[str, Any] = field(default_factory=lambda: {
+        "end_effector": "gripper", "arm_mode": "duo", "arms": ["left", "right"]
+    })
 
 
 def parse_args() -> argparse.Namespace:
@@ -106,7 +118,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Load and summarize targets without publishing.")
-    parser.add_argument("--no-gripper", action="store_true", help="Skip gripper command publishing and trace targets.")
+    parser.add_argument("--no-gripper", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--robot-end-effector", choices=["arm", "gripper", "hand"], default=None,
+                        help="Connected end-effector setting; normally supplied by scripts/replay.sh.")
+    parser.add_argument("--robot-arm-mode", choices=["duo", "left", "right"], default=None,
+                        help="Connected arm setting; normally supplied by scripts/replay.sh.")
+    parser.add_argument("--left-hand-command-port", type=int, default=5561)
+    parser.add_argument("--right-hand-command-port", type=int, default=5562)
+    parser.add_argument("--internal-wuji-hand", choices=["left", "right"], default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--hand-ip", default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--allow-missing-state",
         action="store_true",
@@ -121,6 +142,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--left-gripper-state-topic", default="/left/franka_gripper/joint_states")
     parser.add_argument("--right-gripper-state-topic", default="/right/franka_gripper/joint_states")
     return parser.parse_args()
+
+
+def run_wuji_hand_process(side: str, command_port: int, hand_ip: str) -> None:
+    """Run the Wuji SDK command process in the non-ROS Python environment."""
+    example_dir = Path(__file__).resolve().parents[1] / "libs/wuji-retargeting/example"
+    os.chdir(example_dir)
+    sys.path.insert(0, str(example_dir))
+    from teleop_real import WujiHand2Backend
+
+    backend = WujiHand2Backend(
+        ip=hand_ip,
+        kp=3.0,
+        kd=0.1,
+        current_limit=1.5,
+        handedness=side,
+    )
+    context = zmq.Context()
+    socket = context.socket(zmq.PULL)
+    socket.setsockopt(zmq.RCVHWM, 2)
+    socket.bind(f"tcp://127.0.0.1:{command_port}")
+    print(f"{side} Wuji Hand 2 replay is ready on tcp://127.0.0.1:{command_port}", flush=True)
+    try:
+        while True:
+            target = np.asarray(socket.recv_pyobj(), dtype=np.float64)
+            if target.shape != (20,) or not np.all(np.isfinite(target)):
+                print(f"Ignoring invalid {side} hand target with shape {target.shape}", flush=True)
+                continue
+            backend.send(target)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        socket.close(0)
+        context.term()
+        backend.close()
 
 
 def start_command_listener() -> Queue[str]:
@@ -197,10 +252,18 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
     rows.sort(key=lambda item: item[0])
     states = np.asarray([row[2] for row in rows], dtype=float)
     actions = np.asarray([row[3] for row in rows], dtype=float)
-    if states.ndim != 2 or actions.ndim != 2 or states.shape[1] != 16 or actions.shape[1] != 16:
+    if states.ndim != 2 or actions.ndim != 2 or states.shape[1] != actions.shape[1]:
         raise ValueError(
-            "Controller-matched replay currently supports 16-dim bimanual datasets only. "
+            "Replay requires two-dimensional state/action arrays with matching dimensions. "
             f"Got state shape {states.shape}, action shape {actions.shape}."
+        )
+    trajectory_config = load_trajectory_config(
+        dataset_root, action_config, states.shape[1], actions.shape[1]
+    )
+    expected_dim = int(trajectory_config.get("action_dim", actions.shape[1]))
+    if actions.shape[1] != expected_dim:
+        raise ValueError(
+            f"Trajectory metadata declares action_dim={expected_dim}, but episode data has {actions.shape[1]}."
         )
 
     return EpisodeData(
@@ -210,6 +273,7 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
         timestamps=np.asarray([row[1] for row in rows], dtype=float),
         fps=float(info["fps"]),
         action_config=action_config,
+        trajectory_config=trajectory_config,
     )
 
 
@@ -230,17 +294,32 @@ def select_frame_range(data: EpisodeData, start_frame: int, end_frame: int | Non
         timestamps=data.timestamps[indices],
         fps=data.fps,
         action_config=data.action_config,
+        trajectory_config=data.trajectory_config,
     )
 
 
 def split_targets(data: EpisodeData) -> dict[str, np.ndarray]:
     source = data.actions
-    return {
-        "left_arm": source[:, 0:7],
-        "right_arm": source[:, 8:15],
-        "left_gripper_raw": source[:, 7],
-        "right_gripper_raw": source[:, 15],
-    }
+    arm_mode = str(data.trajectory_config["arm_mode"])
+    end_effector = str(data.trajectory_config["end_effector"])
+    result: dict[str, np.ndarray] = {}
+    offset = 0
+    arms = ["left", "right"] if arm_mode == "duo" else [arm_mode]
+    for side in arms:
+        result[f"{side}_arm"] = source[:, offset : offset + 7]
+        offset += 7
+        if end_effector == "gripper":
+            result[f"{side}_gripper_raw"] = source[:, offset]
+            offset += 1
+        elif end_effector == "hand":
+            result[f"{side}_hand"] = source[:, offset : offset + 20]
+            offset += 20
+    if offset != source.shape[1]:
+        raise ValueError(
+            f"Trajectory layout {end_effector}/{arm_mode} consumes {offset} values, "
+            f"but actions have {source.shape[1]}."
+        )
+    return result
 
 
 def continuous_gripper_targets(values: np.ndarray) -> np.ndarray:
@@ -266,24 +345,38 @@ def print_dry_run_summary(
     print(f"frame range: {int(data.frame_indices[0])}..{int(data.frame_indices[-1])}")
     print(f"dataset fps: {data.fps:g}")
     print(f"replay fps: {fps:g}")
+    print(
+        "trajectory setting: "
+        f"{data.trajectory_config['end_effector']} / {data.trajectory_config['arm_mode']}"
+    )
     print(f"initial state source: observation.state at frame {int(data.frame_indices[0])}")
-    print(f"left arm initial q: {data.states[0, 0:7].round(6).tolist()}")
-    print(f"right arm initial q: {data.states[0, 8:15].round(6).tolist()}")
+    state_data = EpisodeData(
+        states=data.states, actions=data.states, frame_indices=data.frame_indices,
+        timestamps=data.timestamps, fps=data.fps, action_config=data.action_config,
+        trajectory_config=data.trajectory_config,
+    )
+    initial_states = split_targets(state_data)
+    for side in data.trajectory_config["arms"]:
+        print(f"{side} arm initial q: {initial_states[f'{side}_arm'][0].round(6).tolist()}")
     print(f"initial move timeout: {initial_state_timeout:g} s")
     print(f"initial move max joint velocity: {initial_state_max_velocity:g} rad/s")
     print(f"initial move max joint acceleration: {initial_state_max_acceleration:g} rad/s^2")
     print(f"initial-state position tolerance: {initial_state_position_tolerance:g} rad")
     print("target source: action")
     print(f"arm action config: {data.action_config.get('arm_action_representation')} / {data.action_config.get('arm_action_definition')}")
-    for arm_name in ("left_arm", "right_arm"):
+    for arm_name in (f"{side}_arm" for side in data.trajectory_config["arms"]):
         values = np.asarray(targets[arm_name], dtype=float)
         print(f"{arm_name} target min: {np.min(values, axis=0).round(6).tolist()}")
         print(f"{arm_name} target max: {np.max(values, axis=0).round(6).tolist()}")
-    if not no_gripper:
-        left = continuous_gripper_targets(targets["left_gripper_raw"])
-        right = continuous_gripper_targets(targets["right_gripper_raw"])
-        print(f"left gripper target counts: {value_counts(left)}")
-        print(f"right gripper target counts: {value_counts(right)}")
+    if data.trajectory_config["end_effector"] == "gripper" and not no_gripper:
+        for side in data.trajectory_config["arms"]:
+            values = continuous_gripper_targets(targets[f"{side}_gripper_raw"])
+            print(f"{side} gripper target counts: {value_counts(values)}")
+    if data.trajectory_config["end_effector"] == "hand":
+        for side in data.trajectory_config["arms"]:
+            values = targets[f"{side}_hand"]
+            print(f"{side} hand target min: {np.min(values, axis=0).round(6).tolist()}")
+            print(f"{side} hand target max: {np.max(values, axis=0).round(6).tolist()}")
 
 
 def value_counts(values: np.ndarray) -> dict[str, int]:
@@ -351,30 +444,21 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
             self.right_actual_dq: np.ndarray | None = None
             self.left_gripper_actual: float | None = None
             self.right_gripper_actual: float | None = None
-            self.create_subscription(
-                JointState,
-                args.left_state_topic,
-                lambda msg: self._store_arm_state("left", msg),
-                10,
-            )
-            self.create_subscription(
-                JointState,
-                args.right_state_topic,
-                lambda msg: self._store_arm_state("right", msg),
-                10,
-            )
-            self.create_subscription(
-                JointState,
-                args.left_gripper_state_topic,
-                lambda msg: self._store_gripper_state("left", msg),
-                10,
-            )
-            self.create_subscription(
-                JointState,
-                args.right_gripper_state_topic,
-                lambda msg: self._store_gripper_state("right", msg),
-                10,
-            )
+            self.active_arms = list(args.active_arms)
+            for side in self.active_arms:
+                state_topic = args.left_state_topic if side == "left" else args.right_state_topic
+                gripper_state_topic = (
+                    args.left_gripper_state_topic if side == "left" else args.right_gripper_state_topic
+                )
+                self.create_subscription(
+                    JointState, state_topic,
+                    lambda msg, arm=side: self._store_arm_state(arm, msg), 10,
+                )
+                if args.robot_end_effector == "gripper":
+                    self.create_subscription(
+                        JointState, gripper_state_topic,
+                        lambda msg, arm=side: self._store_gripper_state(arm, msg), 10,
+                    )
 
         def _ordered_arm_values(self, msg: Any, field_name: str) -> np.ndarray | None:
             raw_values = getattr(msg, field_name, [])
@@ -413,22 +497,24 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
 
         def publish_targets(
             self,
-            left_target: np.ndarray,
-            right_target: np.ndarray,
+            left_target: np.ndarray | None,
+            right_target: np.ndarray | None,
             left_gripper: float | None,
             right_gripper: float | None,
         ) -> None:
             now_msg = self.get_clock().now().to_msg()
-            left_msg = JointState()
-            left_msg.header.stamp = now_msg
-            left_msg.name = JOINT_NAMES
-            left_msg.position = [float(value) for value in left_target]
-            right_msg = JointState()
-            right_msg.header.stamp = now_msg
-            right_msg.name = JOINT_NAMES
-            right_msg.position = [float(value) for value in right_target]
-            self.left_target_publisher.publish(left_msg)
-            self.right_target_publisher.publish(right_msg)
+            if left_target is not None:
+                left_msg = JointState()
+                left_msg.header.stamp = now_msg
+                left_msg.name = JOINT_NAMES
+                left_msg.position = [float(value) for value in left_target]
+                self.left_target_publisher.publish(left_msg)
+            if right_target is not None:
+                right_msg = JointState()
+                right_msg.header.stamp = now_msg
+                right_msg.name = JOINT_NAMES
+                right_msg.position = [float(value) for value in right_target]
+                self.right_target_publisher.publish(right_msg)
 
             if left_gripper is not None:
                 msg = Float32()
@@ -444,14 +530,14 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
 
         def missing_state_topics(self, no_gripper: bool) -> list[str]:
             missing: list[str] = []
-            if self.left_actual_q is None:
+            if "left" in self.active_arms and self.left_actual_q is None:
                 missing.append(self.left_state_topic)
-            if self.right_actual_q is None:
+            if "right" in self.active_arms and self.right_actual_q is None:
                 missing.append(self.right_state_topic)
             if not no_gripper:
-                if self.left_gripper_actual is None:
+                if "left" in self.active_arms and self.left_gripper_actual is None:
                     missing.append(self.left_gripper_state_topic)
-                if self.right_gripper_actual is None:
+                if "right" in self.active_arms and self.right_gripper_actual is None:
                     missing.append(self.right_gripper_state_topic)
             return missing
 
@@ -526,11 +612,15 @@ def wait_for_start(
     right_hold_q: np.ndarray | None = None
     while rclpy.ok():
         rclpy.spin_once(node, timeout_sec=0.05)
-        if left_hold_q is None and node.left_actual_q is not None and node.right_actual_q is not None:
-            left_hold_q = np.asarray(node.left_actual_q, dtype=float).copy()
-            right_hold_q = np.asarray(node.right_actual_q, dtype=float).copy()
+        active_arms = getattr(node, "active_arms", ["left", "right"])
+        have_active_states = all(getattr(node, f"{side}_actual_q") is not None for side in active_arms)
+        if left_hold_q is None and right_hold_q is None and have_active_states:
+            if "left" in active_arms:
+                left_hold_q = np.asarray(node.left_actual_q, dtype=float).copy()
+            if "right" in active_arms:
+                right_hold_q = np.asarray(node.right_actual_q, dtype=float).copy()
             print("Priming arm controllers with the measured current pose.")
-        if left_hold_q is not None and right_hold_q is not None:
+        if have_active_states:
             node.publish_targets(left_hold_q, right_hold_q, None, None)
         missing = tuple(node.missing_state_topics(no_gripper))
         if missing != last_missing:
@@ -635,19 +725,27 @@ def move_arms_to_initial_state(
     prime_duration_s: float = INITIAL_STATE_PRIME_DURATION_S,
 ) -> bool:
     """Command and verify the first selected observation before replay starts."""
-    left_target = np.asarray(data.states[0, 0:7], dtype=float)
-    right_target = np.asarray(data.states[0, 8:15], dtype=float)
-    if not np.all(np.isfinite(left_target)) or not np.all(np.isfinite(right_target)):
+    state_data = EpisodeData(
+        states=data.states, actions=data.states, frame_indices=data.frame_indices,
+        timestamps=data.timestamps, fps=data.fps, action_config=data.action_config,
+        trajectory_config=data.trajectory_config,
+    )
+    initial_states = split_targets(state_data)
+    active_arms = list(data.trajectory_config["arms"])
+    left_target = None if "left" not in active_arms else np.asarray(initial_states["left_arm"][0], dtype=float)
+    right_target = None if "right" not in active_arms else np.asarray(initial_states["right_arm"][0], dtype=float)
+    targets_to_check = [target for target in (left_target, right_target) if target is not None]
+    if not all(np.all(np.isfinite(target)) for target in targets_to_check):
         raise ValueError("Episode initial arm state must contain only finite values.")
     if consume_commands(commands) == "q":
         return False
-    if node.left_actual_q is None or node.right_actual_q is None:
-        raise RuntimeError("Actual state from both arms is required for a velocity-limited initial move.")
+    if any(getattr(node, f"{side}_actual_q") is None for side in active_arms):
+        raise RuntimeError("Actual state from every trajectory arm is required for the initial move.")
 
-    left_command = np.asarray(node.left_actual_q, dtype=float).copy()
-    right_command = np.asarray(node.right_actual_q, dtype=float).copy()
-    left_commanded_velocity = np.zeros(7, dtype=float)
-    right_commanded_velocity = np.zeros(7, dtype=float)
+    left_command = None if left_target is None else np.asarray(node.left_actual_q, dtype=float).copy()
+    right_command = None if right_target is None else np.asarray(node.right_actual_q, dtype=float).copy()
+    left_commanded_velocity = None if left_target is None else np.zeros(7, dtype=float)
+    right_commanded_velocity = None if right_target is None else np.zeros(7, dtype=float)
     frame_index = int(data.frame_indices[0])
     start_time = time.perf_counter()
     deadline_s = start_time + timeout_s
@@ -655,7 +753,7 @@ def move_arms_to_initial_state(
     stable_samples = 0
 
     print(
-        f"Moving both arms to observation.state at frame {frame_index} before replay "
+        f"Moving {', '.join(active_arms)} arm(s) to observation.state at frame {frame_index} before replay "
         f"(max velocity={max_velocity:g} rad/s, max acceleration={max_acceleration:g} rad/s^2). "
         f"Position tolerance={position_tolerance_rad:g} rad. "
         "Type `q` + Enter to abort."
@@ -677,44 +775,30 @@ def move_arms_to_initial_state(
 
         now = time.perf_counter()
         dt = now - last_command_time
-        left_command, left_commanded_velocity = ramp_initial_state_command(
-            left_command,
-            left_commanded_velocity,
-            left_target,
-            dt,
-            max_velocity,
-            max_acceleration,
-        )
-        right_command, right_commanded_velocity = ramp_initial_state_command(
-            right_command,
-            right_commanded_velocity,
-            right_target,
-            dt,
-            max_velocity,
-            max_acceleration,
-        )
+        if left_target is not None:
+            left_command, left_commanded_velocity = ramp_initial_state_command(
+                left_command, left_commanded_velocity, left_target, dt, max_velocity, max_acceleration
+            )
+        if right_target is not None:
+            right_command, right_commanded_velocity = ramp_initial_state_command(
+                right_command, right_commanded_velocity, right_target, dt, max_velocity, max_acceleration
+            )
         node.publish_targets(left_command, right_command, None, None)
         last_command_time = now
         next_publish_time += INITIAL_STATE_PUBLISH_PERIOD_S
         if sleep_with_spin_and_abort(rclpy, node, commands, next_publish_time):
             return False
 
-        left_reached = arm_reached_initial_state(
-            node.left_actual_q,
-            node.left_actual_dq,
-            left_target,
-            position_tolerance_rad,
+        left_reached = left_target is None or arm_reached_initial_state(
+            node.left_actual_q, node.left_actual_dq, left_target, position_tolerance_rad
         )
-        right_reached = arm_reached_initial_state(
-            node.right_actual_q,
-            node.right_actual_dq,
-            right_target,
-            position_tolerance_rad,
+        right_reached = right_target is None or arm_reached_initial_state(
+            node.right_actual_q, node.right_actual_dq, right_target, position_tolerance_rad
         )
         if left_reached and right_reached:
             stable_samples += 1
             if stable_samples >= INITIAL_STATE_STABLE_SAMPLES:
-                print("Both arms reached the episode initial state. Starting action replay.")
+                print("All trajectory arms reached the episode initial state. Starting action replay.")
                 return True
         else:
             stable_samples = 0
@@ -723,12 +807,12 @@ def move_arms_to_initial_state(
         if now >= deadline_s:
             left_error = (
                 None
-                if node.left_actual_q is None
+                if left_target is None or node.left_actual_q is None
                 else float(np.max(np.abs(left_target - np.asarray(node.left_actual_q, dtype=float))))
             )
             right_error = (
                 None
-                if node.right_actual_q is None
+                if right_target is None or node.right_actual_q is None
                 else float(np.max(np.abs(right_target - np.asarray(node.right_actual_q, dtype=float))))
             )
             raise TimeoutError(
@@ -738,12 +822,12 @@ def move_arms_to_initial_state(
         if now >= next_status_time:
             left_error = (
                 "unavailable"
-                if node.left_actual_q is None
+                if left_target is None or node.left_actual_q is None
                 else f"{np.max(np.abs(left_target - np.asarray(node.left_actual_q, dtype=float))):.4f} rad"
             )
             right_error = (
                 "unavailable"
-                if node.right_actual_q is None
+                if right_target is None or node.right_actual_q is None
                 else f"{np.max(np.abs(right_target - np.asarray(node.right_actual_q, dtype=float))):.4f} rad"
             )
             print(f"Initial-state max joint error: left={left_error}, right={right_error}")
@@ -757,8 +841,25 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
     ReplayNode = build_replay_node_class(Node, JointState, Float32)
 
     targets = split_targets(data)
-    left_gripper_targets = None if args.no_gripper else continuous_gripper_targets(targets["left_gripper_raw"])
-    right_gripper_targets = None if args.no_gripper else continuous_gripper_targets(targets["right_gripper_raw"])
+    end_effector = str(data.trajectory_config["end_effector"])
+    active_arms = list(data.trajectory_config["arms"])
+    left_gripper_targets = (
+        None if end_effector != "gripper" or args.no_gripper or "left" not in active_arms
+        else continuous_gripper_targets(targets["left_gripper_raw"])
+    )
+    right_gripper_targets = (
+        None if end_effector != "gripper" or args.no_gripper or "right" not in active_arms
+        else continuous_gripper_targets(targets["right_gripper_raw"])
+    )
+    hand_sockets: dict[str, Any] = {}
+    if end_effector == "hand":
+        context = zmq.Context()
+        for side, port in (("left", args.left_hand_command_port), ("right", args.right_hand_command_port)):
+            if side in active_arms:
+                socket = context.socket(zmq.PUSH)
+                socket.setsockopt(zmq.SNDHWM, 2)
+                socket.connect(f"tcp://127.0.0.1:{port}")
+                hand_sockets[side] = socket
     args.output.mkdir(parents=True, exist_ok=True)
 
     write_json(
@@ -777,12 +878,15 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
             "initial_state_max_acceleration_rad_per_s2": args.initial_state_max_acceleration,
             "initial_state_position_tolerance_rad": args.initial_state_position_tolerance,
             "no_gripper": args.no_gripper,
+            "trajectory_config": data.trajectory_config,
             "allow_missing_state": args.allow_missing_state,
             "trace_file": TRACE_FILENAME,
         },
     )
 
     rclpy.init()
+    args.active_arms = active_arms
+    args.robot_end_effector = end_effector
     node = ReplayNode(args)
     commands = start_command_listener()
     trace_path = args.output / TRACE_FILENAME
@@ -842,11 +946,18 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
                     break
 
                 rclpy.spin_once(node, timeout_sec=0.0)
-                left_target = np.asarray(targets["left_arm"][local_idx], dtype=float)
-                right_target = np.asarray(targets["right_arm"][local_idx], dtype=float)
+                left_target = (
+                    None if "left" not in active_arms else np.asarray(targets["left_arm"][local_idx], dtype=float)
+                )
+                right_target = (
+                    None if "right" not in active_arms else np.asarray(targets["right_arm"][local_idx], dtype=float)
+                )
                 left_gripper = None if left_gripper_targets is None else float(left_gripper_targets[local_idx])
                 right_gripper = None if right_gripper_targets is None else float(right_gripper_targets[local_idx])
                 node.publish_targets(left_target, right_target, left_gripper, right_gripper)
+                if end_effector == "hand":
+                    for side, socket in hand_sockets.items():
+                        socket.send_pyobj(np.asarray(targets[f"{side}_hand"][local_idx], dtype=float))
                 rclpy.spin_once(node, timeout_sec=0.0)
                 last_controller_ready = node.controller_ready(args.no_gripper)
 
@@ -896,11 +1007,29 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+        for socket in hand_sockets.values():
+            socket.close(0)
+        if end_effector == "hand":
+            context.term()
 
 
 def main() -> None:
     args = parse_args()
+    if args.internal_wuji_hand is not None:
+        port = args.left_hand_command_port if args.internal_wuji_hand == "left" else args.right_hand_command_port
+        run_wuji_hand_process(args.internal_wuji_hand, port, args.hand_ip)
+        return
     data = load_episode_data(args.dataset_root, args.episode)
+    recorded_end_effector = str(data.trajectory_config["end_effector"])
+    recorded_arm_mode = str(data.trajectory_config["arm_mode"])
+    if args.robot_end_effector is None:
+        args.robot_end_effector = recorded_end_effector
+    if args.robot_arm_mode is None:
+        args.robot_arm_mode = recorded_arm_mode
+    validate_setting(data.trajectory_config, args.robot_end_effector, args.robot_arm_mode)
+    if args.robot_end_effector != "gripper" and args.no_gripper:
+        raise ValueError("--no-gripper is only valid when replaying a gripper trajectory.")
+    args.no_gripper = args.robot_end_effector != "gripper"
     data = select_frame_range(data, args.start_frame, args.end_frame, args.max_frames)
     fps = float(args.fps if args.fps is not None else data.fps)
     if not np.isfinite(fps) or fps <= 0:

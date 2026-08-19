@@ -34,6 +34,12 @@ This repo uses two different Python environments:
 Data collection and replay instructions live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md).
 - [`scripts/start_teleoperation.sh`](scripts/start_teleoperation.sh): start left-, right-, or dual-arm GELLO/FR3 teleoperation with matching Franka grippers or Wuji hands.
 - `start_teleoperation.sh` accepts exactly one end-effector mode (`--arm`, `--gripper`, or `--hand`) and one arm selection (`--left`, `--right`, or `--duo`).
+
+All launchers can be invoked from a bare shell; manually activating Conda is
+not required. ROS-only processes use the system ROS Python. LeRobot, policy,
+and Wuji processes use the `lerobot` Conda environment automatically without
+changing the calling shell. Set `LEROBOT_CONDA_ENV`, `WUJI_CONDA_ENV`, or
+`DEPLOYMENT_CONDA_ENV` to select a differently named environment.
 - [`scripts/start_data_collection_client.sh`](scripts/start_data_collection_client.sh): start control-host GELLO/Franka teleoperation for split collection.
 - [`data_collection/wuji/`](data_collection/wuji/): Python Wuji-glove teleoperation publisher with FR3/GELLO-compatible ROS topics.
 - [`scripts/start_data_collection_server.sh`](scripts/start_data_collection_server.sh): start the data-server RealSense publishers, ROS bridge, and optional recorder.

@@ -7,7 +7,7 @@ set -euo pipefail
 # domain/network with this host.
 #
 # Usage:
-#   ./scripts/start_data_collection_server.sh --duo|--single --gripper|--no-gripper|--hand [--record]
+#   ./scripts/start_data_collection_server.sh --duo|--left|--right --arm|--gripper|--hand [--record]
 #                                               [--local-dir PATH]
 #                                               [--repo-id ID]
 #
@@ -16,13 +16,15 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/start_data_collection_server.sh --duo|--single --gripper|--no-gripper|--hand [options]
+Usage: ./scripts/start_data_collection_server.sh --duo|--left|--right --arm|--gripper|--hand [options]
 
 Required:
   --duo                 Record both arms and three cameras.
-  --single              Record the left arm and two cameras.
+  --left                Record the left arm and two cameras.
+  --right               Record the right arm and two cameras.
+  --single              Compatibility alias for --left.
   --gripper             Include gripper state/action data.
-  --no-gripper          Record arm data without gripper topics.
+  --arm, --no-gripper   Record arm data without end-effector topics.
   --hand                Include 20-joint Wuji hand current and target angles.
 
 Options:
@@ -57,14 +59,16 @@ ros_distro="${DATA_SERVER_ROS_DISTRO:-${ROS_DISTRO:-}}"
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
-    --duo|--single)
-      [[ -z "${arm_mode}" ]] || die "choose only one of --duo or --single"
+    --duo|--left|--right|--single)
+      [[ -z "${arm_mode}" ]] || die "choose only one of --duo, --left, or --right"
       arm_mode="${1#--}"
+      [[ "${arm_mode}" != "single" ]] || arm_mode="left"
       shift
       ;;
-    --gripper|--no-gripper|--hand)
-      [[ -z "${gripper_mode}" ]] || die "choose only one of --gripper, --no-gripper, or --hand"
+    --arm|--gripper|--no-gripper|--hand)
+      [[ -z "${gripper_mode}" ]] || die "choose only one of --arm, --gripper, or --hand"
       gripper_mode="${1#--}"
+      [[ "${gripper_mode}" != "no-gripper" ]] || gripper_mode="arm"
       shift
       ;;
     --record) record=1; shift ;;
@@ -98,6 +102,8 @@ done
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
+# shellcheck source=scripts/conda_env.sh
+source "${script_dir}/conda_env.sh"
 
 if [[ -n "${ros_distro}" ]]; then
   ros_setup_file="/opt/ros/${ros_distro}/setup.bash"
@@ -193,19 +199,15 @@ start_process "LeRobot data bridge" \
   "publish_host:=${bridge_host}" "publish_port:=${bridge_port}" \
   "include_gripper:=$([[ "${gripper_mode}" == "gripper" ]] && echo true || echo false)" \
   "include_hand:=$([[ "${gripper_mode}" == "hand" ]] && echo true || echo false)" \
+  "arm_mode:=${arm_mode}" \
   "hand_telemetry_host:=${bridge_host}" "hand_telemetry_port:=${hand_telemetry_port}"
 
-required_bridge_topics=(
-  "/left/joint_states"
-  "/left/gello/raw_joint_states"
-  "/left/gello/accepted_joint_states"
-)
-if [[ "${arm_mode}" == "duo" ]]; then
-  required_bridge_topics+=(
-    "/right/joint_states"
-    "/right/gello/raw_joint_states"
-    "/right/gello/accepted_joint_states"
-  )
+required_bridge_topics=()
+if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "left" ]]; then
+  required_bridge_topics+=("/left/joint_states" "/left/gello/raw_joint_states" "/left/gello/accepted_joint_states")
+fi
+if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "right" ]]; then
+  required_bridge_topics+=("/right/joint_states" "/right/gello/raw_joint_states" "/right/gello/accepted_joint_states")
 fi
 for topic in "${required_bridge_topics[@]}"; do
   if ! timeout 10s ros2 topic echo \
@@ -217,14 +219,17 @@ for topic in "${required_bridge_topics[@]}"; do
 done
 
 if [[ "${record}" -eq 1 ]]; then
-  command -v python >/dev/null 2>&1 || die "python is required for --record (activate the lerobot environment)"
+  lerobot_conda_env="${LEROBOT_CONDA_ENV:-lerobot}"
+  declare -a recorder_python=()
+  real_exp_build_conda_python_command "${lerobot_conda_env}" recorder_python || exit 1
+  real_exp_require_conda_python_modules "${lerobot_conda_env}" lerobot pyarrow zmq numpy || die \
+    "the '${lerobot_conda_env}' Conda environment is missing LeRobot recorder dependencies"
   start_process "LeRobot recorder" \
-    python "${repository_root}/data_collection/lerobot_collection.py" \
+    "${recorder_python[@]}" "${repository_root}/data_collection/lerobot_collection.py" \
     --host "${bridge_host}" --port "${bridge_port}" \
     --repo-id "${repo_id}" --local-dir "${local_dir}"
 else
-  echo "Recorder not started. On this server run:"
-  echo "  python data_collection/lerobot_collection.py --host ${bridge_host} --port ${bridge_port}"
+  echo "Recorder not started. Restart this launcher with --record to launch it automatically."
 fi
 
 echo "Data-server stack is running. Press Ctrl-C to stop it."

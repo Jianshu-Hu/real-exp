@@ -26,6 +26,7 @@ CRITICAL_METADATA_FILES = [
     Path("meta/tasks.parquet"),
     Path("meta/stats.json"),
     Path("meta/real_exp_action_config.json"),
+    Path("meta/real_exp_trajectory_config.json"),
 ]
 DATASET_ALLOW_PATTERNS = [
     "README.md",
@@ -101,7 +102,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Do not explicitly upload meta/info.json, meta/tasks.parquet, meta/stats.json, "
-            "and meta/real_exp_action_config.json after the normal LeRobot push."
+            "meta/real_exp_action_config.json, and meta/real_exp_trajectory_config.json "
+            "after the normal LeRobot push."
         ),
     )
     return parser.parse_args()

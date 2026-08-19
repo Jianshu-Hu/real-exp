@@ -22,6 +22,11 @@ if str(LOCAL_LEROBOT_SRC) not in sys.path:
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from utils.dataset_stats import ensure_dataset_stats, normalize_episode_metadata
+from data_collection.trajectory_metadata import (
+    TRAJECTORY_CONFIG_PATH,
+    trajectory_config_from_packet,
+    write_trajectory_config,
+)
 
 LEROBOT_INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
@@ -29,23 +34,20 @@ SYSTEM_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_i
 
 
 def clamp_gripper_values(values: np.ndarray) -> np.ndarray:
-    """Return a copy with 16-D gripper values clamped to the normalized [0, 1] range.
-
-    Arm-only and hand-augmented vectors are copied unchanged. Gripper layouts
-    retain the historical normalization for 16-D dual-arm packets.
-    """
+    """Clamp gripper widths while leaving arm and Wuji hand layouts unchanged."""
     result = np.asarray(values, dtype=np.float32).copy()
     if result.ndim != 1:
         raise ValueError(f"Expected a one-dimensional action/state vector, got shape {result.shape}.")
-    if result.size in {14, 27, 54}:
+    if result.size in {7, 14, 27, 54}:
         return result
-    if result.size != 16:
+    if result.size not in {8, 16}:
         raise ValueError(
-            "Expected a 14-D arm-only, 16-D gripper, 27-D single-arm hand, or "
+            "Expected a 7/14-D arm-only, 8/16-D gripper, 27-D single-arm hand, or "
             "54-D dual-arm hand vector for normalization; "
             f"got {result.size} dimensions."
         )
-    result[[7, 15]] = np.clip(result[[7, 15]], 0.0, 1.0)
+    gripper_indices = [7] if result.size == 8 else [7, 15]
+    result[gripper_indices] = np.clip(result[gripper_indices], 0.0, 1.0)
     return result
 
 
@@ -231,20 +233,27 @@ def make_dataset(
 ) -> tuple[LeRobotDataset, list[str], bool]:
     features, camera_names = build_features(first_packet)
     action_config = action_config_from_packet(first_packet)
+    trajectory_config = trajectory_config_from_packet(first_packet)
     if is_lerobot_dataset_root(dataset_root):
         dataset = LeRobotDataset.resume(
             repo_id=repo_id,
             root=dataset_root,
         )
         existing_action_config = load_action_config(dataset_root)
+        trajectory_config_path = dataset_root / TRAJECTORY_CONFIG_PATH
+        existing_trajectory_config = (
+            json.loads(trajectory_config_path.read_text()) if trajectory_config_path.exists() else None
+        )
         resolved_existing_action_config = (
             existing_action_config if existing_action_config is not None else assumed_legacy_action_config(first_packet)
         )
         if (
             normalize_feature_specs(dataset.features) == normalize_feature_specs(features)
             and resolved_existing_action_config == action_config
+            and (existing_trajectory_config is None or existing_trajectory_config == trajectory_config)
         ):
             write_action_config(dataset_root, action_config)
+            write_trajectory_config(dataset_root, trajectory_config)
             return dataset, camera_names, True
 
         existing_features = sorted(normalize_feature_specs(dataset.features))
@@ -264,6 +273,9 @@ def make_dataset(
         else:
             print(f"  existing action config: assumed legacy {resolved_existing_action_config}")
         print(f"  incoming action config: {action_config}")
+        if existing_trajectory_config is not None:
+            print(f"  existing trajectory config: {existing_trajectory_config}")
+        print(f"  incoming trajectory config: {trajectory_config}")
         dataset_root = compatible_root
 
     dataset = LeRobotDataset.create(
@@ -274,6 +286,7 @@ def make_dataset(
         root=dataset_root,
     )
     write_action_config(dataset_root, action_config)
+    write_trajectory_config(dataset_root, trajectory_config)
     return dataset, camera_names, False
 
 
@@ -297,33 +310,22 @@ def compute_recorded_action(
     next_action = np.asarray(next_packet["action"], dtype=np.float32)
     action_dim = int(current_packet["action_dim"])
 
-    if action_dim == 16:
-        recorded_action = np.empty(16, dtype=np.float32)
-        recorded_action[0:7] = next_action[0:7]
-        recorded_action[7] = current_action[7]
-        recorded_action[8:15] = next_action[8:15]
-        recorded_action[15] = current_action[15]
-        return recorded_action
-
-    if action_dim == 14:
-        recorded_action = np.empty(14, dtype=np.float32)
-        recorded_action[0:7] = next_action[0:7]
-        recorded_action[7:14] = next_action[7:14]
-        return recorded_action
-
-    if action_dim == 27:
-        recorded_action = np.empty(27, dtype=np.float32)
-        recorded_action[0:7] = next_action[0:7]
-        recorded_action[7:27] = next_action[7:27]
-        return recorded_action
-
-    if action_dim == 54:
-        recorded_action = np.empty(54, dtype=np.float32)
-        recorded_action[0:27] = next_action[0:27]
-        recorded_action[27:54] = next_action[27:54]
-        return recorded_action
-
-    raise ValueError(f"Unsupported action dimension for recorder absolute target transform: {action_dim}")
+    trajectory_config = trajectory_config_from_packet(current_packet)
+    end_effector = trajectory_config["end_effector"]
+    arms = trajectory_config["arms"]
+    block_size = 7 + (1 if end_effector == "gripper" else 20 if end_effector == "hand" else 0)
+    expected_dim = block_size * len(arms)
+    if action_dim != expected_dim:
+        raise ValueError(f"Trajectory metadata expects {expected_dim} action values, got {action_dim}.")
+    recorded_action = np.empty(action_dim, dtype=np.float32)
+    for arm_index in range(len(arms)):
+        offset = arm_index * block_size
+        recorded_action[offset : offset + 7] = next_action[offset : offset + 7]
+        if end_effector == "gripper":
+            recorded_action[offset + 7] = current_action[offset + 7]
+        elif end_effector == "hand":
+            recorded_action[offset + 7 : offset + 27] = next_action[offset + 7 : offset + 27]
+    return recorded_action
 
 
 def packet_pair_to_frame(
@@ -444,6 +446,11 @@ def main() -> None:
                     f"arm={action_config_from_packet(packet)['arm_action_representation']} "
                     f"({action_config_from_packet(packet)['arm_action_definition']}), "
                     f"gripper={action_config_from_packet(packet)['gripper_action_representation']}"
+                )
+                trajectory_config = trajectory_config_from_packet(packet)
+                print(
+                    "  trajectory setting: "
+                    f"{trajectory_config['end_effector']} / {trajectory_config['arm_mode']}"
                 )
                 print(f"  cameras: {', '.join(camera_names)}")
 

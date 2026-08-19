@@ -108,6 +108,8 @@ done
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
+# shellcheck source=scripts/conda_env.sh
+source "${script_dir}/conda_env.sh"
 gello_config_dir="${repository_root}/gello_software/ros2/src/franka_gello_state_publisher/config"
 arm_config_dir="${repository_root}/gello_software/ros2/src/franka_fr3_arm_controllers/config"
 gripper_config_dir="${repository_root}/gello_software/ros2/src/franka_gripper_manager/config"
@@ -507,11 +509,15 @@ fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
+# shellcheck source=scripts/conda_env.sh
+source "${script_dir}/conda_env.sh"
 example_dir="${repository_root}/libs/wuji-retargeting/example"
 teleop_program="${repository_root}/data_collection/wuji_telemetry_proxy.py"
 
 [[ -r "${teleop_program}" ]] || die "Wuji teleoperation adapter not found: ${teleop_program}"
-command -v python >/dev/null 2>&1 || die "python is not available in the current environment"
+wuji_conda_env="${WUJI_CONDA_ENV:-${LEROBOT_CONDA_ENV:-lerobot}}"
+declare -a wuji_python=()
+real_exp_build_conda_python_command "${wuji_conda_env}" wuji_python || exit 1
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
 command -v env >/dev/null 2>&1 || die "required command not found: env"
 command -v flock >/dev/null 2>&1 || die "required command not found: flock"
@@ -529,15 +535,9 @@ for side in "${selected_sides[@]}"; do
 done
 
 if [[ "${validate_only}" -eq 1 ]]; then
-  PYTHONPATH= LD_LIBRARY_PATH= python - <<'PY' || die "the current Python environment cannot import Wuji teleoperation dependencies"
-import importlib
-
-for module_name in ("nlopt", "pinocchio", "wuji_sdk", "wujihandpy", "yaml", "zmq"):
-    try:
-        importlib.import_module(module_name)
-    except Exception as exc:
-        raise SystemExit(f"{module_name}: {exc}")
-PY
+  real_exp_require_conda_python_modules "${wuji_conda_env}" \
+    nlopt pinocchio wuji_sdk wujihandpy yaml zmq || die \
+    "the '${wuji_conda_env}' Conda environment cannot import Wuji teleoperation dependencies"
   exit 0
 fi
 
@@ -567,7 +567,7 @@ start_wuji_side() {
   [[ -r "${example_dir}/${config}" ]] || die "Wuji ${side} config not found: ${example_dir}/${config}"
 
   command=(
-    python "${teleop_program}"
+    "${wuji_python[@]}" "${teleop_program}"
     --input wuji_glove
     --hand "${side}"
     --device-name "${device_name}"

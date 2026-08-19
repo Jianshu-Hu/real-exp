@@ -129,8 +129,12 @@ python3 data_collection/reset_pylibfranka.py \
   --frame-index 0
 ```
 
-For a complete bimanual replay setup, use the replay supervisor from the
-repository root. It starts both FR3 controllers, both Franka-hand managers,
+For replay, use the replay supervisor from the repository root. It reads
+`meta/real_exp_trajectory_config.json`, validates the requested current robot
+setting, and refuses a mismatch before starting replay. When no setting flags
+are supplied, it uses the recorded setting. It starts the required FR3
+controllers and, for gripper or Wuji-hand trajectories, the matching
+end-effector processes,
 waits for the FR3 controller nodes and arm state topics, starts the gripper
 managers, waits for both gripper-client nodes and gripper state topics, and only
 waits for each gripper client's command subscription (after homing and client
@@ -141,6 +145,19 @@ bash scripts/replay.sh \
   --dataset-root data/test-pick-and-place-new \
   --episode 0
 ```
+
+Explicit settings are useful as a hardware safety check:
+
+```bash
+bash scripts/replay.sh \
+  --dataset-root data/test-pick-and-place-new --episode 0 \
+  --gripper --duo
+```
+
+The command exits before starting controllers if the trajectory was recorded
+with a different end-effector or arm selection. A gripper trajectory therefore
+cannot be replayed with `--arm`, and a Wuji-hand trajectory cannot be replayed
+without its hand workers connecting successfully.
 
 After you enter `s`, replay first commands both arms to the first selected
 `observation.state` and waits for them to settle. The replay clock and recorded

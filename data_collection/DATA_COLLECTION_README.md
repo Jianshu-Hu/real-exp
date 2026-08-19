@@ -228,7 +228,7 @@ Press `Ctrl-C` once to stop the complete teleoperation stack. If any managed
 process fails, the script stops the remaining processes and returns the failing
 process's status. `--gripper` selects matching Franka grippers; `--hand` starts
 the matching Wuji glove-to-Wuji Hand 2 process instead. Run
-`start_arm_only_teleop.sh` directly when no end-effector controller is wanted.
+Use `start_teleoperation.sh --arm --left` (or `--right`/`--duo`) when no end-effector controller is wanted.
 
 ### Configuration Notes
 

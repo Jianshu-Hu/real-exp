@@ -129,9 +129,9 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
 example_dir="${repository_root}/libs/wuji-retargeting/example"
-teleop_program="${example_dir}/teleop_real.py"
+teleop_program="${repository_root}/scripts/wuji_telemetry_proxy.py"
 
-[[ -r "${teleop_program}" ]] || die "Wuji teleoperation program not found: ${teleop_program}"
+[[ -r "${teleop_program}" ]] || die "Wuji teleoperation adapter not found: ${teleop_program}"
 command -v python >/dev/null 2>&1 || die "python is not available in the current environment"
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
 command -v env >/dev/null 2>&1 || die "required command not found: env"

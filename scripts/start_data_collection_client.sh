@@ -45,40 +45,15 @@ export ROS_LOCALHOST_ONLY=0
 export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 arm_side="--${arm_mode}"
 [[ "${arm_mode}" == "single" ]] && arm_side="--left"
+teleop_launcher="${script_dir}/start_teleoperation.sh"
 
-if [[ "${data_mode}" != "hand" ]]; then
-  exec "${script_dir}/start_arm_only_teleop.sh" "${arm_side}" "--${data_mode}"
+if [[ "${data_mode}" == "gripper" ]]; then
+  exec "${teleop_launcher}" --gripper "${arm_side}"
+elif [[ "${data_mode}" == "no-gripper" ]]; then
+  exec "${teleop_launcher}" --arm "${arm_side}"
 fi
 
 server_host="${DATA_COLLECTION_SERVER_IP:-192.168.50.13}"
 telemetry_port="${HAND_TELEMETRY_PORT:-5558}"
-declare -a child_pids=()
-shutdown_started=0
-shutdown() {
-  local status=$?
-  [[ "${shutdown_started}" -eq 0 ]] || return
-  shutdown_started=1
-  trap - EXIT INT TERM
-  for child_pid in "${child_pids[@]}"; do
-    kill -INT -- "-${child_pid}" 2>/dev/null || true
-  done
-  for child_pid in "${child_pids[@]}"; do wait "${child_pid}" 2>/dev/null || true; done
-  exit "${status}"
-}
-trap shutdown EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-setsid -- "${script_dir}/start_arm_only_teleop.sh" "${arm_side}" --no-gripper &
-child_pids+=("$!")
-wuji_args=("--${arm_mode}")
-[[ "${arm_mode}" == "single" ]] && wuji_args=("--left")
-setsid -- "${script_dir}/start_wuji_only_teleop.sh" "${wuji_args[@]}" \
-  --telemetry-host "${server_host}" --telemetry-port "${telemetry_port}" &
-child_pids+=("$!")
-echo "Arm and Wuji hand teleoperation are running. Press Ctrl-C to stop."
-set +e
-wait -n -p completed_pid "${child_pids[@]}"
-status=$?
-set -e
-exit "${status}"
+exec "${teleop_launcher}" --hand "${arm_side}" \
+  --telemetry-host "${server_host}" --telemetry-port "${telemetry_port}"

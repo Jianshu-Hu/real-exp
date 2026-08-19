@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Unified GELLO/FR3 arm plus Franka-gripper or Wuji-hand teleoperation launcher.
+# Unified GELLO/FR3 arm, Franka-gripper, and Wuji-hand teleoperation launcher.
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/start_teleoperation.sh --duo|--left|--right --gripper|--hand [Wuji options]
+Usage: ./scripts/start_teleoperation.sh --arm|--gripper|--hand --duo|--left|--right [Wuji options]
 
 Arm selection:
   --duo                    Use both left and right arms.
@@ -13,6 +13,7 @@ Arm selection:
   --right                  Use only the right arm.
 
 End effector:
+  --arm                    Use the arm only; no end-effector process.
   --gripper                Use the matching Franka gripper(s).
   --hand                   Use the matching Wuji glove/hand pair(s).
 
@@ -21,12 +22,14 @@ Wuji options (used only with --hand):
   --right-glove-sn SN      Right Wuji Glove serial.
   --left-hand-ip ADDR      Left Wuji Hand 2 SDK address (IP:port).
   --right-hand-ip ADDR     Right Wuji Hand 2 SDK address (IP:port).
+  --telemetry-host IP      Data-server host for hand telemetry.
+  --telemetry-port PORT    Data-server ZMQ port for hand telemetry.
 
 Examples:
-  ./scripts/start_teleoperation.sh --left --gripper
-  ./scripts/start_teleoperation.sh --right --hand
-  ./scripts/start_teleoperation.sh --duo --gripper
-  ./scripts/start_teleoperation.sh --duo --hand \
+  ./scripts/start_teleoperation.sh --gripper --left
+  ./scripts/start_teleoperation.sh --hand --right
+  ./scripts/start_teleoperation.sh --arm --duo
+  ./scripts/start_teleoperation.sh --hand --duo \
     --left-glove-sn <LEFT_SN> --right-glove-sn <RIGHT_SN> \
     --left-hand-ip <LEFT_IP:PORT> --right-hand-ip <RIGHT_IP:PORT>
 
@@ -51,12 +54,12 @@ while [[ "$#" -gt 0 ]]; do
       side_mode="${1#--}"
       shift
       ;;
-    --gripper|--hand)
-      [[ -z "${end_effector}" ]] || die "choose only one of --gripper or --hand"
+    --arm|--gripper|--hand)
+      [[ -z "${end_effector}" ]] || die "choose only one of --arm, --gripper, or --hand"
       end_effector="${1#--}"
       shift
       ;;
-    --left-glove-sn|--right-glove-sn|--left-hand-ip|--right-hand-ip)
+    --left-glove-sn|--right-glove-sn|--left-hand-ip|--right-hand-ip|--telemetry-host|--telemetry-port)
       [[ "$#" -ge 2 ]] || die "$1 requires a value"
       wuji_options+=("$1" "$2")
       shift 2
@@ -76,7 +79,7 @@ done
   exit 2
 }
 [[ "${end_effector}" == "hand" || "${#wuji_options[@]}" -eq 0 ]] || die \
-  "Wuji device options are valid only with --hand"
+  "Wuji and telemetry options are valid only with --hand"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 arm_launcher="${script_dir}/start_arm_only_teleop.sh"
@@ -167,7 +170,10 @@ trap shutdown EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-if [[ "${end_effector}" == "gripper" ]]; then
+if [[ "${end_effector}" == "arm" ]]; then
+  start_component "FR3 arm" \
+    "${arm_launcher}" "--${side_mode}" --no-gripper
+elif [[ "${end_effector}" == "gripper" ]]; then
   start_component "FR3 arm and Franka gripper" \
     "${arm_launcher}" "--${side_mode}" --gripper
 else

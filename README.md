@@ -33,8 +33,7 @@ This repo uses two different Python environments:
 
 Data collection and replay instructions live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md).
 - [`scripts/start_teleoperation.sh`](scripts/start_teleoperation.sh): start left-, right-, or dual-arm GELLO/FR3 teleoperation with matching Franka grippers or Wuji hands.
-- [`scripts/start_arm_only_teleop.sh`](scripts/start_arm_only_teleop.sh): start the GELLO/FR3 stack alone, optionally with matching Franka gripper control.
-- [`scripts/start_wuji_only_teleop.sh`](scripts/start_wuji_only_teleop.sh): start left, right, or dual Wuji glove-to-hand teleoperation without the FR3 arm stack.
+- `start_teleoperation.sh` accepts exactly one end-effector mode (`--arm`, `--gripper`, or `--hand`) and one arm selection (`--left`, `--right`, or `--duo`).
 - [`scripts/start_data_collection_client.sh`](scripts/start_data_collection_client.sh): start control-host GELLO/Franka teleoperation for split collection.
 - [`data_collection/wuji/`](data_collection/wuji/): Python Wuji-glove teleoperation publisher with FR3/GELLO-compatible ROS topics.
 - [`scripts/start_data_collection_server.sh`](scripts/start_data_collection_server.sh): start the data-server RealSense publishers, ROS bridge, and optional recorder.

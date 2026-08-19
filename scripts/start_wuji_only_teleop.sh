@@ -136,8 +136,15 @@ for side in "${selected_sides[@]}"; do
 done
 
 if [[ "${validate_only}" -eq 1 ]]; then
-  python -c 'import nlopt, pinocchio, wuji_sdk, wujihandpy, yaml' >/dev/null || die \
-    "the current Python environment is missing a Wuji teleoperation dependency"
+  PYTHONPATH= LD_LIBRARY_PATH= python - <<'PY' || die "the current Python environment cannot import Wuji teleoperation dependencies"
+import importlib
+
+for module_name in ("nlopt", "pinocchio", "wuji_sdk", "wujihandpy", "yaml"):
+    try:
+        importlib.import_module(module_name)
+    except Exception as exc:
+        raise SystemExit(f"{module_name}: {exc}")
+PY
   exit 0
 fi
 
@@ -182,7 +189,12 @@ start_wuji_side() {
     exec 9>&-
     # Restore signals ignored by Bash for asynchronous jobs before starting
     # the per-hand process in its own session.
-    exec setsid -- env --default-signal=INT,QUIT,TERM -- "${command[@]}"
+    # Wuji standalone teleoperation does not import ROS Python modules. A
+    # caller may have sourced ROS setup files, which prepend the ROS Humble
+    # Python 3.10 Pinocchio package and libraries ahead of this Python 3.12
+    # environment. Clear both paths so imports resolve from the active
+    # environment only.
+    exec setsid -- env --default-signal=INT,QUIT,TERM PYTHONPATH= LD_LIBRARY_PATH= "${command[@]}"
   ) &
   local child_pid=$!
   child_pids+=("${child_pid}")

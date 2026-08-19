@@ -18,6 +18,8 @@ Device selection:
   --right-glove-sn SN      Right Wuji Glove serial.
   --left-hand-ip ADDR      Left Wuji Hand 2 SDK address (IP:port).
   --right-hand-ip ADDR     Right Wuji Hand 2 SDK address (IP:port).
+  --telemetry-host IP      Data-server host for hand telemetry.
+  --telemetry-port PORT    Data-server ZMQ port for hand telemetry.
 
 Environment defaults:
   WUJI_LEFT_GLOVE_SN
@@ -44,6 +46,8 @@ left_glove_sn="${WUJI_LEFT_GLOVE_SN:-}"
 right_glove_sn="${WUJI_RIGHT_GLOVE_SN:-WG1KA06260623515}"
 left_hand_ip="${WUJI_LEFT_HAND_IP:-}"
 right_hand_ip="${WUJI_RIGHT_HAND_IP:-}"
+telemetry_host="${DATA_COLLECTION_SERVER_IP:-}"
+telemetry_port="${HAND_TELEMETRY_PORT:-0}"
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -74,6 +78,16 @@ while [[ "$#" -gt 0 ]]; do
       [[ "$#" -ge 2 ]] || die "--right-hand-ip requires an IP:port address"
       right_hand_ip="$2"
       right_option_given=1
+      shift 2
+      ;;
+    --telemetry-host)
+      [[ "$#" -ge 2 ]] || die "--telemetry-host requires an address"
+      telemetry_host="$2"
+      shift 2
+      ;;
+    --telemetry-port)
+      [[ "$#" -ge 2 ]] || die "--telemetry-port requires a port"
+      telemetry_port="$2"
       shift 2
       ;;
     --help)
@@ -139,7 +153,7 @@ if [[ "${validate_only}" -eq 1 ]]; then
   PYTHONPATH= LD_LIBRARY_PATH= python - <<'PY' || die "the current Python environment cannot import Wuji teleoperation dependencies"
 import importlib
 
-for module_name in ("nlopt", "pinocchio", "wuji_sdk", "wujihandpy", "yaml"):
+for module_name in ("nlopt", "pinocchio", "wuji_sdk", "wujihandpy", "yaml", "zmq"):
     try:
         importlib.import_module(module_name)
     except Exception as exc:
@@ -182,6 +196,8 @@ start_wuji_side() {
   )
   [[ -z "${glove_sn}" ]] || command+=(--glove-sn "${glove_sn}")
   [[ -z "${hand_ip}" ]] || command+=(--wuji-hand-2-ip "${hand_ip}")
+  [[ -z "${telemetry_host}" ]] || command+=(--telemetry-host "${telemetry_host}")
+  [[ "${telemetry_port}" == "0" ]] || command+=(--telemetry-port "${telemetry_port}")
 
   echo "Starting ${side} Wuji glove/hand teleoperation"
   (

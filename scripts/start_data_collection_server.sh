@@ -7,7 +7,7 @@ set -euo pipefail
 # domain/network with this host.
 #
 # Usage:
-#   ./scripts/start_data_collection_server.sh --duo|--single --gripper|--no-gripper [--record]
+#   ./scripts/start_data_collection_server.sh --duo|--single --gripper|--no-gripper|--hand [--record]
 #                                               [--local-dir PATH]
 #                                               [--repo-id ID]
 #
@@ -16,13 +16,14 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/start_data_collection_server.sh --duo|--single --gripper|--no-gripper [options]
+Usage: ./scripts/start_data_collection_server.sh --duo|--single --gripper|--no-gripper|--hand [options]
 
 Required:
   --duo                 Record both arms and three cameras.
   --single              Record the left arm and two cameras.
   --gripper             Include gripper state/action data.
   --no-gripper          Record arm data without gripper topics.
+  --hand                Include 20-joint Wuji hand current and target angles.
 
 Options:
   --record              Start the LeRobot recorder on this server.
@@ -31,6 +32,8 @@ Options:
   --bridge-host IP      Address on which the bridge publishes samples
                         (default: ${DATA_COLLECTION_SERVER_IP:-192.168.50.13}).
   --bridge-port PORT    ZMQ sample port (default: 5555).
+  --hand-telemetry-port PORT
+                        ZMQ port for hand telemetry (default: 5558).
   --ros-domain-id ID    Set ROS_DOMAIN_ID for this process (default: environment or 0).
   --ros-distro DISTRO   ROS 2 distribution installed under /opt/ros (default:
                         DATA_SERVER_ROS_DISTRO, current ROS_DISTRO, or the only
@@ -48,6 +51,7 @@ local_dir="./lerobot_data"
 repo_id="local/franka_gello_teleop"
 bridge_host="${DATA_COLLECTION_SERVER_IP:-192.168.50.13}"
 bridge_port="5555"
+hand_telemetry_port="${HAND_TELEMETRY_PORT:-5558}"
 ros_domain_id="${ROS_DOMAIN_ID:-0}"
 ros_distro="${DATA_SERVER_ROS_DISTRO:-${ROS_DISTRO:-}}"
 
@@ -58,8 +62,8 @@ while [[ "$#" -gt 0 ]]; do
       arm_mode="${1#--}"
       shift
       ;;
-    --gripper|--no-gripper)
-      [[ -z "${gripper_mode}" ]] || die "choose only one of --gripper or --no-gripper"
+    --gripper|--no-gripper|--hand)
+      [[ -z "${gripper_mode}" ]] || die "choose only one of --gripper, --no-gripper, or --hand"
       gripper_mode="${1#--}"
       shift
       ;;
@@ -76,6 +80,9 @@ while [[ "$#" -gt 0 ]]; do
     --bridge-port)
       [[ "$#" -ge 2 ]] || die "--bridge-port requires a port"
       bridge_port="$2"; shift 2 ;;
+    --hand-telemetry-port)
+      [[ "$#" -ge 2 ]] || die "--hand-telemetry-port requires a port"
+      hand_telemetry_port="$2"; shift 2 ;;
     --ros-domain-id)
       [[ "$#" -ge 2 ]] || die "--ros-domain-id requires an id"
       ros_domain_id="$2"; shift 2 ;;
@@ -184,7 +191,9 @@ start_process "LeRobot data bridge" \
   ros2 launch franka_lerobot_data_bridge bridge.launch.py \
   "config_file:=${config_file}" \
   "publish_host:=${bridge_host}" "publish_port:=${bridge_port}" \
-  "include_gripper:=$([[ "${gripper_mode}" == "gripper" ]] && echo true || echo false)"
+  "include_gripper:=$([[ "${gripper_mode}" == "gripper" ]] && echo true || echo false)" \
+  "include_hand:=$([[ "${gripper_mode}" == "hand" ]] && echo true || echo false)" \
+  "hand_telemetry_host:=${bridge_host}" "hand_telemetry_port:=${hand_telemetry_port}"
 
 required_bridge_topics=(
   "/left/joint_states"

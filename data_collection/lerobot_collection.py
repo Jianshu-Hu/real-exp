@@ -31,17 +31,18 @@ SYSTEM_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_i
 def clamp_gripper_values(values: np.ndarray) -> np.ndarray:
     """Return a copy with 16-D gripper values clamped to the normalized [0, 1] range.
 
-    Arm-only 14-D vectors are copied unchanged. Other dimensions are rejected
-    because their gripper layout is ambiguous.
+    Arm-only and hand-augmented vectors are copied unchanged. Gripper layouts
+    retain the historical normalization for 16-D dual-arm packets.
     """
     result = np.asarray(values, dtype=np.float32).copy()
     if result.ndim != 1:
         raise ValueError(f"Expected a one-dimensional action/state vector, got shape {result.shape}.")
-    if result.size == 14:
+    if result.size in {14, 27, 54}:
         return result
     if result.size != 16:
         raise ValueError(
-            "Expected a 14-D arm-only or 16-D dual-arm vector for gripper clamping; "
+            "Expected a 14-D arm-only, 16-D gripper, 27-D single-arm hand, or "
+            "54-D dual-arm hand vector for normalization; "
             f"got {result.size} dimensions."
         )
     result[[7, 15]] = np.clip(result[[7, 15]], 0.0, 1.0)
@@ -129,8 +130,11 @@ def action_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "arm_action_definition": arm_action_definition,
         "gripper_action_representation": gripper_action_representation,
         "gripper_action_definition": gripper_action_definition,
+        "hand_action_representation": "absolute_joint_position",
+        "hand_action_definition": "hand_q_target[t+1]",
         "include_right_arm": bool(packet.get("include_right_arm", True)),
         "include_gripper": bool(packet.get("include_gripper", True)),
+        "include_hand": bool(packet.get("include_hand", False)),
         "action_dim": int(packet["action_dim"]),
     }
 
@@ -159,8 +163,11 @@ def assumed_legacy_action_config(packet: dict[str, Any]) -> dict[str, Any]:
         "arm_action_definition": "q[t+1]-q[t]",
         "gripper_action_representation": "absolute_width",
         "gripper_action_definition": "open_width_percent",
+        "hand_action_representation": "absolute_joint_position",
+        "hand_action_definition": "hand_q_target[t+1]",
         "include_right_arm": bool(packet.get("include_right_arm", True)),
         "include_gripper": bool(packet.get("include_gripper", True)),
+        "include_hand": bool(packet.get("include_hand", False)),
         "action_dim": int(packet["action_dim"]),
     }
 
@@ -302,6 +309,18 @@ def compute_recorded_action(
         recorded_action = np.empty(14, dtype=np.float32)
         recorded_action[0:7] = next_action[0:7]
         recorded_action[7:14] = next_action[7:14]
+        return recorded_action
+
+    if action_dim == 27:
+        recorded_action = np.empty(27, dtype=np.float32)
+        recorded_action[0:7] = next_action[0:7]
+        recorded_action[7:27] = next_action[7:27]
+        return recorded_action
+
+    if action_dim == 54:
+        recorded_action = np.empty(54, dtype=np.float32)
+        recorded_action[0:27] = next_action[0:27]
+        recorded_action[27:54] = next_action[27:54]
         return recorded_action
 
     raise ValueError(f"Unsupported action dimension for recorder absolute target transform: {action_dim}")

@@ -15,6 +15,7 @@ import pickle  # nosec
 import sys
 import time
 import traceback
+import threading
 from concurrent import futures
 from collections import deque
 from dataclasses import asdict
@@ -24,6 +25,7 @@ from queue import Empty
 from typing import Any
 
 import torch
+import zmq
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -81,6 +83,23 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=2.0,
         help="Observation queue timeout in seconds.",
+    )
+    serve_parser.add_argument(
+        "--camera-cache-address",
+        default="tcp://127.0.0.1:5557",
+        help="Loopback ZMQ camera-bundle cache published by the deployment bridge.",
+    )
+    serve_parser.add_argument(
+        "--max-observation-age",
+        type=float,
+        default=0.25,
+        help="Reject policy requests whose referenced camera bundle is older than this many seconds.",
+    )
+    serve_parser.add_argument(
+        "--max-camera-skew",
+        type=float,
+        default=0.067,
+        help="Reject camera bundles whose inter-camera timestamp skew exceeds this value.",
     )
     serve_parser.add_argument(
         "--diffusion-noise-scheduler-type",
@@ -171,6 +190,7 @@ def raw_observation_to_observation_with_resize_pad(
     lerobot_features: dict[str, dict],
     policy_image_features: dict[str, Any],
     image_preprocess: ResizePadSquare | None,
+    rename_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     from lerobot.async_inference.helpers import (
         extract_images_from_raw_observation,
@@ -189,9 +209,14 @@ def raw_observation_to_observation_with_resize_pad(
 
     for image_key in image_keys:
         raw_image = extract_images_from_raw_observation(lerobot_obs, image_key)
+        policy_image_key = (rename_map or {}).get(image_key, image_key)
+        if policy_image_key not in policy_image_features:
+            # A live bridge may expose more cameras than a policy consumes. Keep the
+            # observation contract permissive and omit those images before preprocessing.
+            continue
         resized_image = resize_pad_robot_observation_image(
             torch.as_tensor(raw_image),
-            policy_image_features[image_key].shape,
+            policy_image_features[policy_image_key].shape,
             image_preprocess,
         )
         observation[image_key] = prepare_image(resized_image).unsqueeze(0)
@@ -202,9 +227,195 @@ def raw_observation_to_observation_with_resize_pad(
     return observation
 
 
+class CameraBundleCache:
+    """Bounded server-local cache of synchronized camera bundles from the ROS bridge."""
+
+    def __init__(self, address: str, max_entries: int = 8) -> None:
+        if max_entries <= 0:
+            raise ValueError(f"max_entries must be positive, got {max_entries}")
+        self.address = address
+        self.max_entries = max_entries
+        self._bundles: dict[int, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._shutdown = threading.Event()
+        self._context = zmq.Context()
+        self._socket = self._context.socket(zmq.SUB)
+        self._socket.setsockopt(zmq.RCVHWM, max_entries)
+        self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        self._socket.connect(address)
+        self._thread = threading.Thread(target=self._receive_loop, daemon=True, name="camera-bundle-cache")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def close(self) -> None:
+        self._shutdown.set()
+        self._thread.join(timeout=1.0)
+        self._socket.close(0)
+        self._context.term()
+
+    def _receive_loop(self) -> None:
+        poller = zmq.Poller()
+        poller.register(self._socket, zmq.POLLIN)
+        while not self._shutdown.is_set():
+            if self._socket not in dict(poller.poll(100)):
+                continue
+            packet = self._socket.recv_pyobj()
+            if not isinstance(packet, dict):
+                continue
+            sequence = packet.get("camera_bundle_sequence")
+            cameras = packet.get("cameras")
+            if sequence is None or not isinstance(cameras, dict):
+                continue
+            with self._lock:
+                self._bundles[int(sequence)] = packet
+                for stale_sequence in sorted(self._bundles)[:-self.max_entries]:
+                    self._bundles.pop(stale_sequence, None)
+
+    def get(self, sequence: int) -> dict[str, Any] | None:
+        with self._lock:
+            return self._bundles.get(int(sequence))
+
+
+def resolve_server_local_observation(
+    timed_observation: Any,
+    policy_image_features: dict[str, Any],
+    lerobot_features: dict[str, dict[str, Any]],
+    camera_bundle_cache: CameraBundleCache | None,
+    max_observation_age_s: float,
+    max_camera_skew_s: float,
+    rename_map: dict[str, str] | None = None,
+) -> Any:
+    """Resolve a robot-side metadata packet to the exact server-local RGB bundle.
+
+    This is deliberately independent of ``PolicyServer`` so the cache protocol can be tested
+    without loading a checkpoint or starting gRPC. The function either returns a complete
+    observation or raises a descriptive error before preprocessing can see incomplete images.
+    """
+    raw = timed_observation.get_observation()
+    expected_names = [
+        key.split("observation.images.", 1)[-1]
+        for key, feature in lerobot_features.items()
+        if key.startswith("observation.images.")
+        and feature.get("dtype") in {"image", "video"}
+        and (rename_map or {}).get(key, key) in policy_image_features
+    ]
+    if not expected_names:
+        return timed_observation
+    request_debug = getattr(timed_observation, "deployment_debug", {}) or {}
+    sequence = request_debug.get("camera_bundle_sequence")
+    if sequence is None:
+        raise RuntimeError(
+            "Policy expects camera images, but the observation has no camera_bundle_sequence "
+            "reference for the server-local cache."
+        )
+    if camera_bundle_cache is None:
+        raise RuntimeError("A camera bundle was referenced but the server cache is disabled.")
+
+    bundle = camera_bundle_cache.get(int(sequence))
+    if bundle is None:
+        raise RuntimeError(f"Camera bundle #{sequence} is unavailable or expired from the cache.")
+    cameras = bundle.get("cameras")
+    cached_sequence = bundle.get("camera_bundle_sequence")
+    if cached_sequence is None or int(cached_sequence) != int(sequence):
+        raise RuntimeError(
+            f"Camera cache returned bundle #{cached_sequence} for requested sequence #{sequence}."
+        )
+    if not isinstance(cameras, dict):
+        raise RuntimeError(f"Camera bundle #{sequence} has no camera dictionary.")
+    missing = [name for name in expected_names if name not in cameras]
+    if missing:
+        raise RuntimeError(
+            f"Camera bundle #{sequence} is missing policy cameras: {', '.join(missing)}."
+        )
+
+    camera_sync = bundle.get("camera_sync") or {}
+    if not camera_sync.get("bundle_ready", False):
+        raise RuntimeError(f"Camera bundle #{sequence} is not marked ready.")
+    camera_stamps: dict[str, float] = {}
+    for name in expected_names:
+        camera = cameras[name]
+        if not isinstance(camera, dict) or "rgb" not in camera:
+            raise RuntimeError(f"Camera bundle #{sequence} has no RGB payload for '{name}'.")
+        image = camera["rgb"]
+        expected_shape = (lerobot_features.get(f"observation.images.{name}") or {}).get("shape")
+        actual_shape = tuple(getattr(image, "shape", ()))
+        declared_shape = tuple(camera.get("shape", ()))
+        if expected_shape and declared_shape and tuple(expected_shape) != declared_shape:
+            raise RuntimeError(
+                f"Camera '{name}' shape {declared_shape} in bundle #{sequence} does not match "
+                f"the live feature contract {tuple(expected_shape)}."
+            )
+        if declared_shape and actual_shape and declared_shape != actual_shape:
+            raise RuntimeError(
+                f"Camera '{name}' declares shape {declared_shape} but carries RGB shape {actual_shape}."
+            )
+        stamp_s = camera.get("stamp_s")
+        if stamp_s is None:
+            raise RuntimeError(f"Camera bundle #{sequence} has no timestamp for '{name}'.")
+        camera_stamps[name] = float(stamp_s)
+
+    computed_skew_s = max(camera_stamps.values()) - min(camera_stamps.values())
+    declared_skew_s = camera_sync.get("max_skew_s")
+    if declared_skew_s is not None and float(declared_skew_s) > max_camera_skew_s:
+        raise RuntimeError(
+            f"Camera bundle #{sequence} skew {float(declared_skew_s):.3f}s exceeds "
+            f"{max_camera_skew_s:.3f}s."
+        )
+    if computed_skew_s > max_camera_skew_s:
+        raise RuntimeError(
+            f"Camera bundle #{sequence} computed skew {computed_skew_s:.3f}s exceeds "
+            f"{max_camera_skew_s:.3f}s."
+        )
+
+    reference_s = camera_sync.get("reference_stamp_s")
+    if reference_s is None:
+        reference_s = bundle.get("bridge_publish_s")
+    if reference_s is None:
+        raise RuntimeError(f"Camera bundle #{sequence} has no freshness timestamp.")
+    age_s = time.time() - float(reference_s)
+    if age_s < -1.0 or age_s > max_observation_age_s:
+        raise RuntimeError(
+            f"Camera bundle #{sequence} age {age_s:.3f}s is outside the allowed "
+            f"window ({max_observation_age_s:.3f}s)."
+        )
+
+    state_stamp_s = request_debug.get("robot_state_stamp_s")
+    if state_stamp_s is None:
+        state_stamp_s = bundle.get("robot_state_stamp_s")
+    if state_stamp_s is None:
+        raise RuntimeError(f"Observation referencing camera bundle #{sequence} has no robot-state timestamp.")
+    state_age_s = time.time() - float(state_stamp_s)
+    if state_age_s < -1.0 or state_age_s > max_observation_age_s:
+        raise RuntimeError(
+            f"Observation robot-state age {state_age_s:.3f}s is outside the allowed "
+            f"window ({max_observation_age_s:.3f}s)."
+        )
+    state_camera_skew_s = abs(float(state_stamp_s) - float(reference_s))
+    if state_camera_skew_s > max_observation_age_s:
+        raise RuntimeError(
+            f"Observation state/camera skew {state_camera_skew_s:.3f}s exceeds "
+            f"{max_observation_age_s:.3f}s for bundle #{sequence}."
+        )
+
+    raw.update({name: cameras[name]["rgb"] for name in expected_names})
+    timed_observation.deployment_debug = {
+        **request_debug,
+        "camera_bundle_age_s_at_server": age_s,
+        "robot_state_age_s_at_server": state_age_s,
+        "camera_computed_skew_s_at_server": computed_skew_s,
+        "state_camera_skew_s_at_server": state_camera_skew_s,
+        "camera_sync": camera_sync,
+    }
+    return timed_observation
+
+
 def make_deployment_policy_server(
     diffusion_cli_overrides: list[str] | None = None,
     diffusion_fixed_noise_seed: int | None = None,
+    camera_bundle_cache: CameraBundleCache | None = None,
+    max_observation_age_s: float = 0.25,
+    max_camera_skew_s: float = 0.067,
 ):
     from lerobot.async_inference.constants import SUPPORTED_POLICIES
     from lerobot.async_inference.helpers import Observation, RemotePolicyConfig
@@ -213,6 +424,17 @@ def make_deployment_policy_server(
     from lerobot.transport import services_pb2
 
     class DeploymentPolicyServer(PolicyServer):
+        def _resolve_server_local_observation(self, timed_observation):
+            return resolve_server_local_observation(
+                timed_observation,
+                self.policy_image_features,
+                self.lerobot_features,
+                camera_bundle_cache,
+                max_observation_age_s,
+                max_camera_skew_s,
+                self.rename_map,
+            )
+
         def SendPolicyInstructions(self, request, context):  # noqa: N802
             if not self.running:
                 self.logger.warning("Server is not running. Ignoring policy instructions.")
@@ -241,6 +463,7 @@ def make_deployment_policy_server(
             self.device = policy_specs.device
             self.policy_type = policy_specs.policy_type
             self.lerobot_features = policy_specs.lerobot_features
+            self.rename_map = policy_specs.rename_map
             self.actions_per_chunk = policy_specs.actions_per_chunk
 
             pretrained_path = Path(policy_specs.pretrained_name_or_path).expanduser()
@@ -336,6 +559,7 @@ def make_deployment_policy_server(
                 self.lerobot_features,
                 self.policy_image_features,
                 self.image_preprocess,
+                self.rename_map,
             )
             observation = self.preprocessor(observation)
             self.last_processed_obs = observation_t
@@ -434,6 +658,14 @@ def make_deployment_policy_server(
                 request_iterator, None, self.shutdown_event, self.logger
             )
             timed_observation = pickle.loads(received_bytes)  # nosec
+            try:
+                timed_observation = self._resolve_server_local_observation(timed_observation)
+            except Exception as exc:
+                self.logger.error(f"Rejecting deployment observation: {exc}")
+                timed_observation.rejected_reason = str(exc)
+                if timed_observation.must_go:
+                    self._enqueue_observation(timed_observation)
+                return services_pb2.Empty()
 
             if self.policy_type == "diffusion" and self.preprocessor is not None:
                 try:
@@ -463,6 +695,10 @@ def make_deployment_policy_server(
             try:
                 getactions_starts = time.perf_counter()
                 obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
+                rejected_reason = getattr(obs, "rejected_reason", None)
+                if rejected_reason:
+                    self.logger.error(f"Action request rejected: {rejected_reason}")
+                    return services_pb2.Empty()
 
                 with self._predicted_timesteps_lock:
                     self._predicted_timesteps.add(obs.get_timestep())
@@ -493,14 +729,22 @@ def serve_deployment_policy_server(
     cfg,
     diffusion_cli_overrides: list[str] | None = None,
     diffusion_fixed_noise_seed: int | None = None,
+    camera_cache_address: str = "tcp://127.0.0.1:5557",
+    max_observation_age_s: float = 0.25,
+    max_camera_skew_s: float = 0.067,
 ) -> None:
     import grpc
 
     from lerobot.transport import services_pb2_grpc
 
+    camera_bundle_cache = CameraBundleCache(camera_cache_address)
+    camera_bundle_cache.start()
     DeploymentPolicyServer = make_deployment_policy_server(
         diffusion_cli_overrides,
         diffusion_fixed_noise_seed=diffusion_fixed_noise_seed,
+        camera_bundle_cache=camera_bundle_cache,
+        max_observation_age_s=max_observation_age_s,
+        max_camera_skew_s=max_camera_skew_s,
     )
 
     logging.info(pformat(asdict(cfg)))
@@ -512,8 +756,11 @@ def serve_deployment_policy_server(
 
     policy_server.logger.info(f"PolicyServer started on {cfg.host}:{cfg.port}")
     server.start()
-    server.wait_for_termination()
-    policy_server.logger.info("Server terminated")
+    try:
+        server.wait_for_termination()
+    finally:
+        camera_bundle_cache.close()
+        policy_server.logger.info("Server terminated")
 
 
 def inspect_policy(policy_path: Path, dataset_root: Path) -> None:
@@ -626,6 +873,9 @@ def run_server(args: argparse.Namespace) -> None:
         cfg,
         diffusion_cli_overrides=diffusion_cli_overrides,
         diffusion_fixed_noise_seed=fixed_noise_seed,
+        camera_cache_address=args.camera_cache_address,
+        max_observation_age_s=args.max_observation_age,
+        max_camera_skew_s=args.max_camera_skew,
     )
 
 

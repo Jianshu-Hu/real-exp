@@ -13,22 +13,26 @@ import json
 import os
 import pickle  # nosec
 import subprocess  # nosec
+import sys
 import threading
 import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 import torch
 
-# from lerobot.async_inference.configs import get_aggregate_function
 from lerobot.async_inference.helpers import RemotePolicyConfig, TimedAction, TimedObservation
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from deploy.action_aggregation import TemporalProposalAggregator
+
+
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_DEPLOYMENT_LOG_ROOT = DEFAULT_OUTPUT_ROOT / "deployment_logs"
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "test-limit-pick-and-place"
@@ -115,12 +119,13 @@ def parse_args() -> argparse.Namespace:
         help="Optional deployment log run name. Defaults to a timestamp plus policy/chunk settings.",
     )
     parser.add_argument(
-        "--act-aggregate-ratio-old",
+        "--temporal-proposal-decay",
         type=float,
-        default=0.8,
+        default=0.5,
         help=(
-            "ACT-only weight assigned to the queued action when aggregating overlapping timesteps. "
-            "The blended action is old_ratio * old + (1 - old_ratio) * new."
+            "Exponential generation-age decay for overlapping action proposals. The newest "
+            "proposal has weight 1 and each older generation has weight decay**age. "
+            "Defaults to 0.5."
         ),
     )
     return parser.parse_args()
@@ -128,11 +133,6 @@ def parse_args() -> argparse.Namespace:
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
-
-
-def get_aggregate_function(old_ration: float) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Build an aggregate function from the queued-action ratio."""
-    return lambda old, new: old_ration * old + (1.0 - old_ration) * new
 
 
 def infer_policy_type(policy_path: Path) -> str:
@@ -185,7 +185,9 @@ def packet_to_raw_observation(packet: dict[str, Any], task: str) -> dict[str, An
     state = np.asarray(packet["state"], dtype=np.float32)
     raw_observation: dict[str, Any] = {f"state_{idx}": float(value) for idx, value in enumerate(state)}
     for camera_name in packet["camera_names"]:
-        raw_observation[camera_name] = np.asarray(packet["cameras"][camera_name]["rgb"], dtype=np.uint8)
+        camera = packet["cameras"][camera_name]
+        if "rgb" in camera:
+            raw_observation[camera_name] = np.asarray(camera["rgb"], dtype=np.uint8)
     raw_observation["task"] = task
     return raw_observation
 
@@ -229,11 +231,11 @@ def default_run_name(args: argparse.Namespace) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     policy_name = args.policy_path.expanduser().name
     threshold = args.act_chunk_size_threshold
-    aggregate_ratio = args.act_aggregate_ratio_old
+    proposal_decay = args.temporal_proposal_decay
     return (
         f"{timestamp}_{policy_name}_act"
         f"_apc{args.actions_per_chunk or 'auto'}"
-        f"_thr{threshold:g}_{aggregate_ratio}"
+        f"_thr{threshold:g}_decay{proposal_decay:g}"
     )
 
 
@@ -276,14 +278,13 @@ class FrankaPolicyExecutor:
             raise ValueError(
                 f"--act-chunk-size-threshold must be between 0 and 1, got {args.act_chunk_size_threshold}"
             )
-        if not 0.0 <= args.act_aggregate_ratio_old <= 1.0:
+        if not 0.0 <= args.temporal_proposal_decay <= 1.0:
             raise ValueError(
-                f"--act-aggregate-ratio-old must be between 0 and 1, got {args.act_aggregate_ratio_old}"
+                "--temporal-proposal-decay must be between 0 and 1, "
+                f"got {args.temporal_proposal_decay}"
             )
         self.chunk_size_threshold = args.act_chunk_size_threshold
-        self.aggregate_ratio_old = args.act_aggregate_ratio_old
-
-        self.aggregate_fn = get_aggregate_function(self.aggregate_ratio_old)
+        self.temporal_proposal_decay = args.temporal_proposal_decay
         self.dataset_info = load_json(self.dataset_root / INFO_REL_PATH)
         action_config_path = self.dataset_root / ACTION_CONFIG_REL_PATH
         if not action_config_path.exists():
@@ -309,6 +310,7 @@ class FrankaPolicyExecutor:
         self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
 
         self.action_queue: deque[TimedAction] = deque()
+        self.action_aggregator = TemporalProposalAggregator(self.temporal_proposal_decay)
         self.action_queue_lock = threading.Lock()
         self.inflight_observation_lock = threading.Lock()
         self.log_lock = threading.Lock()
@@ -332,7 +334,7 @@ class FrankaPolicyExecutor:
 
     def _gripper_action_representation(self) -> str:
         return str(
-            self.action_config.get("gripper_action_representation", "binary_open_close")
+            self.action_config.get("gripper_action_representation", "absolute_width")
         ).strip().lower()
 
     def _joint_targets_from_action(self, split: dict[str, Any]) -> dict[str, list[float]]:
@@ -400,9 +402,8 @@ class FrankaPolicyExecutor:
             "camera_names": list(first_packet["camera_names"]),
             "actions_per_chunk": self.actions_per_chunk,
             "chunk_size_threshold": self.chunk_size_threshold,
-            "aggregate_ratio_old": self.aggregate_ratio_old,
+            "temporal_proposal_decay": self.temporal_proposal_decay,
             "act_chunk_size_threshold": self.args.act_chunk_size_threshold,
-            "act_aggregate_ratio_old": self.args.act_aggregate_ratio_old,
             "fps": self.args.fps,
             "task": self.args.task,
             "execute": self.args.execute,
@@ -569,11 +570,12 @@ class FrankaPolicyExecutor:
         if value is None:
             return None
         representation = self._gripper_action_representation()
-        if representation == "binary_open_close":
-            return 1.0 if float(value) >= 0.5 else 0.0
         if representation == "absolute_width":
             return max(0.0, min(1.0, float(value)))
-        raise ValueError(f"Unsupported gripper action representation '{representation}' for bridge execution.")
+        raise ValueError(
+            "Deployment requires continuous gripper action representation 'absolute_width'; "
+            f"got {representation!r}. Retrain or regenerate action metadata instead of thresholding it."
+        )
 
     def _set_bridge_active(self, active: bool) -> None:
         if self.args.no_auto_activate_bridge:
@@ -657,32 +659,48 @@ class FrankaPolicyExecutor:
             queue_fraction = len(self.action_queue) / float(max(self.action_chunk_size, 1))
         return queue_fraction <= self.chunk_size_threshold
 
+    def _observation_debug_metadata(
+        self, observation: TimedObservation, current_packet: dict[str, Any]
+    ) -> dict[str, Any]:
+        camera_sync = current_packet.get("camera_sync") or {}
+        return {
+            "observation_timestep": observation.get_timestep(),
+            "camera_bundle_sequence": current_packet.get(
+                "camera_bundle_sequence", camera_sync.get("bundle_sequence")
+            ),
+            "bridge_publish_s": current_packet.get("bridge_publish_s"),
+            "robot_state_stamp_s": current_packet.get("robot_state_stamp_s"),
+            "robot_state_freshness": current_packet.get("robot_state_freshness"),
+            "camera_sync": camera_sync,
+            "camera_freshness": current_packet.get("camera_freshness"),
+            "executor_send_s": time.time(),
+        }
+
     def _aggregate_action_queue(self, incoming_actions: list[TimedAction]) -> dict[str, Any]:
         with self.action_queue_lock:
             current_queue = {action.get_timestep(): action for action in self.action_queue}
             latest_executed_timestep = self.latest_executed_timestep
+            generation = self.action_aggregator.begin_chunk()
 
             added = 0
             blended = 0
             dropped = 0
+            overlap_diagnostics = []
             for new_action in incoming_actions:
                 timestep = new_action.get_timestep()
                 if timestep <= latest_executed_timestep:
                     dropped += 1
                     continue
 
+                new_action.action = self.action_aggregator.add(
+                    timestep, generation, np.asarray(new_action.get_action(), dtype=np.float32)
+                )
                 if timestep not in current_queue:
-                    current_queue[timestep] = new_action
                     added += 1
-                    continue
-
-                old_action = current_queue[timestep]
-                old_tensor = torch.as_tensor(np.asarray(old_action.get_action(), dtype=np.float32))
-                new_tensor = torch.as_tensor(np.asarray(new_action.get_action(), dtype=np.float32))
-                blended_tensor = self.aggregate_fn(old_tensor, new_tensor)
-                new_action.action = blended_tensor.detach().cpu().numpy()
+                else:
+                    blended += 1
+                    overlap_diagnostics.append(self.action_aggregator.diagnostics(timestep))
                 current_queue[timestep] = new_action
-                blended += 1
 
             # Drop any stale timesteps again while still holding the queue lock, so an action
             # executed concurrently with chunk reception cannot be reinserted into the queue.
@@ -691,6 +709,7 @@ class FrankaPolicyExecutor:
                 dropped += len(stale_timesteps)
                 for timestep in stale_timesteps:
                     current_queue.pop(timestep, None)
+                    self.action_aggregator.discard(timestep)
 
             ordered_timesteps = sorted(current_queue)
             self.action_queue = deque(current_queue[timestep] for timestep in ordered_timesteps)
@@ -702,6 +721,8 @@ class FrankaPolicyExecutor:
             "queue_size": len(ordered_timesteps),
             "first_timestep": ordered_timesteps[0] if ordered_timesteps else None,
             "last_timestep": ordered_timesteps[-1] if ordered_timesteps else None,
+            "chunk_generation": generation,
+            "overlap_proposals": overlap_diagnostics,
         }
 
     def receive_actions(self) -> None:
@@ -812,6 +833,7 @@ class FrankaPolicyExecutor:
                 return None, queue_before, queue_before
             action = self.action_queue.popleft()
             self.latest_executed_timestep = action.get_timestep()
+            self.action_aggregator.discard(action.get_timestep())
             queue_after = self._queue_snapshot_unlocked()
         return action, queue_before, queue_after
 
@@ -834,7 +856,7 @@ class FrankaPolicyExecutor:
         print(f"dataset_action_dim: {dataset_action_dim}")
         print(f"actions_per_chunk: {self.actions_per_chunk}")
         print(f"chunk_size_threshold: {self.chunk_size_threshold}")
-        print(f"aggregate_ratio_old: {self.aggregate_ratio_old}")
+        print(f"temporal_proposal_decay: {self.temporal_proposal_decay}")
         print(f"execute: {self.args.execute}")
 
         context = zmq.Context()
@@ -889,6 +911,9 @@ class FrankaPolicyExecutor:
                         observation=packet_to_raw_observation(current_packet, self.args.task),
                         timestep=observation_timestep,
                         must_go=must_go,
+                    )
+                    observation.deployment_debug = self._observation_debug_metadata(
+                        observation, current_packet
                     )
                     try:
                         self.send_observation(observation)

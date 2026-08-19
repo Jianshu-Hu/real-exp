@@ -11,6 +11,7 @@ Options:
   --server-ip IP       ZMQ bind address (default: DEPLOYMENT_SERVER_IP or 192.168.50.13)
   --publish-port PORT  Observation ZMQ port (default: 5555)
   --command-port PORT  Command ZMQ port (default: 5556)
+  --camera-cache-port PORT  Loopback full-camera cache port (default: 5557)
   --policy-port PORT   gRPC policy port (default: 8080)
   --bridge-config FILE Bridge config (default: deployment_duo.yaml)
   --ros-domain-id ID   Set ROS_DOMAIN_ID
@@ -26,7 +27,7 @@ die() { echo "Error: $*" >&2; exit 1; }
 validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535)); }
 
 server_ip="${DEPLOYMENT_SERVER_IP:-192.168.50.13}"
-publish_port=5555; command_port=5556; policy_port=8080
+publish_port=5555; command_port=5556; camera_cache_port=5557; policy_port=8080
 bridge_config=deployment_duo.yaml; ros_domain_id="${ROS_DOMAIN_ID:-0}"
 ros_distro="${DEPLOYMENT_ROS_DISTRO:-${ROS_DISTRO:-}}"
 policy_python="${DEPLOYMENT_PYTHON:-python}"
@@ -36,6 +37,7 @@ while [[ "$#" -gt 0 ]]; do
     --server-ip) [[ "$#" -ge 2 ]] || die "$1 requires a value"; server_ip="$2"; shift 2 ;;
     --publish-port) [[ "$#" -ge 2 ]] || die "$1 requires a value"; publish_port="$2"; shift 2 ;;
     --command-port) [[ "$#" -ge 2 ]] || die "$1 requires a value"; command_port="$2"; shift 2 ;;
+    --camera-cache-port) [[ "$#" -ge 2 ]] || die "$1 requires a value"; camera_cache_port="$2"; shift 2 ;;
     --policy-port) [[ "$#" -ge 2 ]] || die "$1 requires a value"; policy_port="$2"; shift 2 ;;
     --bridge-config) [[ "$#" -ge 2 ]] || die "$1 requires a value"; bridge_config="$2"; shift 2 ;;
     --ros-domain-id) [[ "$#" -ge 2 ]] || die "$1 requires a value"; ros_domain_id="$2"; shift 2 ;;
@@ -47,9 +49,12 @@ while [[ "$#" -gt 0 ]]; do
 done
 validate_port "${publish_port}" || die "invalid observation port: ${publish_port}"
 validate_port "${command_port}" || die "invalid command port: ${command_port}"
+validate_port "${camera_cache_port}" || die "invalid camera cache port: ${camera_cache_port}"
 validate_port "${policy_port}" || die "invalid policy port: ${policy_port}"
-[[ "${publish_port}" != "${command_port}" && "${publish_port}" != "${policy_port}" && "${command_port}" != "${policy_port}" ]] || \
-  die "observation, command, and policy ports must be distinct"
+[[ "${publish_port}" != "${command_port}" && "${publish_port}" != "${camera_cache_port}" && \
+   "${publish_port}" != "${policy_port}" && "${command_port}" != "${camera_cache_port}" && \
+   "${command_port}" != "${policy_port}" && "${camera_cache_port}" != "${policy_port}" ]] || \
+  die "observation, command, camera cache, and policy ports must be distinct"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
@@ -96,13 +101,15 @@ shutdown() {
 }
 trap shutdown EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 
-echo "Deployment server: observation tcp://${server_ip}:${publish_port}, command tcp://${server_ip}:${command_port}, gRPC :${policy_port}"
+echo "Deployment server: observation tcp://${server_ip}:${publish_port}, command tcp://${server_ip}:${command_port}, camera cache tcp://127.0.0.1:${camera_cache_port}, gRPC :${policy_port}"
 start_process "RealSense camera publisher" ros2 launch franka_realsense_camera_publisher cameras.launch.py
 start_process "Deployment observation bridge" ros2 launch franka_lerobot_data_bridge bridge.launch.py \
   "config_file:=${bridge_config}" "publish_host:=${server_ip}" "publish_port:=${publish_port}" \
-  "command_host:=${server_ip}" "command_port:=${command_port}"
+  "command_host:=${server_ip}" "command_port:=${command_port}" \
+  "camera_cache_host:=127.0.0.1" "camera_cache_port:=${camera_cache_port}"
 start_process "Policy server" "${policy_python}" "${repository_root}/deploy/deploy_lerobot_policy.py" server \
-  --host 0.0.0.0 --port "${policy_port}" --fps 15
+  --host 0.0.0.0 --port "${policy_port}" --fps 15 \
+  --camera-cache-address "tcp://127.0.0.1:${camera_cache_port}"
 echo "Deployment server is running. Press Ctrl-C to stop all children."
 set +e; completed_pid=""; wait -n -p completed_pid "${child_pids[@]}"; status=$?; set -e
 echo "${child_names[${completed_pid}]} exited with status ${status}." >&2; exit "${status}"

@@ -187,32 +187,34 @@ and Franka workspaces, validates the required GELLO USB aliases, starts and
 verifies the matching FR3 controller before starting GELLO (the controller owns
 the accepted-target topic), and optionally starts gripper control.
 
-Dual-arm teleoperation with gripper control:
+Dual-arm teleoperation with Franka gripper control:
 
 ```bash
 cd ~/real-exp
 ./scripts/start_teleoperation.sh --duo --gripper
 ```
 
-Dual-arm teleoperation without gripper control:
+Dual-arm teleoperation with Wuji hands:
 
 ```bash
 cd ~/real-exp
-./scripts/start_teleoperation.sh --duo --no-gripper
+./scripts/start_teleoperation.sh --duo --hand \
+  --left-glove-sn <LEFT_SN> --right-glove-sn <RIGHT_SN> \
+  --left-hand-ip <LEFT_IP:PORT> --right-hand-ip <RIGHT_IP:PORT>
 ```
 
-Single left-arm teleoperation with gripper control:
+Left-arm teleoperation with Franka gripper control:
 
 ```bash
 cd ~/real-exp
-./scripts/start_teleoperation.sh --single --gripper
+./scripts/start_teleoperation.sh --left --gripper
 ```
 
-Single left-arm teleoperation without gripper control:
+Right-arm teleoperation with its Wuji glove and hand:
 
 ```bash
 cd ~/real-exp
-./scripts/start_teleoperation.sh --single --no-gripper
+./scripts/start_teleoperation.sh --right --hand
 ```
 
 The argument order is interchangeable. Run the following command for the full
@@ -222,19 +224,22 @@ usage summary:
 ./scripts/start_teleoperation.sh --help
 ```
 
-Press `Ctrl-C` once to stop the complete teleoperation stack. If any managed ROS
-launch process fails, the script stops the remaining processes and returns the
-failing process's status. With `--gripper`, the script waits until every selected
-arm controller publishes a commanded joint-state message before launching the
-Franka-hand manager.
+Press `Ctrl-C` once to stop the complete teleoperation stack. If any managed
+process fails, the script stops the remaining processes and returns the failing
+process's status. `--gripper` selects matching Franka grippers; `--hand` starts
+the matching Wuji glove-to-Wuji Hand 2 process instead. Run
+`start_arm_only_teleop.sh` directly when no end-effector controller is wanted.
 
 ### Configuration Notes
 
 - GELLO publisher configs live in `gello_software/ros2/src/franka_gello_state_publisher/config/`.
 - FR3 controller configs live in `gello_software/ros2/src/franka_fr3_arm_controllers/config/`.
 - `--duo` selects calibrated `gello_duo.yaml` and `example_fr3_duo_config.yaml`.
-- `--single` selects calibrated `gello_single.yaml` and `example_fr3_config.yaml`.
+- `--left` selects calibrated `gello_single.yaml` and `example_fr3_config.yaml`.
+- `--right` selects `gello_right.yaml` and `example_fr3_right_config.yaml`.
 - `--gripper` selects the matching `example_fr3*_config_franka_hand.yaml` file.
+- `--hand` uses an FR3 config with `load_gripper: false`, so the Franka gripper
+  hardware node is not loaded alongside the Wuji Hand 2 process.
 - `gello_duo.yaml` defines the calibrated left and right GELLO devices for bimanual control.
 - `example_fr3_duo_config.yaml` defines the corresponding left and right FR3 robot IPs and namespaces.
 - If you are switching between single-arm and dual-arm setups, make sure the publisher and controller configs match.

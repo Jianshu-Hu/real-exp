@@ -28,4 +28,12 @@ echo "Run scripts/start_data_collection_server.sh on 192.168.50.13 for cameras a
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
 export ROS_LOCALHOST_ONLY=0
 export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
-exec "${script_dir}/start_teleoperation.sh" "$@"
+arm_arguments=("$@")
+for index in "${!arm_arguments[@]}"; do
+  if [[ "${arm_arguments[${index}]}" == "--single" ]]; then
+    # The data-server interface still calls this mode "single"; the arm-only
+    # launcher uses the physically explicit side name.
+    arm_arguments[${index}]="--left"
+  fi
+done
+exec "${script_dir}/start_arm_only_teleop.sh" "${arm_arguments[@]}"

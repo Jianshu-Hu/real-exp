@@ -16,6 +16,9 @@ from pathlib import Path
 
 import zmq
 
+DEFAULT_TELEMETRY_HOST = "192.168.50.13"
+DEFAULT_TELEMETRY_PORT = 5558
+
 
 def _take_option(argv: list[str], name: str, default: str) -> tuple[list[str], str]:
     remaining: list[str] = []
@@ -35,8 +38,16 @@ def _take_option(argv: list[str], name: str, default: str) -> tuple[list[str], s
 
 
 def main() -> None:
-    argv, telemetry_host = _take_option(sys.argv[1:], "--telemetry-host", os.environ.get("DATA_COLLECTION_SERVER_IP", ""))
-    argv, telemetry_port_text = _take_option(argv, "--telemetry-port", os.environ.get("HAND_TELEMETRY_PORT", "0"))
+    argv, telemetry_host = _take_option(
+        sys.argv[1:],
+        "--telemetry-host",
+        os.environ.get("DATA_COLLECTION_SERVER_IP", DEFAULT_TELEMETRY_HOST),
+    )
+    argv, telemetry_port_text = _take_option(
+        argv,
+        "--telemetry-port",
+        os.environ.get("HAND_TELEMETRY_PORT", str(DEFAULT_TELEMETRY_PORT)),
+    )
     try:
         telemetry_port = int(telemetry_port_text)
     except ValueError as exc:
@@ -53,12 +64,23 @@ def main() -> None:
     if telemetry_host and telemetry_port > 0:
         telemetry_socket = zmq.Context.instance().socket(zmq.PUSH)
         telemetry_socket.setsockopt(zmq.SNDHWM, 2)
+        telemetry_socket.setsockopt(zmq.LINGER, 0)
         telemetry_socket.connect(f"tcp://{telemetry_host}:{telemetry_port}")
         atexit.register(telemetry_socket.close, 0)
+        print(
+            f"Wuji hand telemetry: pushing to tcp://{telemetry_host}:{telemetry_port}",
+            flush=True,
+        )
+    else:
+        print("Wuji hand telemetry: disabled", flush=True)
 
     original_send = teleop_real.WujiHand2Backend.send
+    telemetry_sent = 0
+    telemetry_error_count = 0
+    telemetry_last_error_time = 0.0
 
     def send_with_telemetry(backend, qpos):
+        nonlocal telemetry_sent, telemetry_error_count, telemetry_last_error_time
         original_send(backend, qpos)
         if telemetry_socket is None:
             return
@@ -77,8 +99,20 @@ def main() -> None:
                 },
                 flags=zmq.NOBLOCK,
             )
-        except (AttributeError, RuntimeError, ValueError, zmq.Again):
-            pass
+            telemetry_sent += 1
+            if telemetry_sent == 1:
+                print("Wuji hand telemetry: first packet queued", flush=True)
+        except Exception as exc:
+            telemetry_error_count += 1
+            now = time.monotonic()
+            if telemetry_error_count == 1 or now - telemetry_last_error_time >= 5.0:
+                print(
+                    "Wuji hand telemetry: unable to queue packet "
+                    f"({type(exc).__name__}: {exc}); failures={telemetry_error_count}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                telemetry_last_error_time = now
 
     teleop_real.WujiHand2Backend.send = send_with_telemetry
     teleop_real.main()
@@ -93,4 +127,3 @@ def _hand_side(argv: list[str]) -> str:
 
 if __name__ == "__main__":
     main()
-

@@ -139,6 +139,8 @@ export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
 command -v timeout >/dev/null 2>&1 || die "required command not found: timeout"
+command -v pkill >/dev/null 2>&1 || die "required command not found: pkill"
+command -v ps >/dev/null 2>&1 || die "required command not found: ps"
 command -v ros2 >/dev/null 2>&1 || die "ros2 is unavailable after sourcing ROS ${ros_distro}"
 
 ros_python="/usr/bin/python3"
@@ -153,7 +155,14 @@ PY
 [[ -z "${missing_ros_modules}" ]] || die \
   "missing ROS Python modules for ${ros_python}: ${missing_ros_modules}"
 
-config_file="example_${arm_mode}.yaml"
+# The bridge package calls the left-arm configuration "example_single.yaml"
+# for historical compatibility; keep the command-line mode names independent
+# from package-internal filenames.
+case "${arm_mode}" in
+  left) config_file="example_single.yaml" ;;
+  right|duo) config_file="example_${arm_mode}.yaml" ;;
+  *) die "unsupported arm mode: ${arm_mode}" ;;
+esac
 declare -a child_pids=()
 declare -A child_names=()
 shutdown_started=0
@@ -170,10 +179,33 @@ start_process() {
 signal_running_groups() {
   local signal_name="$1"
   for child_pid in "${child_pids[@]}"; do
+    # Each child is started with setsid, so its PID is also the process-group
+    # and session ID.  Signal both: ROS launch may create descendants that
+    # remain in the session but are no longer in the launcher's process group.
     if kill -0 -- "-${child_pid}" 2>/dev/null; then
       kill -s "${signal_name}" -- "-${child_pid}" 2>/dev/null || true
     fi
+    pkill "-${signal_name}" -s "${child_pid}" 2>/dev/null || true
   done
+}
+
+wait_for_groups_to_stop() {
+  local attempts="$1"
+  local attempt
+
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    local running_group=0
+    for child_pid in "${child_pids[@]}"; do
+      if ps -o stat= --sid "${child_pid}" 2>/dev/null | grep -qv '^[[:space:]]*Z'; then
+        running_group=1
+        break
+      fi
+    done
+    [[ "${running_group}" -eq 0 ]] && return 0
+    sleep 0.1
+  done
+
+  return 1
 }
 
 shutdown() {
@@ -181,7 +213,15 @@ shutdown() {
   [[ "${shutdown_started}" -eq 1 ]] && return
   shutdown_started=1
   trap - EXIT INT TERM
+
   signal_running_groups INT
+  if ! wait_for_groups_to_stop 20; then
+    signal_running_groups TERM
+  fi
+  if ! wait_for_groups_to_stop 30; then
+    echo "Force-stopping unresponsive data-server processes..." >&2
+    signal_running_groups KILL
+  fi
   for child_pid in "${child_pids[@]}"; do wait "${child_pid}" 2>/dev/null || true; done
   exit "${exit_status}"
 }

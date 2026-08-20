@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
@@ -31,6 +32,7 @@ from data_collection.trajectory_metadata import (
 LEROBOT_INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 SYSTEM_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
+DEFAULT_BRIDGE_READY_TIMEOUT_SEC = 2.0
 
 
 def clamp_gripper_values(values: np.ndarray) -> np.ndarray:
@@ -85,7 +87,77 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional task string to override the task name coming from the ROS 2 bridge.",
     )
+    parser.add_argument(
+        "--bridge-ready-timeout",
+        type=float,
+        default=DEFAULT_BRIDGE_READY_TIMEOUT_SEC,
+        help=(
+            "Maximum age in seconds of the latest valid bridge sample when starting an episode "
+            f"(default: {DEFAULT_BRIDGE_READY_TIMEOUT_SEC:g})."
+        ),
+    )
     return parser.parse_args()
+
+
+def bridge_packet_readiness(packet: Any) -> tuple[bool, str]:
+    """Return whether a bridge packet contains enough data to record safely.
+
+    The bridge only publishes after all required arm, end-effector, and camera
+    inputs are ready. Validate the packet shape here as well so a malformed or
+    deployment-only packet cannot arm recording and fail later on the first frame.
+    """
+    if not isinstance(packet, dict):
+        return False, "received a non-dictionary bridge packet"
+
+    try:
+        state = np.asarray(packet["state"], dtype=np.float32)
+        action = np.asarray(packet["action"], dtype=np.float32)
+        robot_state_dim = int(packet["robot_state_dim"])
+        action_dim = int(packet["action_dim"])
+        camera_names = list(packet["camera_names"])
+        cameras = packet["cameras"]
+    except (KeyError, TypeError, ValueError) as exc:
+        return False, f"bridge packet is missing required fields ({exc})"
+
+    if state.ndim != 1 or state.size != robot_state_dim:
+        return False, f"bridge state has shape {state.shape}, expected ({robot_state_dim},)"
+    if action.ndim != 1 or action.size != action_dim:
+        return False, f"bridge action has shape {action.shape}, expected ({action_dim},)"
+    if not isinstance(cameras, dict):
+        return False, "bridge packet cameras field is not a dictionary"
+
+    for camera_name in camera_names:
+        camera = cameras.get(camera_name)
+        if not isinstance(camera, dict) or "rgb" not in camera or "shape" not in camera:
+            return False, f"bridge packet is missing camera data for {camera_name!r}"
+        rgb = np.asarray(camera["rgb"])
+        shape = camera["shape"]
+        if rgb.ndim != 3 or tuple(rgb.shape) != tuple(shape) or rgb.shape[-1] != 3:
+            return False, f"bridge camera {camera_name!r} has invalid RGB shape {rgb.shape}"
+
+    try:
+        action_config_from_packet(packet)
+        trajectory_config_from_packet(packet)
+    except (KeyError, TypeError, ValueError) as exc:
+        return False, f"bridge packet metadata is invalid ({exc})"
+    return True, ""
+
+
+def bridge_is_ready(
+    latest_packet: Any,
+    received_at_monotonic: float | None,
+    now_monotonic: float,
+    max_age_sec: float,
+) -> tuple[bool, str]:
+    """Check that a valid bridge sample has arrived recently enough to record."""
+    if latest_packet is None or received_at_monotonic is None:
+        return False, "no valid bridge sample has been received yet"
+    if max_age_sec <= 0:
+        raise ValueError("bridge-ready timeout must be positive")
+    age_sec = max(0.0, now_monotonic - received_at_monotonic)
+    if age_sec > max_age_sec:
+        return False, f"latest bridge sample is {age_sec:.1f}s old (limit {max_age_sec:.1f}s)"
+    return True, ""
 
 
 def start_command_listener() -> Queue[str]:
@@ -373,23 +445,56 @@ def main() -> None:
     recording_active = False
     episode_count = 0
     pending_packet: dict[str, Any] | None = None
+    latest_packet: dict[str, Any] | None = None
+    latest_packet_received_at: float | None = None
+    last_invalid_packet_warning_at = 0.0
     commands = start_command_listener()
 
     print(f"Listening for ROS 2 bridge samples on tcp://{args.host}:{args.port}")
     print("Episode controls:")
-    print("  s + Enter: start recording a new episode")
+    print("  s + Enter: start recording a new episode (requires a fresh bridge sample)")
     print("  e + Enter: end and save the current episode")
     print("  d + Enter: discard the current episode")
     print("  q + Enter: quit the recorder")
 
     try:
         while True:
+            packet: dict[str, Any] | None = None
+            try:
+                received_packet = socket.recv_pyobj()
+            except zmq.Again:
+                pass
+            else:
+                packet_ready, packet_reason = bridge_packet_readiness(received_packet)
+                if packet_ready:
+                    packet = received_packet
+                    latest_packet = received_packet
+                    latest_packet_received_at = time.monotonic()
+                else:
+                    now = time.monotonic()
+                    if now - last_invalid_packet_warning_at >= 5.0:
+                        print(f"Ignoring invalid bridge packet: {packet_reason}", file=sys.stderr)
+                        last_invalid_packet_warning_at = now
+
             try:
                 while True:
                     command = commands.get_nowait()
                     if command == "s":
                         if recording_active:
                             print("Already recording.")
+                            continue
+                        ready, reason = bridge_is_ready(
+                            latest_packet,
+                            latest_packet_received_at,
+                            time.monotonic(),
+                            args.bridge_ready_timeout,
+                        )
+                        if not ready:
+                            print(
+                                "Cannot start recording: "
+                                f"{reason}. Check that the LeRobot bridge is publishing "
+                                "the selected arm/end-effector data."
+                            )
                             continue
                         if dataset is not None and dataset.has_pending_frames():
                             dataset.clear_episode_buffer()
@@ -422,9 +527,7 @@ def main() -> None:
             except Empty:
                 pass
 
-            try:
-                packet = socket.recv_pyobj()
-            except zmq.Again:
+            if packet is None:
                 continue
 
             if dataset is None:

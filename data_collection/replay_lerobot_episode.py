@@ -209,6 +209,11 @@ def run_wuji_hand_process(side: str, command_port: int, status_port: int, hand_i
                     backend.send(target)
                 else:
                     request = status_socket.recv_pyobj()
+                    if isinstance(request, dict) and str(request.get("kind", "status")) == "initial":
+                        requested_target = np.asarray(request.get("target", []), dtype=np.float64)
+                        if requested_target.shape == (20,) and np.all(np.isfinite(requested_target)):
+                            initial_target = requested_target.copy()
+                            backend.send(requested_target)
                     actual = backend.actual_position()
                     target_position = backend.target_position if initial_target is not None else None
                     target_ready = (
@@ -227,6 +232,7 @@ def run_wuji_hand_process(side: str, command_port: int, status_port: int, hand_i
                         {
                             "ready": True,
                             "initial_reached": reached,
+                            "initial_received": initial_target is not None,
                             "actual": None if actual is None else actual.tolist(),
                             "initial_target": backend.target_position.tolist()
                             if initial_target is not None
@@ -729,9 +735,13 @@ def sleep_with_spin_and_abort(
     return True
 
 
-def request_hand_status(status_socket: Any, timeout_s: float = 1.0) -> dict[str, Any]:
+def request_hand_status(
+    status_socket: Any,
+    request: dict[str, Any] | None = None,
+    timeout_s: float = 1.0,
+) -> dict[str, Any]:
     """Request one hand-worker status response over its REQ/REP channel."""
-    status_socket.send_pyobj({"kind": "status"})
+    status_socket.send_pyobj({"kind": "status"} if request is None else request)
     poller = zmq.Poller()
     poller.register(status_socket, zmq.POLLIN)
     if not poller.poll(max(1, int(timeout_s * 1000))):
@@ -773,11 +783,19 @@ def move_hands_to_initial_state(
         f"Moving {', '.join(targets)} hand(s) to observation.state at frame "
         f"{int(data.frame_indices[0])} before replay. Type `q` + Enter to abort."
     )
+    latest_status: dict[str, dict[str, Any]] = {}
     for side, target in targets.items():
-        hand_sockets[side].send_pyobj({"kind": "initial", "target": target})
+        status = request_hand_status(
+            hand_status_sockets[side],
+            {"kind": "initial", "target": target},
+        )
+        if not bool(status.get("initial_received", False)):
+            raise RuntimeError(f"{side} hand worker did not acknowledge its initial target.")
+        latest_status[side] = status
 
     deadline = time.perf_counter() + timeout_s
     last_status_time = 0.0
+    next_report_time = 0.0
     while rclpy.ok() and time.perf_counter() < deadline:
         if consume_commands(commands) == "q":
             return False
@@ -789,11 +807,33 @@ def move_hands_to_initial_state(
         reached = True
         for side, status_socket in hand_status_sockets.items():
             status = request_hand_status(status_socket)
+            latest_status[side] = status
             if not bool(status.get("initial_reached", False)):
                 reached = False
         if reached:
             print("All trajectory hands reached the episode initial state. Starting action replay.")
             return True
+        if now >= next_report_time:
+            for side, status in latest_status.items():
+                actual = status.get("actual")
+                commanded = status.get("initial_target")
+                if actual is None or commanded is None:
+                    error_text = "measured state unavailable"
+                else:
+                    error = float(
+                        np.max(
+                            np.abs(
+                                np.asarray(actual, dtype=float)
+                                - np.asarray(commanded, dtype=float)
+                            )
+                        )
+                    )
+                    error_text = f"max joint error={error:.4f} rad"
+                print(
+                    f"Initial-state hand status: {side} target_received="
+                    f"{bool(status.get('initial_received', False))}, {error_text}"
+                )
+            next_report_time = now + 1.0
         rclpy.spin_once(node, timeout_sec=0.01)
     raise TimeoutError(
         f"Hands did not reach the episode initial state within {timeout_s:g}s."

@@ -13,9 +13,42 @@ from data_collection.replay_lerobot_episode import (
     arm_reached_initial_state,
     move_arms_to_initial_state,
     parse_args,
+    request_hand_status,
     ramp_initial_state_command,
     wait_for_start,
 )
+
+
+def test_request_hand_status_forwards_initial_target() -> None:
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.sent = None
+
+        def send_pyobj(self, payload: object) -> None:
+            self.sent = payload
+
+        def recv_pyobj(self) -> dict[str, object]:
+            return {"ready": True, "initial_received": True}
+
+    class FakePoller:
+        def register(self, socket: object, event: object) -> None:
+            del socket, event
+
+        def poll(self, timeout_ms: int) -> list[tuple[object, int]]:
+            del timeout_ms
+            return [(object(), 1)]
+
+    import data_collection.replay_lerobot_episode as replay_module
+
+    original_poller = replay_module.zmq.Poller
+    replay_module.zmq.Poller = FakePoller
+    socket = FakeSocket()
+    try:
+        response = request_hand_status(socket, {"kind": "initial", "target": [0.0] * 20})
+    finally:
+        replay_module.zmq.Poller = original_poller
+    assert response["initial_received"] is True
+    assert socket.sent == {"kind": "initial", "target": [0.0] * 20}
 
 
 def make_episode_data() -> EpisodeData:

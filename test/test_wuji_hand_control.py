@@ -119,3 +119,50 @@ def test_smoothed_backend_falls_back_to_joint_state_stream() -> None:
     finally:
         backend.close()
     assert backend._backend._hand.subscription.closed
+
+
+def test_smoothed_backend_uses_urdf_limits_when_sdk_has_no_limit_api() -> None:
+    class FakeSubscription:
+        def recv(self) -> object:
+            return type("Frame", (), {
+                "joints": [
+                    type("Joint", (), {"nid": index, "position": 0.0})()
+                    for index in range(HAND_JOINT_COUNT)
+                ]
+            })()
+
+        def close(self) -> None:
+            return
+
+    class FakeHand:
+        def joint_states(self) -> object:
+            subscription = FakeSubscription()
+            return type("Resource", (), {"subscribe": lambda resource: subscription})()
+
+    class FakeBackend:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            self._hand = FakeHand()
+
+        @staticmethod
+        def send(backend: "FakeBackend", qpos: np.ndarray) -> None:
+            del backend, qpos
+
+        def close(self) -> None:
+            return
+
+    SmoothedBackend = make_smoothed_backend_class(FakeBackend)
+    backend = SmoothedBackend(
+        command_rate_hz=HAND_COMMAND_RATE_HZ,
+        ip="",
+        kp=1.0,
+        kd=0.1,
+        current_limit=1.0,
+        handedness="right",
+    )
+    try:
+        backend.send(np.full(HAND_JOINT_COUNT, 10.0))
+        assert np.all(backend._generator.upper_limits <= 2.1)
+        assert np.all(backend._generator.lower_limits >= -1.5)
+    finally:
+        backend.close()

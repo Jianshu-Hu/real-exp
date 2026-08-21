@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import threading
 import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -19,6 +21,39 @@ HAND_COMMAND_RATE_HZ = 250.0
 HAND_COMMAND_PERIOD_S = 1.0 / HAND_COMMAND_RATE_HZ
 HAND_TARGET_TRANSITION_DURATION_S = 0.10
 HAND_INITIAL_POSITION_TOLERANCE_RAD = 0.05
+
+
+def _urdf_position_limits(handedness: str | None) -> tuple[np.ndarray, np.ndarray] | None:
+    """Load the checked-in Wuji Hand 2 mechanical limits for SDKs without GET support."""
+    side = str(handedness or "right").strip().lower()
+    if side not in ("left", "right"):
+        side = "right"
+    urdf_path = (
+        Path(__file__).resolve().parents[1]
+        / "libs"
+        / "wuji-retargeting"
+        / "wuji_retargeting"
+        / "wuji-description"
+        / "hand2"
+        / "body"
+        / "urdf"
+        / f"{side}.urdf"
+    )
+    try:
+        root = ET.parse(urdf_path).getroot()
+        limits = []
+        for joint in root.findall("joint"):
+            limit = joint.find("limit")
+            if limit is None or "lower" not in limit.attrib or "upper" not in limit.attrib:
+                continue
+            limits.append((float(limit.attrib["lower"]), float(limit.attrib["upper"])))
+        if len(limits) != HAND_JOINT_COUNT:
+            return None
+        lower = np.asarray([item[0] for item in limits], dtype=float)
+        upper = np.asarray([item[1] for item in limits], dtype=float)
+        return upper, lower
+    except (OSError, ET.ParseError, KeyError, TypeError, ValueError):
+        return None
 
 
 def normalize_hand_positions(state: Any) -> np.ndarray | None:
@@ -38,7 +73,7 @@ def normalize_hand_positions(state: Any) -> np.ndarray | None:
 
 
 class HandTrajectoryGenerator:
-    """Generate a smooth position path while enforcing firmware position limits."""
+    """Generate a smooth position path while enforcing validated position limits."""
 
     def __init__(
         self,
@@ -190,9 +225,16 @@ class SmoothedWujiHand2Backend:
             self._backend.close()
             raise RuntimeError("Wuji Hand 2 did not return a valid 20-joint initial state.")
         try:
-            upper, lower = self._backend._hand.get_soft_limits()
-            upper_limits = np.asarray(upper, dtype=float)
-            lower_limits = np.asarray(lower, dtype=float)
+            get_soft_limits = getattr(self._backend._hand, "get_soft_limits", None)
+            if callable(get_soft_limits):
+                upper, lower = get_soft_limits()
+                upper_limits = np.asarray(upper, dtype=float)
+                lower_limits = np.asarray(lower, dtype=float)
+            else:
+                fallback = _urdf_position_limits(handedness)
+                if fallback is None:
+                    raise RuntimeError("No Wuji Hand 2 position-limit source is available.")
+                upper_limits, lower_limits = fallback
         except Exception:
             self._backend.close()
             raise RuntimeError("Could not read Wuji Hand 2 firmware position limits.")

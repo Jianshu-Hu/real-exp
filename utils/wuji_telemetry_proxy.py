@@ -17,6 +17,12 @@ from pathlib import Path
 
 import zmq
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils.wuji_hand_control import make_smoothed_backend_class
+
 DEFAULT_TELEMETRY_HOST = "192.168.50.13"
 DEFAULT_TELEMETRY_PORT = 5558
 DEFAULT_TELEMETRY_RATE_HZ = 15.0
@@ -85,10 +91,22 @@ def main() -> None:
 
     example_dir = Path(__file__).resolve().parents[1] / "libs" / "wuji-retargeting" / "example"
     os.chdir(example_dir)
-    sys.path.insert(0, str(example_dir))
+    # ``wuji_hand_control`` comes from the repository's ``utils`` package,
+    # while ``teleop_real`` imports the submodule-local ``utils.config_paths``.
+    # Remove the cached repository package before importing the submodule.
+    for module_name in list(sys.modules):
+        if module_name == "utils" or module_name.startswith("utils."):
+            del sys.modules[module_name]
+    example_path = str(example_dir)
+    if example_path in sys.path:
+        sys.path.remove(example_path)
+    sys.path.insert(0, example_path)
     sys.argv = [str(example_dir / "teleop_real.py"), *argv]
 
     import teleop_real
+
+    original_backend_class = teleop_real.WujiHand2Backend
+    teleop_real.WujiHand2Backend = make_smoothed_backend_class(original_backend_class)
 
     telemetry_socket = None
     if telemetry_host and telemetry_port > 0:

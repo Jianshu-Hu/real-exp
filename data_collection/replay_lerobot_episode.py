@@ -32,6 +32,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils.trajectory_metadata import load_trajectory_config, validate_setting
+from utils.wuji_hand_control import (
+    HAND_INITIAL_POSITION_TOLERANCE_RAD,
+    make_smoothed_backend_class,
+    normalize_hand_positions,
+)
 
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 TRACE_FILENAME = "trace.csv"
@@ -62,14 +67,14 @@ class EpisodeData:
     })
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Replay a local LeRobot episode through the same ROS 2 collection-controller "
             "topics used during data collection."
         )
     )
-    parser.add_argument("--dataset-root", required=True, type=Path, help="LeRobot dataset root.")
+    parser.add_argument("--dataset-root", type=Path, help="LeRobot dataset root.")
     parser.add_argument("--episode", type=int, default=0, help="Episode index to replay.")
     parser.add_argument("--fps", type=float, default=None, help="Replay FPS. Defaults to dataset metadata fps.")
     parser.add_argument(
@@ -125,6 +130,8 @@ def parse_args() -> argparse.Namespace:
                         help="Connected arm setting; normally supplied by scripts/replay.sh.")
     parser.add_argument("--left-hand-command-port", type=int, default=5561)
     parser.add_argument("--right-hand-command-port", type=int, default=5562)
+    parser.add_argument("--left-hand-status-port", type=int, default=5563, help=argparse.SUPPRESS)
+    parser.add_argument("--right-hand-status-port", type=int, default=5564, help=argparse.SUPPRESS)
     parser.add_argument("--internal-wuji-hand", choices=["left", "right"], default=None,
                         help=argparse.SUPPRESS)
     parser.add_argument("--hand-ip", default="", help=argparse.SUPPRESS)
@@ -141,17 +148,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--right-state-topic", default="/right/franka/joint_states")
     parser.add_argument("--left-gripper-state-topic", default="/left/franka_gripper/joint_states")
     parser.add_argument("--right-gripper-state-topic", default="/right/franka_gripper/joint_states")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.internal_wuji_hand is None and args.dataset_root is None:
+        parser.error("the following arguments are required: --dataset-root")
+    return args
 
 
-def run_wuji_hand_process(side: str, command_port: int, hand_ip: str) -> None:
+def run_wuji_hand_process(side: str, command_port: int, status_port: int, hand_ip: str) -> None:
     """Run the Wuji SDK command process in the non-ROS Python environment."""
     example_dir = Path(__file__).resolve().parents[1] / "libs/wuji-retargeting/example"
     os.chdir(example_dir)
-    sys.path.insert(0, str(example_dir))
-    from teleop_real import WujiHand2Backend
+    # The replay module imports the repository's ``utils`` package before this
+    # worker starts. ``teleop_real`` has a different package with the same name
+    # under the submodule's example directory, so clear the cached repository
+    # package before loading the submodule.
+    for module_name in list(sys.modules):
+        if module_name == "utils" or module_name.startswith("utils."):
+            del sys.modules[module_name]
+    example_path = str(example_dir)
+    if example_path in sys.path:
+        sys.path.remove(example_path)
+    sys.path.insert(0, example_path)
+    from teleop_real import WujiHand2Backend as OriginalWujiHand2Backend
 
-    backend = WujiHand2Backend(
+    backend_class = make_smoothed_backend_class(OriginalWujiHand2Backend)
+    backend = backend_class(
         ip=hand_ip,
         kp=3.0,
         kd=0.1,
@@ -162,18 +183,62 @@ def run_wuji_hand_process(side: str, command_port: int, hand_ip: str) -> None:
     socket = context.socket(zmq.PULL)
     socket.setsockopt(zmq.RCVHWM, 2)
     socket.bind(f"tcp://127.0.0.1:{command_port}")
+    status_socket = context.socket(zmq.REP)
+    status_socket.bind(f"tcp://127.0.0.1:{status_port}")
+    poller = zmq.Poller()
+    poller.register(socket, zmq.POLLIN)
+    poller.register(status_socket, zmq.POLLIN)
+    initial_target: np.ndarray | None = None
     print(f"{side} Wuji Hand 2 replay is ready on tcp://127.0.0.1:{command_port}", flush=True)
     try:
         while True:
-            target = np.asarray(socket.recv_pyobj(), dtype=np.float64)
-            if target.shape != (20,) or not np.all(np.isfinite(target)):
-                print(f"Ignoring invalid {side} hand target with shape {target.shape}", flush=True)
-                continue
-            backend.send(target)
+            for ready_socket, _ in poller.poll(50):
+                if ready_socket is socket:
+                    payload = socket.recv_pyobj()
+                    if isinstance(payload, dict):
+                        kind = str(payload.get("kind", "target"))
+                        target = np.asarray(payload.get("target", []), dtype=np.float64)
+                    else:
+                        kind = "target"
+                        target = np.asarray(payload, dtype=np.float64)
+                    if target.shape != (20,) or not np.all(np.isfinite(target)):
+                        print(f"Ignoring invalid {side} hand target with shape {target.shape}", flush=True)
+                        continue
+                    if kind == "initial":
+                        initial_target = target.copy()
+                    backend.send(target)
+                else:
+                    request = status_socket.recv_pyobj()
+                    actual = backend.actual_position()
+                    target_position = backend.target_position if initial_target is not None else None
+                    target_ready = (
+                        target_position is not None
+                        and initial_target is not None
+                        and float(np.max(np.abs(target_position - initial_target)))
+                        <= HAND_INITIAL_POSITION_TOLERANCE_RAD
+                    )
+                    reached = (
+                        target_ready
+                        and actual is not None
+                        and float(np.max(np.abs(actual - target_position)))
+                        <= HAND_INITIAL_POSITION_TOLERANCE_RAD
+                    )
+                    status_socket.send_pyobj(
+                        {
+                            "ready": True,
+                            "initial_reached": reached,
+                            "actual": None if actual is None else actual.tolist(),
+                            "initial_target": backend.target_position.tolist()
+                            if initial_target is not None
+                            else None,
+                            "request": request,
+                        }
+                    )
     except KeyboardInterrupt:
         pass
     finally:
         socket.close(0)
+        status_socket.close(0)
         context.term()
         backend.close()
 
@@ -664,6 +729,77 @@ def sleep_with_spin_and_abort(
     return True
 
 
+def request_hand_status(status_socket: Any, timeout_s: float = 1.0) -> dict[str, Any]:
+    """Request one hand-worker status response over its REQ/REP channel."""
+    status_socket.send_pyobj({"kind": "status"})
+    poller = zmq.Poller()
+    poller.register(status_socket, zmq.POLLIN)
+    if not poller.poll(max(1, int(timeout_s * 1000))):
+        raise TimeoutError("Timed out waiting for Wuji hand replay worker status.")
+    response = status_socket.recv_pyobj()
+    if not isinstance(response, dict) or not response.get("ready", False):
+        raise RuntimeError(f"Invalid Wuji hand replay worker status: {response!r}")
+    return response
+
+
+def move_hands_to_initial_state(
+    rclpy: Any,
+    node: Any,
+    commands: Queue[str],
+    data: EpisodeData,
+    hand_sockets: dict[str, Any],
+    hand_status_sockets: dict[str, Any],
+    timeout_s: float,
+) -> bool:
+    """Move every replay hand to its recorded initial state before actions."""
+    state_data = EpisodeData(
+        states=data.states,
+        actions=data.states,
+        frame_indices=data.frame_indices,
+        timestamps=data.timestamps,
+        fps=data.fps,
+        action_config=data.action_config,
+        trajectory_config=data.trajectory_config,
+    )
+    initial_states = split_targets(state_data)
+    targets = {
+        side: np.asarray(initial_states[f"{side}_hand"][0], dtype=float)
+        for side in data.trajectory_config["arms"]
+    }
+    if not all(np.all(np.isfinite(target)) for target in targets.values()):
+        raise ValueError("Episode initial hand state must contain only finite values.")
+
+    print(
+        f"Moving {', '.join(targets)} hand(s) to observation.state at frame "
+        f"{int(data.frame_indices[0])} before replay. Type `q` + Enter to abort."
+    )
+    for side, target in targets.items():
+        hand_sockets[side].send_pyobj({"kind": "initial", "target": target})
+
+    deadline = time.perf_counter() + timeout_s
+    last_status_time = 0.0
+    while rclpy.ok() and time.perf_counter() < deadline:
+        if consume_commands(commands) == "q":
+            return False
+        now = time.perf_counter()
+        if now - last_status_time < 0.05:
+            rclpy.spin_once(node, timeout_sec=0.01)
+            continue
+        last_status_time = now
+        reached = True
+        for side, status_socket in hand_status_sockets.items():
+            status = request_hand_status(status_socket)
+            if not bool(status.get("initial_reached", False)):
+                reached = False
+        if reached:
+            print("All trajectory hands reached the episode initial state. Starting action replay.")
+            return True
+        rclpy.spin_once(node, timeout_sec=0.01)
+    raise TimeoutError(
+        f"Hands did not reach the episode initial state within {timeout_s:g}s."
+    )
+
+
 def arm_reached_initial_state(
     actual_q: np.ndarray | None,
     actual_dq: np.ndarray | None,
@@ -852,14 +988,23 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
         else continuous_gripper_targets(targets["right_gripper_raw"])
     )
     hand_sockets: dict[str, Any] = {}
+    hand_status_sockets: dict[str, Any] = {}
     if end_effector == "hand":
         context = zmq.Context()
-        for side, port in (("left", args.left_hand_command_port), ("right", args.right_hand_command_port)):
+        for side, port, status_port in (
+            ("left", args.left_hand_command_port, args.left_hand_status_port),
+            ("right", args.right_hand_command_port, args.right_hand_status_port),
+        ):
             if side in active_arms:
                 socket = context.socket(zmq.PUSH)
                 socket.setsockopt(zmq.SNDHWM, 2)
                 socket.connect(f"tcp://127.0.0.1:{port}")
                 hand_sockets[side] = socket
+                status_socket = context.socket(zmq.REQ)
+                status_socket.setsockopt(zmq.RCVTIMEO, 1000)
+                status_socket.setsockopt(zmq.SNDTIMEO, 1000)
+                status_socket.connect(f"tcp://127.0.0.1:{status_port}")
+                hand_status_sockets[side] = status_socket
     args.output.mkdir(parents=True, exist_ok=True)
 
     write_json(
@@ -896,6 +1041,7 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
     published_frames = 0
     last_controller_ready = False
     initial_state_reached = False
+    hand_initial_state_reached = end_effector != "hand"
     initial_state_duration_s = 0.0
     start_time = 0.0
     try:
@@ -925,6 +1071,21 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
             return
         initial_state_duration_s = time.perf_counter() - initial_state_start_time
         initial_state_reached = True
+
+        if end_effector == "hand":
+            if not move_hands_to_initial_state(
+                rclpy,
+                node,
+                commands,
+                data,
+                hand_sockets,
+                hand_status_sockets,
+                args.initial_state_timeout,
+            ):
+                aborted = True
+                print("Abort requested while moving hands to the episode initial state.")
+                return
+            hand_initial_state_reached = True
 
         print("Starting LeRobot episode replay. Type `q` + Enter to abort.")
         start_time = time.perf_counter()
@@ -957,7 +1118,12 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
                 node.publish_targets(left_target, right_target, left_gripper, right_gripper)
                 if end_effector == "hand":
                     for side, socket in hand_sockets.items():
-                        socket.send_pyobj(np.asarray(targets[f"{side}_hand"][local_idx], dtype=float))
+                        socket.send_pyobj(
+                            {
+                                "kind": "target",
+                                "target": np.asarray(targets[f"{side}_hand"][local_idx], dtype=float),
+                            }
+                        )
                 rclpy.spin_once(node, timeout_sec=0.0)
                 last_controller_ready = node.controller_ready(args.no_gripper)
 
@@ -998,6 +1164,7 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
                 "published_frames": published_frames,
                 "selected_frames": int(len(data.frame_indices)),
                 "initial_state_reached": initial_state_reached,
+                "hand_initial_state_reached": hand_initial_state_reached,
                 "initial_state_duration_s": initial_state_duration_s,
                 "controller_ready_at_last_frame": bool(last_controller_ready),
                 "duration_s": float(time.perf_counter() - start_time) if start_time else 0.0,
@@ -1009,6 +1176,8 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
             rclpy.shutdown()
         for socket in hand_sockets.values():
             socket.close(0)
+        for socket in hand_status_sockets.values():
+            socket.close(0)
         if end_effector == "hand":
             context.term()
 
@@ -1016,8 +1185,13 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
 def main() -> None:
     args = parse_args()
     if args.internal_wuji_hand is not None:
-        port = args.left_hand_command_port if args.internal_wuji_hand == "left" else args.right_hand_command_port
-        run_wuji_hand_process(args.internal_wuji_hand, port, args.hand_ip)
+        if args.internal_wuji_hand == "left":
+            command_port = args.left_hand_command_port
+            status_port = args.left_hand_status_port
+        else:
+            command_port = args.right_hand_command_port
+            status_port = args.right_hand_status_port
+        run_wuji_hand_process(args.internal_wuji_hand, command_port, status_port, args.hand_ip)
         return
     data = load_episode_data(args.dataset_root, args.episode)
     recorded_end_effector = str(data.trajectory_config["end_effector"])

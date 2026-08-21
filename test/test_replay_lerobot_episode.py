@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from queue import Queue
 from typing import Any
 
@@ -10,6 +12,7 @@ from data_collection.replay_lerobot_episode import (
     EpisodeData,
     arm_reached_initial_state,
     move_arms_to_initial_state,
+    parse_args,
     ramp_initial_state_command,
     wait_for_start,
 )
@@ -28,6 +31,21 @@ def make_episode_data() -> EpisodeData:
         fps=15.0,
         action_config={},
     )
+
+
+def test_internal_wuji_worker_does_not_require_dataset_root() -> None:
+    args = parse_args(["--internal-wuji-hand", "right", "--right-hand-command-port", "5562"])
+
+    assert args.internal_wuji_hand == "right"
+    assert args.dataset_root is None
+    assert args.right_hand_command_port == 5562
+
+
+def test_episode_replay_still_requires_dataset_root() -> None:
+    with pytest.raises(SystemExit) as error:
+        parse_args([])
+
+    assert error.value.code == 2
 
 
 def test_arm_reached_initial_state_checks_position_and_velocity() -> None:

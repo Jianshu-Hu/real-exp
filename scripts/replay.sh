@@ -334,13 +334,13 @@ elif [[ "${end_effector}" == "hand" ]]; then
   if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "left" ]]; then
     start_process "Left Wuji hand replay" "${wuji_python[@]}" \
       "${replay_script}" --internal-wuji-hand left --left-hand-command-port 5561 \
-      --hand-ip "${left_hand_ip}"
+      --left-hand-status-port 5563 --hand-ip "${left_hand_ip}"
     wait_for_tcp_port 5561 "${child_pids[${#child_pids[@]} - 1]}"
   fi
   if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "right" ]]; then
     start_process "Right Wuji hand replay" "${wuji_python[@]}" \
       "${replay_script}" --internal-wuji-hand right --right-hand-command-port 5562 \
-      --hand-ip "${right_hand_ip}"
+      --right-hand-status-port 5564 --hand-ip "${right_hand_ip}"
     wait_for_tcp_port 5562 "${child_pids[${#child_pids[@]} - 1]}"
   fi
   echo "Wuji hand replay is ready; starting episode replay."

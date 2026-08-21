@@ -18,7 +18,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 INFO_PATH = Path("meta/info.json")
@@ -129,6 +129,71 @@ def has_non_finite(values: list[float]) -> bool:
     return any(not math.isfinite(value) for value in values)
 
 
+def motion_indices_from_metadata(
+    dataset_root: Path, info: dict[str, Any]
+) -> tuple[int, ...]:
+    """Return state indices belonging to the active arm joints.
+
+    Real-exp trajectories are laid out as one block per active arm. Each block
+    starts with seven arm joints, followed by an optional gripper (one value)
+    or Wuji hand (twenty values). The trajectory metadata is authoritative for
+    the block layout; the legacy action config is used by
+    ``load_dataset_trajectory_config`` when the trajectory config predates the
+    metadata file.
+    """
+    features = info.get("features", {})
+    try:
+        state_dim = int(features["observation.state"]["shape"][0])
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Could not determine observation.state dimension from {dataset_root / INFO_PATH}."
+        ) from exc
+
+    action_config_path = dataset_root / ACTION_CONFIG_PATH
+    action_config = load_json(action_config_path) if action_config_path.exists() else {}
+    try:
+        from data_collection.trajectory_metadata import load_trajectory_config
+
+        trajectory_config = load_trajectory_config(
+            dataset_root,
+            action_config,
+            state_dim,
+            int(features.get("action", {}).get("shape", [state_dim])[0]),
+        )
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid trajectory metadata for {dataset_root}; cannot determine state layout."
+        ) from exc
+
+    arms = trajectory_config.get("arms")
+    if not isinstance(arms, list) or not arms:
+        arm_mode = str(trajectory_config.get("arm_mode", "")).strip().lower()
+        arms = ["left", "right"] if arm_mode == "duo" else [arm_mode]
+    if any(str(arm).strip().lower() not in {"left", "right"} for arm in arms):
+        raise ValueError(f"Invalid active arm combination in trajectory metadata: {arms!r}.")
+    arms = [str(arm).strip().lower() for arm in arms]
+
+    end_effector = str(trajectory_config.get("end_effector", "arm")).strip().lower()
+    block_size = 7 + {"arm": 0, "gripper": 1, "hand": 20}.get(end_effector, -1)
+    if block_size < 7:
+        raise ValueError(
+            f"Invalid end-effector mode {end_effector!r} in trajectory metadata; "
+            "expected arm, gripper, or hand."
+        )
+    expected_dim = block_size * len(arms)
+    if state_dim != expected_dim:
+        raise ValueError(
+            "Trajectory metadata does not match observation.state: "
+            f"{len(arms)} {end_effector} arm block(s) require {expected_dim} values, "
+            f"but metadata declares {state_dim}."
+        )
+    return tuple(
+        arm_index * block_size + joint_index
+        for arm_index in range(len(arms))
+        for joint_index in range(7)
+    )
+
+
 def parse_episode_selection(text: str) -> list[int]:
     tokens = [token for token in text.replace(",", " ").split() if token]
     if not tokens:
@@ -151,7 +216,10 @@ def parse_episode_selection(text: str) -> list[int]:
 
 
 def detect_initial_trim(
-    rows: list[dict[str, Any]], threshold: float, min_static_frames: int
+    rows: list[dict[str, Any]],
+    threshold: float,
+    min_static_frames: int,
+    motion_indices: Sequence[int] | None = None,
 ) -> int:
     if threshold < 0:
         raise ValueError("--motion-threshold must be non-negative.")
@@ -159,17 +227,33 @@ def detect_initial_trim(
         raise ValueError("--min-static-frames must be positive.")
     ordered = sorted(rows, key=lambda row: int(row["frame_index"]))
     states = [flatten_numeric(row.get("observation.state")) for row in ordered]
-    if not states or any(len(state) != 16 for state in states):
-        raise ValueError("Static detection requires a 16-D observation.state for every frame.")
+    if not states:
+        raise ValueError("Static detection requires observation.state for every frame.")
+    if motion_indices is None:
+        # Preserve the old helper behavior for callers that do not have dataset
+        # metadata. Dataset processing always supplies metadata-derived indices.
+        if any(len(state) != 16 for state in states):
+            raise ValueError(
+                "Static detection requires trajectory metadata for non-16-D observation.state."
+            )
+        motion_indices = tuple(range(7)) + tuple(range(8, 15))
+    motion_indices = tuple(motion_indices)
+    if not motion_indices or min(motion_indices) < 0:
+        raise ValueError("Static detection requires at least one valid arm-joint index.")
+    state_dim = len(states[0])
+    if any(len(state) != state_dim for state in states):
+        raise ValueError("Static detection requires a consistent observation.state dimension.")
+    if max(motion_indices) >= state_dim:
+        raise ValueError(
+            f"Static detection arm-joint index {max(motion_indices)} exceeds "
+            f"observation.state dimension {state_dim}."
+        )
     if any(has_non_finite(state) for state in states):
         raise ValueError("Static detection requires finite observation.state values.")
 
     static_transitions = 0
     for previous, current in zip(states, states[1:], strict=True):
-        arm_delta = max(
-            [abs(current[index] - previous[index]) for index in range(0, 7)]
-            + [abs(current[index] - previous[index]) for index in range(8, 15)]
-        )
+        arm_delta = max(abs(current[index] - previous[index]) for index in motion_indices)
         if arm_delta > threshold:
             break
         static_transitions += 1
@@ -199,6 +283,7 @@ def trim_initial_static_segments(args: argparse.Namespace) -> int:
             f"{dataset_root} is not a LeRobot dataset root. Missing {INFO_PATH}."
         )
     info = load_json(dataset_root / INFO_PATH)
+    motion_indices = motion_indices_from_metadata(dataset_root, info)
     source_meta = LeRobotDatasetMetadata(
         repo_id=f"local/{dataset_root.name}",
         root=dataset_root,
@@ -232,7 +317,10 @@ def trim_initial_static_segments(args: argparse.Namespace) -> int:
             )
         trim_frames = (
             detect_initial_trim(
-                rows_by_episode[index], args.motion_threshold, args.min_static_frames
+                rows_by_episode[index],
+                args.motion_threshold,
+                args.min_static_frames,
+                motion_indices,
             )
             if index in episode_indices
             else 0

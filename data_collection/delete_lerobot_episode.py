@@ -20,6 +20,7 @@ from utils.dataset_stats import ensure_dataset_stats
 
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
+TRAJECTORY_CONFIG_PATH = Path("meta/real_exp_trajectory_config.json")
 
 
 def parse_args() -> argparse.Namespace:
@@ -173,13 +174,11 @@ def resolve_repo_id(dataset_root: Path, repo_id: str | None) -> str:
 
 
 def copy_optional_metadata(source_root: Path, target_root: Path) -> None:
-    source_action_config = source_root / ACTION_CONFIG_PATH
-    if not source_action_config.exists():
-        return
-
-    target_action_config = target_root / ACTION_CONFIG_PATH
-    target_action_config.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_action_config, target_action_config)
+    target_root.joinpath("meta").mkdir(parents=True, exist_ok=True)
+    for relative_path in (ACTION_CONFIG_PATH, TRAJECTORY_CONFIG_PATH):
+        source_path = source_root / relative_path
+        if source_path.exists():
+            shutil.copy2(source_path, target_root / relative_path)
 
 
 def load_frame_episode_indices(dataset_root: Path) -> list[int] | None:

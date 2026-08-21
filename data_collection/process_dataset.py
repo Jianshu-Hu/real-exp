@@ -23,6 +23,7 @@ from typing import Any, Sequence
 
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
+TRAJECTORY_CONFIG_PATH = Path("meta/real_exp_trajectory_config.json")
 PROCESSED_FLAG = "processed"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
@@ -473,6 +474,11 @@ def trim_initial_static_segments(args: argparse.Namespace) -> int:
             target_action_config = output_root / ACTION_CONFIG_PATH
             target_action_config.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_action_config, target_action_config)
+        source_trajectory_config = source_root / TRAJECTORY_CONFIG_PATH
+        if source_trajectory_config.exists():
+            target_trajectory_config = output_root / TRAJECTORY_CONFIG_PATH
+            target_trajectory_config.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_trajectory_config, target_trajectory_config)
         ensure_dataset_stats(f"local/{output_root.name}", output_root, force_recompute=True)
     except Exception:
         if moved and backup_root.exists():

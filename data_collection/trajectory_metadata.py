@@ -53,12 +53,17 @@ def trajectory_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
 def legacy_trajectory_config(action_config: dict[str, Any], state_dim: int, action_dim: int) -> dict[str, Any]:
     include_hand = bool(action_config.get("include_hand", False))
     include_gripper = bool(action_config.get("include_gripper", False))
-    arm_mode = "duo" if bool(action_config.get("include_right_arm", True)) else "left"
+    recorded_arm_mode = action_config.get("arm_mode")
+    arm_mode = (
+        normalize_arm_mode(str(recorded_arm_mode))
+        if recorded_arm_mode is not None
+        else "duo" if bool(action_config.get("include_right_arm", True)) else "left"
+    )
     return {
         "schema_version": TRAJECTORY_CONFIG_SCHEMA_VERSION,
         "end_effector": "hand" if include_hand else "gripper" if include_gripper else "arm",
         "arm_mode": arm_mode,
-        "arms": ["left", "right"] if arm_mode == "duo" else ["left"],
+        "arms": ["left", "right"] if arm_mode == "duo" else [arm_mode],
         "include_gripper": include_gripper,
         "include_hand": include_hand,
         "robot_state_dim": int(state_dim),

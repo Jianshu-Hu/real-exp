@@ -199,6 +199,7 @@ def action_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "absolute_width": "open_width_percent",
         "binary_open_close": "latched_binary_command (0=close, 1=open)",
     }.get(gripper_action_representation, gripper_action_representation)
+    arm_mode = trajectory_config_from_packet(packet)["arm_mode"]
     return {
         "arm_action_representation": arm_action_representation,
         "arm_action_definition": arm_action_definition,
@@ -206,6 +207,7 @@ def action_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "gripper_action_definition": gripper_action_definition,
         "hand_action_representation": "absolute_joint_position",
         "hand_action_definition": "hand_q_target[t+1]",
+        "arm_mode": arm_mode,
         "include_right_arm": bool(packet.get("include_right_arm", True)),
         "include_gripper": bool(packet.get("include_gripper", True)),
         "include_hand": bool(packet.get("include_hand", False)),
@@ -239,6 +241,7 @@ def assumed_legacy_action_config(packet: dict[str, Any]) -> dict[str, Any]:
         "gripper_action_definition": "open_width_percent",
         "hand_action_representation": "absolute_joint_position",
         "hand_action_definition": "hand_q_target[t+1]",
+        "arm_mode": trajectory_config_from_packet(packet)["arm_mode"],
         "include_right_arm": bool(packet.get("include_right_arm", True)),
         "include_gripper": bool(packet.get("include_gripper", True)),
         "include_hand": bool(packet.get("include_hand", False)),

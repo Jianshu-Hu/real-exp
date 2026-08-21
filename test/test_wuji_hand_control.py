@@ -72,3 +72,50 @@ def test_smoothed_backend_publishes_from_measured_position() -> None:
         assert np.max(samples[-1]) > 0.25
     finally:
         backend.close()
+
+
+def test_smoothed_backend_falls_back_to_joint_state_stream() -> None:
+    class FakeSubscription:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def recv(self) -> object:
+            return type("Frame", (), {
+                "joints": [
+                    type("Joint", (), {"nid": index, "position": 0.1})()
+                    for index in range(HAND_JOINT_COUNT)
+                ]
+            })()
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeHand:
+        def __init__(self) -> None:
+            self.subscription = FakeSubscription()
+
+        def joint_states(self) -> object:
+            return type("Resource", (), {"subscribe": lambda resource: self.subscription})()
+
+        def get_soft_limits(self) -> tuple[list[float], list[float]]:
+            return [1.0] * HAND_JOINT_COUNT, [-1.0] * HAND_JOINT_COUNT
+
+    class FakeBackend:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            self._hand = FakeHand()
+
+        @staticmethod
+        def send(backend: "FakeBackend", qpos: np.ndarray) -> None:
+            del backend, qpos
+
+        def close(self) -> None:
+            return
+
+    SmoothedBackend = make_smoothed_backend_class(FakeBackend)
+    backend = SmoothedBackend(command_rate_hz=HAND_COMMAND_RATE_HZ, ip="", kp=1.0, kd=0.1, current_limit=1.0)
+    try:
+        np.testing.assert_allclose(backend.target_position, np.full(HAND_JOINT_COUNT, 0.1))
+    finally:
+        backend.close()
+    assert backend._backend._hand.subscription.closed

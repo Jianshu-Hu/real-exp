@@ -181,7 +181,11 @@ class SmoothedWujiHand2Backend:
             current_limit=current_limit,
             handedness=handedness,
         )
-        initial_position = normalize_hand_positions(self._backend._hand.read_joint_state())
+        self._state_subscription = None
+        self._state_stop_event = threading.Event()
+        self._actual_lock = threading.Lock()
+        self._actual: np.ndarray | None = None
+        initial_position = self._read_initial_position()
         if initial_position is None:
             self._backend.close()
             raise RuntimeError("Wuji Hand 2 did not return a valid 20-joint initial state.")
@@ -197,7 +201,12 @@ class SmoothedWujiHand2Backend:
         self._target_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._target = initial_position.copy()
+        self._actual = initial_position.copy()
         self._command_period_s = 1.0 / float(command_rate_hz)
+        self._state_thread = threading.Thread(
+            target=self._state_loop, name="wuji-hand-state-reader", daemon=True
+        )
+        self._state_thread.start()
         self._thread = threading.Thread(target=self._command_loop, name="wuji-hand-trajectory", daemon=True)
         self._thread.start()
         print(
@@ -217,7 +226,8 @@ class SmoothedWujiHand2Backend:
             self._target = target.copy()
 
     def actual_position(self) -> np.ndarray | None:
-        return normalize_hand_positions(self._backend._hand.read_joint_state())
+        with self._actual_lock:
+            return None if self._actual is None else self._actual.copy()
 
     @property
     def target_position(self) -> np.ndarray:
@@ -239,8 +249,60 @@ class SmoothedWujiHand2Backend:
             wait_s = max(0.0, next_time - time.monotonic())
             self._stop_event.wait(wait_s)
 
+    def _read_initial_position(self) -> np.ndarray | None:
+        """Read one state from either SDK generation's synchronous or stream API."""
+        hand = self._backend._hand
+        read_joint_state = getattr(hand, "read_joint_state", None)
+        if callable(read_joint_state):
+            return normalize_hand_positions(read_joint_state())
+        joint_states = getattr(hand, "joint_states", None)
+        if not callable(joint_states):
+            return None
+        subscription = joint_states().subscribe()
+        self._state_subscription = subscription
+        deadline = time.monotonic() + 10.0
+        initial_position: np.ndarray | None = None
+        try:
+            while time.monotonic() < deadline:
+                time.sleep(0.02)
+                try:
+                    position = normalize_hand_positions(subscription.recv())
+                except Exception:
+                    position = None
+                if position is not None:
+                    initial_position = position
+                    break
+        finally:
+            if initial_position is None:
+                subscription.close()
+                self._state_subscription = None
+        return initial_position
+
+    def _state_loop(self) -> None:
+        subscription = self._state_subscription
+        if subscription is None:
+            return
+        try:
+            while not self._state_stop_event.is_set():
+                position = normalize_hand_positions(subscription.recv())
+                if position is not None:
+                    with self._actual_lock:
+                        self._actual = position
+        except Exception:
+            # The command loop remains usable if state streaming is interrupted;
+            # status requests will report the last valid measured position.
+            return
+
     def close(self) -> None:
         self._stop_event.set()
+        self._state_stop_event.set()
+        if self._state_subscription is not None:
+            try:
+                self._state_subscription.close()
+            except Exception:
+                pass
+        if hasattr(self, "_state_thread"):
+            self._state_thread.join(timeout=1.0)
         self._thread.join(timeout=max(1.0, 4.0 * self._command_period_s))
         self._backend.close()
 

@@ -114,10 +114,17 @@ gello_config_dir="${repository_root}/gello_software/ros2/src/franka_gello_state_
 arm_config_dir="${repository_root}/gello_software/ros2/src/franka_fr3_arm_controllers/config"
 gripper_config_dir="${repository_root}/gello_software/ros2/src/franka_gripper_manager/config"
 
+# Do not let ROS overlays inherited from an interactive shell select packages
+# from a different checkout. The setup files below rebuild the required ROS
+# paths in a deterministic order.
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH LD_LIBRARY_PATH
+
 setup_files=(
   "/opt/ros/humble/setup.bash"
-  "${HOME}/franka_ros2_ws/install/setup.bash"
-  "${repository_root}/gello_software/ros2/install/setup.bash"
+  # Use local_setup for overlays so a generated setup.bash cannot pull in a
+  # stale workspace path from the machine where that workspace was built.
+  "${HOME}/franka_ros2_ws/install/local_setup.bash"
+  "${repository_root}/gello_software/ros2/install/local_setup.bash"
 )
 
 # Generated ROS environment hooks may inspect optional variables before defining them.

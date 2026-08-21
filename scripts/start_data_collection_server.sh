@@ -119,10 +119,15 @@ else
   ros_distro="$(basename -- "$(dirname -- "${ros_setup_file}")")"
 fi
 
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH LD_LIBRARY_PATH
+
 setup_files=(
   "${ros_setup_file}"
-  "${repository_root}/gello_software/ros2/install/setup.bash"
 )
+if [[ -r "${HOME}/franka_ros2_ws/install/local_setup.bash" ]]; then
+  setup_files+=("${HOME}/franka_ros2_ws/install/local_setup.bash")
+fi
+setup_files+=("${repository_root}/gello_software/ros2/install/local_setup.bash")
 
 # ROS setup hooks may inspect unset variables.
 set +u

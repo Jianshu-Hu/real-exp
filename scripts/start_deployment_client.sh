@@ -40,7 +40,12 @@ if [[ -n "${ros_distro}" ]]; then ros_setup_file="/opt/ros/${ros_distro}/setup.b
   [[ "${#candidates[@]}" -eq 1 ]] || die "select ROS distro with --ros-distro"
   ros_setup_file="${candidates[0]}"; ros_distro="$(basename "$(dirname "${ros_setup_file}")")"
 fi
-setup_files=("${ros_setup_file}" "${repository_root}/gello_software/ros2/install/setup.bash"); set +u
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH LD_LIBRARY_PATH
+setup_files=(
+  "${ros_setup_file}"
+  "${HOME}/franka_ros2_ws/install/local_setup.bash"
+  "${repository_root}/gello_software/ros2/install/local_setup.bash"
+); set +u
 for setup_file in "${setup_files[@]}"; do
   [[ -r "${setup_file}" ]] || die "ROS setup file is missing: ${setup_file}"
   # shellcheck disable=SC1090

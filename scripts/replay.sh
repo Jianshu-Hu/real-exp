@@ -85,10 +85,12 @@ for ((index = 0; index < ${#replay_args[@]}; index++)); do
 done
 [[ -n "${dataset_root}" ]] || die "--dataset-root is required"
 
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH LD_LIBRARY_PATH
+
 setup_files=(
   "/opt/ros/humble/setup.bash"
-  "${HOME}/franka_ros2_ws/install/setup.bash"
-  "${repository_root}/gello_software/ros2/install/setup.bash"
+  "${HOME}/franka_ros2_ws/install/local_setup.bash"
+  "${repository_root}/gello_software/ros2/install/local_setup.bash"
 )
 
 # Generated ROS environment hooks may inspect optional variables before defining them.

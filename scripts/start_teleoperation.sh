@@ -523,7 +523,7 @@ repository_root="$(cd -- "${script_dir}/.." && pwd)"
 # shellcheck source=scripts/conda_env.sh
 source "${script_dir}/conda_env.sh"
 example_dir="${repository_root}/libs/wuji-retargeting/example"
-teleop_program="${repository_root}/data_collection/wuji_telemetry_proxy.py"
+teleop_program="${repository_root}/utils/wuji_telemetry_proxy.py"
 
 [[ -r "${teleop_program}" ]] || die "Wuji teleoperation adapter not found: ${teleop_program}"
 wuji_conda_env="${WUJI_CONDA_ENV:-${LEROBOT_CONDA_ENV:-lerobot}}"

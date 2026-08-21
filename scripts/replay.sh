@@ -118,9 +118,9 @@ else
   exec 10<&0
 fi
 
-recorded_end_effector="$("${ros_python}" "${repository_root}/data_collection/trajectory_metadata.py" --dataset-root "${dataset_root}" --field end_effector)" \
+recorded_end_effector="$("${ros_python}" "${repository_root}/utils/trajectory_metadata.py" --dataset-root "${dataset_root}" --field end_effector)" \
   || die "could not read trajectory metadata"
-recorded_arm_mode="$("${ros_python}" "${repository_root}/data_collection/trajectory_metadata.py" --dataset-root "${dataset_root}" --field arm_mode)" \
+recorded_arm_mode="$("${ros_python}" "${repository_root}/utils/trajectory_metadata.py" --dataset-root "${dataset_root}" --field arm_mode)" \
   || die "could not read trajectory metadata"
 [[ -n "${end_effector}" ]] || end_effector="${recorded_end_effector}"
 [[ -n "${arm_mode}" ]] || arm_mode="${recorded_arm_mode}"

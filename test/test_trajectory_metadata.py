@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from data_collection.trajectory_metadata import legacy_trajectory_config
+from utils.trajectory_metadata import legacy_trajectory_config
 
 
 def test_legacy_metadata_uses_explicit_right_arm_mode() -> None:

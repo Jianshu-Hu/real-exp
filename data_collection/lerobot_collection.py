@@ -23,7 +23,7 @@ if str(LOCAL_LEROBOT_SRC) not in sys.path:
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from utils.dataset_stats import ensure_dataset_stats, normalize_episode_metadata
-from data_collection.trajectory_metadata import (
+from utils.trajectory_metadata import (
     TRAJECTORY_CONFIG_PATH,
     trajectory_config_from_packet,
     write_trajectory_config,

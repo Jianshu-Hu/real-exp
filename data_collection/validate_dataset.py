@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data_collection.trajectory_metadata import load_trajectory_config  # noqa: E402
+from utils.trajectory_metadata import load_trajectory_config  # noqa: E402
 from utils.limit import (  # noqa: E402
     TrajectoryViolationCounts,
     arm_joint_slices,

@@ -153,7 +153,7 @@ def motion_indices_from_metadata(
     action_config_path = dataset_root / ACTION_CONFIG_PATH
     action_config = load_json(action_config_path) if action_config_path.exists() else {}
     try:
-        from data_collection.trajectory_metadata import load_trajectory_config
+        from utils.trajectory_metadata import load_trajectory_config
 
         trajectory_config = load_trajectory_config(
             dataset_root,

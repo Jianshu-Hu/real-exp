@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data_collection.trajectory_metadata import load_trajectory_config, validate_setting
+from utils.trajectory_metadata import load_trajectory_config, validate_setting
 
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 TRACE_FILENAME = "trace.csv"

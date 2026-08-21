@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import multiprocessing as mp
 import os
 import re
 import time
@@ -24,21 +23,35 @@ import numpy as np
 
 DEFAULT_LEFT_ROBOT_IP = "172.16.0.3"
 DEFAULT_RIGHT_ROBOT_IP = "172.16.0.2"
-MAX_TRANSLATION_SPEED_M_PER_S = 0.08
-MAX_ROTATION_SPEED_RAD_PER_S = 0.5
-MAX_HAND_JOINT_SPEED_RAD_PER_S = 1.0
-MIN_TRAJECTORY_DURATION_S = 1.0
-POSE_SETTLE_DURATION_S = 0.30
-POSE_SETTLE_TIMEOUT_S = 5.0
-POSE_POSITION_TOLERANCE_M = 2e-4
-POSE_ORIENTATION_TOLERANCE_RAD = 2e-3
-POSE_VELOCITY_TOLERANCE_M_PER_S = 2e-3
-POSE_ANGULAR_VELOCITY_TOLERANCE_RAD_PER_S = 5e-3
-POSE_VELOCITY_GAIN_PER_S = 1.5
-POSE_VELOCITY_RAMP_S = 0.25
-GRIPPER_SPEED_M_PER_S = 0.05
-HAND_COMMAND_RATE_HZ = 50.0
-HAND_ENABLE_TIMEOUT_S = 5.0
+JOINT_NAMES = [f"fr3_joint{index}" for index in range(1, 8)]
+ARM_PUBLISH_PERIOD_S = 0.02
+ARM_PRIME_DURATION_S = 0.5
+ARM_MAX_VELOCITY_RAD_PER_S = 0.10
+ARM_MAX_ACCELERATION_RAD_PER_S2 = 0.20
+ARM_TRACKING_GAIN_PER_S = 1.5
+# Keep this aligned with replay_lerobot_episode's first-phase gate. The ROS
+# joint-impedance controller can intentionally settle a few hundredths of a
+# radian from the published target while the measured velocity is already low.
+ARM_POSITION_TOLERANCE_RAD = 0.06
+ARM_VELOCITY_TOLERANCE_RAD_PER_S = 0.05
+ARM_STABLE_SAMPLES = 5
+ARM_MOVE_TIMEOUT_S = 120.0
+EE_FINAL_POSITION_TOLERANCE_M = 0.01
+EE_FINAL_ORIENTATION_TOLERANCE_RAD = 0.03
+IK_POSITION_TOLERANCE_M = 5e-4
+IK_ORIENTATION_TOLERANCE_RAD = 5e-3
+IK_MAX_FUNCTION_EVALUATIONS = 1200
+END_EFFECTOR_MOVE_TIMEOUT_S = 30.0
+
+# Match JointReferenceGenerator's operational envelope in the ROS controller.
+# It is deliberately narrower than the mechanical URDF limits, so an IK target
+# accepted here cannot be silently clipped by the controller later.
+ARM_POSITION_LOWER_RAD = np.asarray(
+    [-2.6937, -1.7337, -2.8507, -2.9921, -2.7565, 0.5945, -2.9659], dtype=float
+)
+ARM_POSITION_UPPER_RAD = np.asarray(
+    [2.6937, 1.7337, 2.8507, -0.2018, 2.7565, 4.4669, 2.9659], dtype=float
+)
 
 # A Cartesian command is checked before opening a hardware connection. These
 # are a conservative FR3 end-effector envelope in the robot base frame (the
@@ -55,6 +68,15 @@ class SideTarget:
     side: str
     pose: np.ndarray
     end_effector_joint: np.ndarray | None
+
+
+@dataclass(frozen=True)
+class IkResult:
+    q: np.ndarray
+    achieved_pose: np.ndarray
+    position_error_m: float
+    orientation_error_rad: float
+    function_evaluations: int
 
 
 class TargetArgumentParser(argparse.ArgumentParser):
@@ -265,129 +287,15 @@ def rotation_to_rpy(rotation: np.ndarray) -> np.ndarray:
 
 
 def matrix_to_pose_vector(transform: np.ndarray) -> np.ndarray:
-    matrix = np.asarray(transform, dtype=float).reshape((4, 4), order="F")
+    """Convert a 4x4 matrix or libfranka's flat column-major transform."""
+    values = np.asarray(transform, dtype=float)
+    matrix = values.reshape((4, 4), order="F") if values.ndim == 1 else values.reshape(4, 4)
     return np.concatenate((matrix[:3, 3], rotation_to_rpy(matrix[:3, :3])))
-
-
-def rotation_to_quaternion(rotation: np.ndarray) -> np.ndarray:
-    trace = float(np.trace(rotation))
-    if trace > 0.0:
-        scale = math.sqrt(trace + 1.0) * 2.0
-        quaternion = np.asarray(
-            [scale / 4.0, (rotation[2, 1] - rotation[1, 2]) / scale,
-             (rotation[0, 2] - rotation[2, 0]) / scale,
-             (rotation[1, 0] - rotation[0, 1]) / scale],
-            dtype=float,
-        )
-    else:
-        axis = int(np.argmax(np.diag(rotation)))
-        if axis == 0:
-            scale = math.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
-            quaternion = np.asarray(
-                [(rotation[2, 1] - rotation[1, 2]) / scale, scale / 4.0,
-                 (rotation[0, 1] + rotation[1, 0]) / scale,
-                 (rotation[0, 2] + rotation[2, 0]) / scale], dtype=float
-            )
-        elif axis == 1:
-            scale = math.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
-            quaternion = np.asarray(
-                [(rotation[0, 2] - rotation[2, 0]) / scale,
-                 (rotation[0, 1] + rotation[1, 0]) / scale, scale / 4.0,
-                 (rotation[1, 2] + rotation[2, 1]) / scale], dtype=float
-            )
-        else:
-            scale = math.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
-            quaternion = np.asarray(
-                [(rotation[1, 0] - rotation[0, 1]) / scale,
-                 (rotation[0, 2] + rotation[2, 0]) / scale,
-                 (rotation[1, 2] + rotation[2, 1]) / scale, scale / 4.0], dtype=float
-            )
-    return quaternion / np.linalg.norm(quaternion)
-
-
-def quaternion_to_rotation(quaternion: np.ndarray) -> np.ndarray:
-    w, x, y, z = quaternion / np.linalg.norm(quaternion)
-    return np.asarray(
-        [
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-        ],
-        dtype=float,
-    )
-
-
-def slerp(start: np.ndarray, target: np.ndarray, fraction: float) -> np.ndarray:
-    dot = float(np.dot(start, target))
-    if dot < 0.0:
-        target = -target
-        dot = -dot
-    dot = float(np.clip(dot, -1.0, 1.0))
-    if dot > 0.9995:
-        result = start + fraction * (target - start)
-        return result / np.linalg.norm(result)
-    angle = math.acos(dot)
-    return (
-        math.sin((1.0 - fraction) * angle) / math.sin(angle) * start
-        + math.sin(fraction * angle) / math.sin(angle) * target
-    )
-
-
-def smooth_step(fraction: float) -> float:
-    value = float(np.clip(fraction, 0.0, 1.0))
-    return value**3 * (10.0 - 15.0 * value + 6.0 * value**2)
 
 
 def rotation_distance(start: np.ndarray, target: np.ndarray) -> float:
     cosine = (float(np.trace(start.T @ target)) - 1.0) / 2.0
     return math.acos(float(np.clip(cosine, -1.0, 1.0)))
-
-
-def rotation_vector(rotation: np.ndarray) -> np.ndarray:
-    """Return the axis-angle vector for a rotation matrix."""
-    angle = rotation_distance(np.eye(3), rotation)
-    if angle < 1e-9:
-        return np.zeros(3, dtype=float)
-    sine = math.sin(angle)
-    if abs(sine) > 1e-6:
-        axis = np.asarray(
-            [rotation[2, 1] - rotation[1, 2], rotation[0, 2] - rotation[2, 0], rotation[1, 0] - rotation[0, 1]],
-            dtype=float,
-        ) / (2.0 * sine)
-    else:
-        # Near pi, extract the axis from the largest diagonal element.
-        axis_index = int(np.argmax(np.diag(rotation)))
-        axis = np.zeros(3, dtype=float)
-        axis[axis_index] = math.sqrt(max(0.0, (float(rotation[axis_index, axis_index]) + 1.0) / 2.0))
-        other = (axis_index + 1) % 3
-        third = (axis_index + 2) % 3
-        denominator = max(4.0 * axis[axis_index], 1e-9)
-        axis[other] = (rotation[other, axis_index] + rotation[axis_index, other]) / denominator
-        axis[third] = (rotation[third, axis_index] + rotation[axis_index, third]) / denominator
-    return axis * angle
-
-
-def cartesian_velocity_toward_pose(current: np.ndarray, target: np.ndarray, ramp: float) -> np.ndarray:
-    """Compute a bounded base-frame Cartesian velocity toward ``target``."""
-    position_error = target[:3, 3] - current[:3, 3]
-    orientation_error = rotation_vector(target[:3, :3] @ current[:3, :3].T)
-    velocity = np.concatenate(
-        (
-            POSE_VELOCITY_GAIN_PER_S * position_error,
-            POSE_VELOCITY_GAIN_PER_S * orientation_error,
-        )
-    )
-    velocity[:3] = np.clip(velocity[:3], -MAX_TRANSLATION_SPEED_M_PER_S, MAX_TRANSLATION_SPEED_M_PER_S)
-    velocity[3:] = np.clip(velocity[3:], -MAX_ROTATION_SPEED_RAD_PER_S, MAX_ROTATION_SPEED_RAD_PER_S)
-    return float(np.clip(ramp, 0.0, 1.0)) * velocity
-
-
-def trajectory_duration(start: np.ndarray, target: np.ndarray) -> float:
-    translation_time = (
-        float(np.linalg.norm(target[:3, 3] - start[:3, 3])) / MAX_TRANSLATION_SPEED_M_PER_S
-    )
-    rotation_time = rotation_distance(start[:3, :3], target[:3, :3]) / MAX_ROTATION_SPEED_RAD_PER_S
-    return max(MIN_TRAJECTORY_DURATION_S, translation_time, rotation_time)
 
 
 def pose_error(start: np.ndarray, target: np.ndarray) -> tuple[float, float]:
@@ -397,354 +305,485 @@ def pose_error(start: np.ndarray, target: np.ndarray) -> tuple[float, float]:
     return translation_error, orientation_error
 
 
-def state_pose_matrix(state: Any) -> np.ndarray:
-    """Return the FR3 commanded Cartesian pose used to seed pose control."""
-    # O_T_EE_c is the pose currently commanded by libfranka's generator. The
-    # measured O_T_EE can lag it, and starting from that lagging pose creates a
-    # velocity/acceleration discontinuity on the next 1 kHz command cycle.
-    values = getattr(state, "O_T_EE_c", None)
-    if values is None:
-        values = state.O_T_EE
-    matrix = np.asarray(values, dtype=float).reshape((4, 4), order="F")
-    if not np.all(np.isfinite(matrix)):
-        raise RuntimeError("FR3 returned a non-finite Cartesian command pose")
-    if not np.allclose(matrix[3, :], [0.0, 0.0, 0.0, 1.0], atol=1e-6):
-        raise RuntimeError(f"FR3 returned an invalid homogeneous command pose: {matrix.tolist()}")
-    rotation = matrix[:3, :3]
-    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-4) or not np.isclose(
-        np.linalg.det(rotation), 1.0, atol=1e-4
-    ):
-        raise RuntimeError(f"FR3 returned an invalid rotation in command pose: {rotation.tolist()}")
-    return matrix
+def pose_message_to_matrix(pose: Any) -> np.ndarray:
+    from scipy.spatial.transform import Rotation
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, 3] = [pose.position.x, pose.position.y, pose.position.z]
+    transform[:3, :3] = Rotation.from_quat(
+        [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+    ).as_matrix()
+    return transform
 
 
-def cartesian_state_is_settled(state: Any, target: np.ndarray) -> bool:
-    """Check measured pose and Cartesian velocity before setting motion_finished."""
-    current = np.asarray(state.O_T_EE, dtype=float).reshape((4, 4), order="F")
-    translation_error, orientation_error = pose_error(current, target)
-    velocity_values = getattr(state, "O_dP_EE", None)
-    if velocity_values is None:
-        # pylibfranka exposes commanded/desired Cartesian velocity as O_dP_EE_c
-        # and O_dP_EE_d; some test doubles expose the shorter O_dP_EE name.
-        velocity_values = getattr(state, "O_dP_EE_c", getattr(state, "O_dP_EE_d", None))
-    velocity = np.asarray(np.zeros(6) if velocity_values is None else velocity_values, dtype=float)
-    if velocity.shape != (6,) or not np.all(np.isfinite(velocity)):
-        return (
-            translation_error <= POSE_POSITION_TOLERANCE_M
-            and orientation_error <= POSE_ORIENTATION_TOLERANCE_RAD
+def build_fr3_model() -> tuple[Any, int]:
+    """Build the same no-gripper FR3 model used by the ROS controller stack."""
+    import pinocchio as pin
+    import xacro
+    from ament_index_python.packages import get_package_share_directory
+    from pathlib import Path
+
+    xacro_path = (
+        Path(get_package_share_directory("franka_description"))
+        / "robots"
+        / "fr3"
+        / "fr3.urdf.xacro"
+    )
+    xml = xacro.process_file(
+        str(xacro_path),
+        mappings={
+            "ros2_control": "false",
+            "arm_id": "fr3",
+            "arm_prefix": "",
+            "robot_ip": "",
+            "hand": "false",
+            "use_fake_hardware": "false",
+            "fake_sensor_commands": "false",
+        },
+    ).toxml()
+    model = pin.buildModelFromXML(xml)
+    frame_id = model.getFrameId("fr3_link8")
+    if frame_id >= len(model.frames):
+        raise RuntimeError("FR3 model does not contain the fr3_link8 flange frame")
+    return model, frame_id
+
+
+def forward_end_effector_pose(
+    model: Any, frame_id: int, q: np.ndarray, flange_to_ee: np.ndarray
+) -> np.ndarray:
+    import pinocchio as pin
+
+    data = model.createData()
+    pin.forwardKinematics(model, data, np.asarray(q, dtype=float))
+    pin.updateFramePlacements(model, data)
+    return np.asarray(data.oMf[frame_id].homogeneous, dtype=float) @ flange_to_ee
+
+
+def solve_fr3_ik(
+    current_q: np.ndarray,
+    target_ee_pose: np.ndarray,
+    flange_to_ee: np.ndarray,
+    model: Any | None = None,
+    frame_id: int | None = None,
+) -> IkResult:
+    """Solve bounded final-pose IK and independently verify its FK residual."""
+    from scipy.optimize import least_squares
+    from scipy.spatial.transform import Rotation
+
+    seed = np.asarray(current_q, dtype=float)
+    target = np.asarray(target_ee_pose, dtype=float)
+    flange_to_ee = np.asarray(flange_to_ee, dtype=float)
+    if seed.shape != (7,) or not np.all(np.isfinite(seed)):
+        raise ValueError("IK seed must be a finite seven-joint FR3 configuration")
+    if target.shape != (4, 4) or flange_to_ee.shape != (4, 4):
+        raise ValueError("IK target and F_T_EE must be 4x4 transforms")
+    if model is None or frame_id is None:
+        model, frame_id = build_fr3_model()
+
+    target_flange = target @ np.linalg.inv(flange_to_ee)
+    data = model.createData()
+
+    def flange_pose(q: np.ndarray) -> np.ndarray:
+        import pinocchio as pin
+
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+        return np.asarray(data.oMf[frame_id].homogeneous, dtype=float)
+
+    def residual(q: np.ndarray) -> np.ndarray:
+        current = flange_pose(q)
+        translation = current[:3, 3] - target_flange[:3, 3]
+        orientation = Rotation.from_matrix(
+            target_flange[:3, :3].T @ current[:3, :3]
+        ).as_rotvec()
+        # A very weak redundancy preference selects a solution near the live
+        # configuration without materially relaxing the six pose constraints.
+        return np.concatenate((translation, orientation, 1e-5 * (q - seed)))
+
+    candidate_seeds = [seed]
+    for joint, delta in ((6, 0.45), (6, -0.45), (2, 0.30), (2, -0.30)):
+        candidate = seed.copy()
+        candidate[joint] = np.clip(
+            candidate[joint] + delta,
+            ARM_POSITION_LOWER_RAD[joint] + 1e-6,
+            ARM_POSITION_UPPER_RAD[joint] - 1e-6,
         )
-    return (
-        translation_error <= POSE_POSITION_TOLERANCE_M
-        and orientation_error <= POSE_ORIENTATION_TOLERANCE_RAD
-        and float(np.linalg.norm(velocity[:3])) <= POSE_VELOCITY_TOLERANCE_M_PER_S
-        and float(np.linalg.norm(velocity[3:])) <= POSE_ANGULAR_VELOCITY_TOLERANCE_RAD_PER_S
-    )
+        candidate_seeds.append(candidate)
 
-
-def interpolate_pose(start: np.ndarray, target: np.ndarray, fraction: float) -> np.ndarray:
-    blend = smooth_step(fraction)
-    result = np.eye(4, dtype=float)
-    result[:3, 3] = start[:3, 3] + blend * (target[:3, 3] - start[:3, 3])
-    result[:3, :3] = quaternion_to_rotation(
-        slerp(rotation_to_quaternion(start[:3, :3]), rotation_to_quaternion(target[:3, :3]), blend)
-    )
-    return result
-
-
-def duration_to_seconds(duration: Any) -> float:
-    if hasattr(duration, "to_sec"):
-        return float(duration.to_sec())
-    if hasattr(duration, "toSec"):
-        return float(duration.toSec())
-    return float(duration)
-
-
-def cartesian_impedance_mode(pylibfranka: Any) -> Any:
-    try:
-        return pylibfranka.ControllerMode.kCartesianImpedance
-    except AttributeError:
-        return pylibfranka.ControllerMode.CartesianImpedance
-
-
-def joint_impedance_mode(pylibfranka: Any) -> Any:
-    try:
-        return pylibfranka.ControllerMode.kJointImpedance
-    except AttributeError:
-        return pylibfranka.ControllerMode.JointImpedance
-
-
-def recover_robot_if_needed(robot: Any, side: str) -> None:
-    try:
-        robot.automatic_error_recovery()
-        print(f"[{side}] Automatic error recovery completed.", flush=True)
-    except Exception as exc:
-        if "no error" not in str(exc).lower():
-            raise RuntimeError(f"automatic error recovery failed: {exc}") from exc
-
-
-def move_arm(robot_ip: str, side: str, pose: np.ndarray) -> None:
-    import pylibfranka
-
-    print(f"[{side}] Connecting to FR3 at {robot_ip}...", flush=True)
-    robot = pylibfranka.Robot(robot_ip)
-    try:
-        recover_robot_if_needed(robot, side)
-        control = robot.start_cartesian_velocity_control(joint_impedance_mode(pylibfranka))
-        control.readOnce()
-        target = pose_vector_to_matrix(pose)
-        print(f"[{side}] Moving end effector with Cartesian velocity control...", flush=True)
-        # Active control requires the first read to be paired with a write
-        # before requesting the next state sample.
-        control.writeOnce(pylibfranka.CartesianVelocities([0.0] * 6))
-        elapsed = 0.0
-        settle_elapsed = 0.0
-        settled_for = 0.0
-        while settle_elapsed < POSE_SETTLE_TIMEOUT_S:
-            current_state, period = control.readOnce()
-            dt = max(duration_to_seconds(period), 1e-4)
-            elapsed += dt
-            settle_elapsed += dt
-            current = np.asarray(current_state.O_T_EE, dtype=float).reshape((4, 4), order="F")
-            translation_error, orientation_error = pose_error(current, target)
-            if translation_error <= POSE_POSITION_TOLERANCE_M and orientation_error <= POSE_ORIENTATION_TOLERANCE_RAD:
-                command_velocity = np.zeros(6, dtype=float)
-                settled_for += dt
-                if settled_for >= POSE_SETTLE_DURATION_S:
-                    break
-            else:
-                settled_for = 0.0
-                ramp = min(1.0, elapsed / POSE_VELOCITY_RAMP_S)
-                command_velocity = cartesian_velocity_toward_pose(current, target, ramp)
-            control.writeOnce(pylibfranka.CartesianVelocities(command_velocity.tolist()))
-        else:
-            raise RuntimeError(
-                f"[{side}] FR3 did not reach the target pose within "
-                f"{POSE_SETTLE_TIMEOUT_S:.1f} s; refusing motion-finished command"
+    results: list[IkResult] = []
+    total_evaluations = 0
+    for candidate_seed in candidate_seeds:
+        solution = least_squares(
+            residual,
+            np.clip(candidate_seed, ARM_POSITION_LOWER_RAD, ARM_POSITION_UPPER_RAD),
+            bounds=(ARM_POSITION_LOWER_RAD, ARM_POSITION_UPPER_RAD),
+            max_nfev=IK_MAX_FUNCTION_EVALUATIONS,
+            ftol=1e-12,
+            xtol=1e-12,
+            gtol=1e-12,
+        )
+        total_evaluations += int(solution.nfev)
+        achieved = forward_end_effector_pose(model, frame_id, solution.x, flange_to_ee)
+        position_error, orientation_error = pose_error(achieved, target)
+        results.append(
+            IkResult(
+                q=np.asarray(solution.x, dtype=float),
+                achieved_pose=achieved,
+                position_error_m=position_error,
+                orientation_error_rad=orientation_error,
+                function_evaluations=int(solution.nfev),
             )
+        )
 
-        final_command = pylibfranka.CartesianVelocities([0.0] * 6)
-        final_command.motion_finished = True
-        control.writeOnce(final_command)
-        print(f"[{side}] End-effector target reached.", flush=True)
-    finally:
-        try:
-            robot.stop()
-        except Exception:
-            pass
+    valid = [
+        result
+        for result in results
+        if result.position_error_m <= IK_POSITION_TOLERANCE_M
+        and result.orientation_error_rad <= IK_ORIENTATION_TOLERANCE_RAD
+    ]
+    if not valid:
+        best = min(results, key=lambda item: item.position_error_m + item.orientation_error_rad)
+        raise RuntimeError(
+            "No FR3 IK solution satisfies the verified pose tolerance: "
+            f"best position error={best.position_error_m:.6f} m, "
+            f"orientation error={best.orientation_error_rad:.6f} rad after "
+            f"{total_evaluations} function evaluations. No arm command was published."
+        )
+    return min(valid, key=lambda item: float(np.linalg.norm(item.q - seed)))
 
 
-def read_current_arm_pose(robot_ip: str, side: str) -> np.ndarray:
-    import pylibfranka
-
-    print(f"[{side}] Reading current FR3 end-effector pose from {robot_ip}...", flush=True)
-    robot = pylibfranka.Robot(robot_ip)
-    try:
-        return matrix_to_pose_vector(np.asarray(robot.read_once().O_T_EE, dtype=float))
-    finally:
-        try:
-            robot.stop()
-        except Exception:
-            pass
+def ramp_arm_command(
+    commanded_q: np.ndarray,
+    commanded_velocity: np.ndarray,
+    target_q: np.ndarray,
+    dt: float,
+    max_velocity: float = ARM_MAX_VELOCITY_RAD_PER_S,
+    max_acceleration: float = ARM_MAX_ACCELERATION_RAD_PER_S2,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Replay's bounded 50 Hz first-phase arm ramp."""
+    dt = min(max(float(dt), 1e-6), 2.0 * ARM_PUBLISH_PERIOD_S)
+    position_error = target_q - commanded_q
+    target_velocity = np.clip(
+        ARM_TRACKING_GAIN_PER_S * position_error, -max_velocity, max_velocity
+    )
+    velocity_delta = np.clip(
+        target_velocity - commanded_velocity,
+        -max_acceleration * dt,
+        max_acceleration * dt,
+    )
+    next_velocity = np.clip(
+        commanded_velocity + velocity_delta, -max_velocity, max_velocity
+    )
+    position_step = next_velocity * dt
+    position_step = np.where(
+        np.abs(position_step) > np.abs(position_error), position_error, position_step
+    )
+    next_q = commanded_q + position_step
+    next_velocity = np.where(position_step == position_error, 0.0, next_velocity)
+    return next_q, next_velocity
 
 
 def move_gripper(robot_ip: str, side: str, target_width: float) -> None:
+    """Move a Franka Hand after the ROS-controlled arm has settled."""
     import pylibfranka
 
     gripper = pylibfranka.Gripper(robot_ip)
     state = gripper.read_once()
-    max_width = float(state.max_width)
-    if target_width > max_width + 1e-6:
+    if target_width > float(state.max_width) + 1e-6:
         raise ValueError(
-            f"[{side}] target gripper width {target_width:.6f} m exceeds "
-            f"the measured maximum {max_width:.6f} m"
+            f"[{side}] target width {target_width:.6f} m exceeds the measured "
+            f"maximum {float(state.max_width):.6f} m"
         )
-    print(f"[{side}] Moving gripper to {target_width:.6f} m...", flush=True)
-    if not gripper.move(target_width, GRIPPER_SPEED_M_PER_S):
-        raise RuntimeError(f"[{side}] gripper rejected or failed to reach the target")
-    print(f"[{side}] Gripper target reached.", flush=True)
+    if not gripper.move(target_width, 0.05):
+        raise RuntimeError(f"[{side}] Franka gripper failed to reach its target")
+    print(f"[{side}] Franka gripper target reached.", flush=True)
 
 
-def read_current_gripper_width(robot_ip: str, side: str) -> np.ndarray:
-    import pylibfranka
-
-    print(f"[{side}] Reading current Franka gripper width from {robot_ip}...", flush=True)
-    gripper = pylibfranka.Gripper(robot_ip)
-    return np.asarray([float(gripper.read_once().width)], dtype=float)
-
-
-def joint_state_positions(state: Any) -> np.ndarray | None:
-    positions = getattr(state, "position", None)
-    if positions is not None:
-        values = np.asarray(positions, dtype=float)
-    else:
-        joints = getattr(state, "joints", None)
-        if joints is None:
-            return None
-        values = np.asarray(
-            [joint.position for joint in sorted(joints, key=lambda joint: int(joint.nid))],
-            dtype=float,
-        )
-    return values if values.shape == (20,) and np.all(np.isfinite(values)) else None
+def ordered_joint_values(message: Any, field_name: str) -> np.ndarray | None:
+    raw = getattr(message, field_name, [])
+    if len(raw) < 7:
+        return None
+    ordered: list[float | None] = [None] * 7
+    for name, value in zip(message.name, raw, strict=False):
+        for index in range(1, 8):
+            if name.endswith(f"joint{index}"):
+                ordered[index - 1] = float(value)
+    if all(value is not None for value in ordered):
+        return np.asarray(ordered, dtype=float)
+    return np.asarray(raw[:7], dtype=float)
 
 
-def connect_wuji_hand(manager: Any, side: str, address: str) -> Any:
-    if address:
-        return manager.connect(address=address, device_name="wuji_hand_2")
-    devices = [device for device in manager.scan() if str(device.sn).upper().startswith("WH")]
-    if not devices:
-        raise RuntimeError(f"[{side}] no Wuji Hand 2 found; pass --{side}-hand-ip")
-    if len(devices) == 1:
-        return manager.connect(address=devices[0].address, device_name="wuji_hand_2")
-    for device in devices:
-        hand = manager.connect(address=device.address, device_name="wuji_hand_2")
-        try:
-            if str(hand.handedness().get()).lower() == side:
-                return hand
-        except Exception:
-            pass
-        hand.disconnect()
-        time.sleep(0.2)
-    raise RuntimeError(f"[{side}] no matching Wuji Hand 2 found; pass --{side}-hand-ip")
+def build_move_node_class(Node: Any, JointState: Any, FrankaRobotState: Any) -> type:
+    class MoveToTargetNode(Node):  # type: ignore[misc, valid-type]
+        def __init__(self, args: argparse.Namespace) -> None:
+            super().__init__("move_to_target_ee")
+            self.active_sides = selected_sides(args.arm_mode)
+            self.arm_q: dict[str, np.ndarray | None] = {side: None for side in self.active_sides}
+            self.arm_dq: dict[str, np.ndarray | None] = {side: None for side in self.active_sides}
+            self.ee_pose: dict[str, np.ndarray | None] = {side: None for side in self.active_sides}
+            self.flange_to_ee: dict[str, np.ndarray | None] = {
+                side: None for side in self.active_sides
+            }
+            self.arm_publishers: dict[str, Any] = {}
+            for side in self.active_sides:
+                self.arm_publishers[side] = self.create_publisher(
+                    JointState, f"/{side}/gello/raw_joint_states", 10
+                )
+                self.create_subscription(
+                    JointState,
+                    f"/{side}/franka/joint_states",
+                    lambda message, selected=side: self._store_joint_state(selected, message),
+                    10,
+                )
+                self.create_subscription(
+                    FrankaRobotState,
+                    f"/{side}/franka_robot_state_broadcaster/robot_state",
+                    lambda message, selected=side: self._store_robot_state(selected, message),
+                    10,
+                )
+
+        def _store_joint_state(self, side: str, message: Any) -> None:
+            q = ordered_joint_values(message, "position")
+            if q is not None and np.all(np.isfinite(q)):
+                self.arm_q[side] = q
+            dq = ordered_joint_values(message, "velocity")
+            if dq is not None and np.all(np.isfinite(dq)):
+                self.arm_dq[side] = dq
+
+        def _store_robot_state(self, side: str, message: Any) -> None:
+            self.ee_pose[side] = pose_message_to_matrix(message.o_t_ee.pose)
+            self.flange_to_ee[side] = pose_message_to_matrix(message.f_t_ee.pose)
+
+        def publish_arm(self, side: str, q: np.ndarray) -> None:
+            message = JointState()
+            message.header.stamp = self.get_clock().now().to_msg()
+            message.name = JOINT_NAMES
+            message.position = np.asarray(q, dtype=float).tolist()
+            self.arm_publishers[side].publish(message)
+
+    return MoveToTargetNode
 
 
-def wait_for_wuji_enabled(hand: Any, side: str) -> None:
-    deadline = time.monotonic() + HAND_ENABLE_TIMEOUT_S
-    subscription = hand.joint_diagnostics().subscribe()
-    try:
-        while time.monotonic() < deadline:
-            time.sleep(0.1)
-            frame = subscription.recv()
-            if frame is None or not frame.joints:
-                continue
-            live = [joint for joint in frame.joints if joint.vbus_v_fb > 0.5]
-            if live and all(joint.status_word.ext_state == 2 for joint in live):
-                return
-    finally:
-        subscription.close()
-    raise RuntimeError(f"[{side}] Wuji Hand 2 did not enable within {HAND_ENABLE_TIMEOUT_S:g} s")
+def wait_until(rclpy: Any, node: Any, predicate: Any, timeout_s: float, description: str) -> None:
+    deadline = time.monotonic() + timeout_s
+    while rclpy.ok() and time.monotonic() < deadline:
+        if predicate():
+            return
+        rclpy.spin_once(node, timeout_sec=0.05)
+    raise TimeoutError(f"Timed out after {timeout_s:g} s waiting for {description}")
 
 
-def read_wuji_positions(hand: Any, side: str) -> np.ndarray:
-    deadline = time.monotonic() + HAND_ENABLE_TIMEOUT_S
-    subscription = hand.joint_states().subscribe()
-    try:
-        while time.monotonic() < deadline:
-            time.sleep(0.02)
-            state = subscription.recv()
-            if state is None:
-                continue
-            positions = joint_state_positions(state)
-            if positions is not None:
-                return positions
-    finally:
-        subscription.close()
-    raise RuntimeError(f"[{side}] no valid 20-joint Wuji state received")
+def wait_for_robot_state(rclpy: Any, node: Any, args: argparse.Namespace) -> None:
+    def ready() -> bool:
+        for side in node.active_sides:
+            if (
+                node.arm_q[side] is None
+                or node.ee_pose[side] is None
+                or node.flange_to_ee[side] is None
+            ):
+                return False
+        return True
+
+    wait_until(rclpy, node, ready, 30.0, "FR3 state topics")
 
 
-def read_current_hand_positions(side: str, address: str) -> np.ndarray:
-    import wuji_sdk
-
-    manager = wuji_sdk.SdkManager.instance()
-    hand = None
-    try:
-        print(f"[{side}] Reading current Wuji Hand 2 joint positions...", flush=True)
-        hand = connect_wuji_hand(manager, side, address)
-        return read_wuji_positions(hand, side)
-    finally:
-        if hand is not None:
-            try:
-                hand.disconnect()
-            except Exception:
-                pass
-        try:
-            manager.disconnect_all()
-        except Exception:
-            pass
+def arm_reached(node: Any, side: str, target_q: np.ndarray) -> bool:
+    actual_q = node.arm_q[side]
+    if actual_q is None or np.max(np.abs(actual_q - target_q)) > ARM_POSITION_TOLERANCE_RAD:
+        return False
+    actual_dq = node.arm_dq[side]
+    return actual_dq is None or np.max(np.abs(actual_dq)) <= ARM_VELOCITY_TOLERANCE_RAD_PER_S
 
 
-def move_hand(side: str, address: str, target: np.ndarray) -> None:
-    import wuji_sdk
+def move_arms_with_replay_transport(
+    rclpy: Any, node: Any, ik_results: dict[str, IkResult]
+) -> None:
+    commands = {
+        side: np.asarray(node.arm_q[side], dtype=float).copy() for side in node.active_sides
+    }
+    velocities = {side: np.zeros(7, dtype=float) for side in node.active_sides}
+    targets = {side: ik_results[side].q for side in node.active_sides}
+    print(
+        "Moving arm(s) through the replay transport "
+        f"(50 Hz, max {ARM_MAX_VELOCITY_RAD_PER_S:g} rad/s, "
+        f"{ARM_MAX_ACCELERATION_RAD_PER_S2:g} rad/s^2)...",
+        flush=True,
+    )
 
-    manager = wuji_sdk.SdkManager.instance()
-    hand = None
-    publisher = None
-    try:
-        print(f"[{side}] Connecting to Wuji Hand 2...", flush=True)
-        hand = connect_wuji_hand(manager, side, address)
-        online_count = int(hand.online_joints_count().get())
-        if online_count != 20:
-            raise RuntimeError(f"[{side}] expected 20 online hand joints, found {online_count}")
-        hand.effort_limit().set(1.5)
-        hand.mit_params().set((3.0, 0.1))
-        hand.enable()
-        wait_for_wuji_enabled(hand, side)
-        start = read_wuji_positions(hand, side)
-        duration = max(
-            MIN_TRAJECTORY_DURATION_S,
-            float(np.max(np.abs(target - start))) / MAX_HAND_JOINT_SPEED_RAD_PER_S,
-        )
-        publisher = hand.joint_command().publish()
-        period = 1.0 / HAND_COMMAND_RATE_HZ
-        start_time = time.monotonic()
-        print(f"[{side}] Moving 20 hand joints over {duration:.2f} s...", flush=True)
-        while True:
-            elapsed = time.monotonic() - start_time
-            blend = smooth_step(elapsed / duration)
-            positions = start + blend * (target - start)
-            publisher.send(
-                [wuji_sdk.JointCommand(float(position), 0.0, 0.0) for position in positions]
+    start = time.monotonic()
+    deadline = start + ARM_MOVE_TIMEOUT_S
+    next_publish = start
+    while time.monotonic() < min(start + ARM_PRIME_DURATION_S, deadline):
+        for side in node.active_sides:
+            node.publish_arm(side, commands[side])
+        next_publish += ARM_PUBLISH_PERIOD_S
+        while time.monotonic() < next_publish:
+            rclpy.spin_once(node, timeout_sec=min(0.01, next_publish - time.monotonic()))
+
+    last_command = time.monotonic()
+    next_publish = last_command
+    stable_samples = 0
+    next_status = last_command
+    while rclpy.ok() and time.monotonic() < deadline:
+        now = time.monotonic()
+        dt = now - last_command
+        for side in node.active_sides:
+            commands[side], velocities[side] = ramp_arm_command(
+                commands[side], velocities[side], targets[side], dt
             )
-            if elapsed >= duration:
-                break
-            time.sleep(period)
-        time.sleep(0.2)
-        print(f"[{side}] Hand-joint target reached.", flush=True)
-    finally:
-        if publisher is not None:
-            try:
-                publisher.close()
-            except Exception:
-                pass
-        if hand is not None:
-            try:
-                hand.disable()
-            except Exception:
-                pass
-        try:
-            manager.disconnect_all()
-        except Exception:
-            pass
+            node.publish_arm(side, commands[side])
+        last_command = now
+        next_publish += ARM_PUBLISH_PERIOD_S
+        while time.monotonic() < next_publish:
+            rclpy.spin_once(node, timeout_sec=min(0.01, next_publish - time.monotonic()))
+
+        if all(arm_reached(node, side, targets[side]) for side in node.active_sides):
+            stable_samples += 1
+            if stable_samples >= ARM_STABLE_SAMPLES:
+                cartesian_status: list[str] = []
+                cartesian_outside_tolerance: list[str] = []
+                for side in node.active_sides:
+                    measured = node.ee_pose[side]
+                    expected = ik_results[side].achieved_pose
+                    if measured is None:
+                        cartesian_status.append(f"{side}=unavailable")
+                        continue
+                    position_error, orientation_error = pose_error(measured, expected)
+                    status = (
+                        f"{side}: position={position_error:.6f} m, "
+                        f"orientation={orientation_error:.6f} rad"
+                    )
+                    cartesian_status.append(status)
+                    if (
+                        position_error > EE_FINAL_POSITION_TOLERANCE_M
+                        or orientation_error > EE_FINAL_ORIENTATION_TOLERANCE_RAD
+                    ):
+                        cartesian_outside_tolerance.append(status)
+                print(
+                    "Final measured Cartesian residual: " + "; ".join(cartesian_status),
+                    flush=True,
+                )
+                if cartesian_outside_tolerance:
+                    print(
+                        "Warning: the final Cartesian residual exceeds the diagnostic "
+                        f"threshold ({EE_FINAL_POSITION_TOLERANCE_M:g} m, "
+                        f"{EE_FINAL_ORIENTATION_TOLERANCE_RAD:g} rad). Continuing because "
+                        "the replay-compatible joint/velocity gate is satisfied.",
+                        flush=True,
+                    )
+                print("All selected arms reached the replay-compatible initial-state gate.", flush=True)
+                return
+        else:
+            stable_samples = 0
+        if now >= next_status:
+            status = ", ".join(
+                f"{side}={np.max(np.abs(targets[side] - node.arm_q[side])):.4f} rad"
+                for side in node.active_sides
+            )
+            print(f"Arm max joint error: {status}", flush=True)
+            next_status = now + 1.0
+    errors = {
+        side: float(np.max(np.abs(targets[side] - node.arm_q[side])))
+        for side in node.active_sides
+    }
+    raise TimeoutError(f"Arms did not settle within {ARM_MOVE_TIMEOUT_S:g} s; errors={errors}")
 
 
-def run_parallel(process_specs: list[tuple[str, Any, tuple[Any, ...]]]) -> None:
-    context = mp.get_context("spawn")
-    processes: list[tuple[str, mp.Process]] = []
-    for name, function, arguments in process_specs:
-        process = context.Process(target=function, args=arguments, name=name)
-        process.start()
-        processes.append((name, process))
-    failed: list[str] = []
-    for name, process in processes:
-        process.join()
-        if process.exitcode != 0:
-            failed.append(f"{name} (exit {process.exitcode})")
-    if failed:
-        raise RuntimeError("hardware command failed: " + ", ".join(failed))
+def request_hand_status(socket: Any, request: dict[str, Any] | None = None) -> dict[str, Any]:
+    import zmq
+
+    socket.send_pyobj({"kind": "status"} if request is None else request)
+    if not socket.poll(1000, zmq.POLLIN):
+        raise TimeoutError("Timed out waiting for Wuji hand worker status")
+    response = socket.recv_pyobj()
+    if not isinstance(response, dict) or not response.get("ready", False):
+        raise RuntimeError(f"Invalid Wuji hand worker status: {response!r}")
+    return response
 
 
-def read_current_targets(args: argparse.Namespace, targets: list[SideTarget]) -> dict[str, dict[str, np.ndarray]]:
-    """Read all values displayed to the operator before an actual move."""
-    robot_ips = {"left": args.ip_left, "right": args.ip_right}
-    hand_addresses = {"left": args.left_hand_ip, "right": args.right_hand_ip}
+def open_hand_status_sockets(sides: list[str]) -> tuple[Any, dict[str, Any]]:
+    import zmq
+
+    context = zmq.Context()
+    ports = {"left": 5563, "right": 5564}
+    sockets: dict[str, Any] = {}
+    for side in sides:
+        socket = context.socket(zmq.REQ)
+        socket.setsockopt(zmq.RCVTIMEO, 1000)
+        socket.setsockopt(zmq.SNDTIMEO, 1000)
+        socket.connect(f"tcp://127.0.0.1:{ports[side]}")
+        sockets[side] = socket
+    return context, sockets
+
+
+def read_hand_states(sockets: dict[str, Any]) -> dict[str, np.ndarray]:
+    result: dict[str, np.ndarray] = {}
+    for side, socket in sockets.items():
+        status = request_hand_status(socket)
+        actual = status.get("actual")
+        if actual is None or np.asarray(actual).shape != (20,):
+            raise RuntimeError(f"[{side}] Wuji worker has no valid measured joint state")
+        result[side] = np.asarray(actual, dtype=float)
+    return result
+
+
+def move_hands(sockets: dict[str, Any], targets: list[SideTarget]) -> None:
+    for target in targets:
+        status = request_hand_status(
+            sockets[target.side],
+            {"kind": "initial", "target": target.end_effector_joint.tolist()},
+        )
+        if not status.get("initial_received", False):
+            raise RuntimeError(f"[{target.side}] Wuji worker rejected the hand target")
+    deadline = time.monotonic() + END_EFFECTOR_MOVE_TIMEOUT_S
+    while time.monotonic() < deadline:
+        statuses = {side: request_hand_status(socket) for side, socket in sockets.items()}
+        if all(status.get("initial_reached", False) for status in statuses.values()):
+            print("All selected Wuji hands reached their targets.", flush=True)
+            return
+        time.sleep(0.05)
+    errors = {}
+    for target in targets:
+        actual = request_hand_status(sockets[target.side]).get("actual")
+        errors[target.side] = None if actual is None else float(
+            np.max(np.abs(np.asarray(actual, dtype=float) - target.end_effector_joint))
+        )
+    raise TimeoutError(f"Hands did not settle within {END_EFFECTOR_MOVE_TIMEOUT_S:g} s; errors={errors}")
+
+
+def read_current_targets(
+    args: argparse.Namespace,
+    targets: list[SideTarget],
+    node: Any | None = None,
+    hand_states: dict[str, np.ndarray] | None = None,
+) -> dict[str, dict[str, np.ndarray]]:
+    """Read all values displayed to the operator before an actual move.
+
+    Arm pose and joint state are intentionally read from ROS, the same state
+    stream that the replay transport uses. ``node`` is optional only for unit
+    tests and legacy callers; hardware execution always supplies it.
+    """
     current: dict[str, dict[str, np.ndarray]] = {}
     for target in targets:
-        side_values = {"pose": read_current_arm_pose(robot_ips[target.side], target.side)}
+        if node is None:
+            raise RuntimeError("ROS node is required to read current arm state")
+        pose = node.ee_pose[target.side]
+        q = node.arm_q[target.side]
+        if pose is None or q is None:
+            raise RuntimeError(f"[{target.side}] ROS state is not available")
+        side_values = {"pose": matrix_to_pose_vector(pose), "arm_q": np.asarray(q, dtype=float)}
         if args.end_effector == "gripper":
-            side_values["joint"] = read_current_gripper_width(robot_ips[target.side], target.side)
-        elif args.end_effector == "hand":
-            side_values["joint"] = read_current_hand_positions(
-                target.side, hand_addresses[target.side]
+            import pylibfranka
+
+            gripper = pylibfranka.Gripper(
+                args.ip_left if target.side == "left" else args.ip_right
             )
+            width = float(gripper.read_once().width)
+            side_values["joint"] = np.asarray([width], dtype=float)
+        elif args.end_effector == "hand":
+            if hand_states is None or target.side not in hand_states:
+                raise RuntimeError(f"[{target.side}] hand state is not available")
+            side_values["joint"] = np.asarray(hand_states[target.side], dtype=float)
         current[target.side] = side_values
     return current
 
@@ -772,6 +811,8 @@ def print_move_summary(
     for target in targets:
         print(f"{target.side} current ee pose [x, y, z, roll, pitch, yaw]: {format_values(current[target.side]['pose'])}")
         print(f"{target.side} target  ee pose [x, y, z, roll, pitch, yaw]: {format_values(target.pose)}")
+        if "arm_q" in current[target.side]:
+            print(f"{target.side} current arm joint angles [rad]: {format_values(current[target.side]['arm_q'])}")
         if target.end_effector_joint is not None:
             label = "gripper width [m]" if args.end_effector == "gripper" else "hand joint angles [rad]"
             print(f"{target.side} current {label}: {format_values(current[target.side]['joint'])}")
@@ -791,8 +832,11 @@ def require_approval() -> None:
         raise SystemExit("Real-robot motion cancelled.")
 
 
-def print_dry_run(args: argparse.Namespace, targets: list[SideTarget]) -> None:
-    current = read_current_targets(args, targets)
+def print_dry_run(
+    args: argparse.Namespace,
+    targets: list[SideTarget],
+    current: dict[str, dict[str, np.ndarray]],
+) -> None:
     print_move_summary(args, targets, current)
     print("Dry run: no hardware motion was commanded.")
 
@@ -801,46 +845,83 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     targets = resolve_targets(args, parser)
-    robot_ips = {"left": args.ip_left, "right": args.ip_right}
-    if args.dry_run:
-        print_dry_run(args, targets)
-        return
+    try:
+        import rclpy
+        from franka_msgs.msg import FrankaRobotState
+        from rclpy.node import Node
+        from sensor_msgs.msg import JointState
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "ROS 2 Python dependencies are required. Run scripts/move_to_target_ee.sh "
+            "so the ROS Humble environment is sourced."
+        ) from exc
 
-    current = read_current_targets(args, targets)
-    print_move_summary(args, targets, current)
-    require_approval()
-    run_parallel(
-        [
-            (f"{target.side}_arm_move", move_arm, (robot_ips[target.side], target.side, target.pose))
-            for target in targets
-        ]
-    )
+    rclpy.init()
+    node_class = build_move_node_class(Node, JointState, FrankaRobotState)
+    node = node_class(args)
+    hand_context = None
+    hand_sockets: dict[str, Any] = {}
+    try:
+        wait_for_robot_state(rclpy, node, args)
+        hand_states = None
+        if args.end_effector == "hand":
+            hand_context, hand_sockets = open_hand_status_sockets(node.active_sides)
+            hand_states = read_hand_states(hand_sockets)
+        current = read_current_targets(args, targets, node, hand_states)
 
-    if args.end_effector == "gripper":
-        run_parallel(
-            [
-                (
-                    f"{target.side}_gripper_move",
-                    move_gripper,
-                    (robot_ips[target.side], target.side, float(target.end_effector_joint[0])),
-                )
-                for target in targets
-            ]
+        # Solve IK before asking for approval so the operator sees the exact
+        # joint-space command that will be sent through the ROS controller.
+        model, frame_id = build_fr3_model()
+        ik_results: dict[str, IkResult] = {}
+        for target in targets:
+            flange_to_ee = np.asarray(node.flange_to_ee[target.side], dtype=float)
+            result = solve_fr3_ik(
+                current[target.side]["arm_q"],
+                pose_vector_to_matrix(target.pose),
+                flange_to_ee,
+                model,
+                frame_id,
+            )
+            ik_results[target.side] = result
+
+        print_move_summary(args, targets, current)
+        for target in targets:
+            result = ik_results[target.side]
+            print(f"{target.side} IK target arm joint angles [rad]: {format_values(result.q)}")
+            print(
+                f"{target.side} IK FK residual: position={result.position_error_m:.6f} m, "
+                f"orientation={result.orientation_error_rad:.6f} rad"
+            )
+        print(
+            "Safety note: this is final-pose IK plus a joint-space transport, not a "
+            "Cartesian straight-line or collision-planned path. Confirm only if the "
+            "joint-space route has clear workspace."
         )
-    elif args.end_effector == "hand":
-        hand_addresses = {"left": args.left_hand_ip, "right": args.right_hand_ip}
-        run_parallel(
-            [
-                (
-                    f"{target.side}_hand_move",
-                    move_hand,
-                    (target.side, hand_addresses[target.side], target.end_effector_joint),
-                )
-                for target in targets
-            ]
-        )
+        if args.dry_run:
+            print("Dry run: no hardware motion was commanded.")
+            return
 
-    print("All requested targets reached.")
+        require_approval()
+        move_arms_with_replay_transport(rclpy, node, ik_results)
+        if args.end_effector == "gripper":
+            robot_ips = {"left": args.ip_left, "right": args.ip_right}
+            for target in targets:
+                move_gripper(
+                    robot_ips[target.side],
+                    target.side,
+                    float(target.end_effector_joint[0]),
+                )
+        elif args.end_effector == "hand":
+            move_hands(hand_sockets, targets)
+        print("All requested targets reached.")
+    finally:
+        node.destroy_node()
+        if hand_context is not None:
+            for socket in hand_sockets.values():
+                socket.close(0)
+            hand_context.term()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

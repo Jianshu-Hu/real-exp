@@ -44,6 +44,13 @@ from utils.image_preprocessing import (
     apply_resize_pad_to_feature_specs,
     make_resize_pad_transform,
 )
+from utils.trajectory_metadata import (
+    TRAJECTORY_CONFIG_PATH,
+    describe_trajectory_layout,
+    require_dataset_trajectory_config,
+    validate_action_trajectory_contract,
+)
+from utils.deployment_metadata import write_checkpoint_deployment_metadata
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
@@ -426,6 +433,19 @@ def load_action_config(dataset_root: Path) -> dict[str, Any]:
     return json.loads(action_config_path.read_text())
 
 
+def write_policy_data_contract(
+    checkpoint_dir: Path,
+    dataset_info: dict[str, Any],
+    action_config: dict[str, Any],
+    trajectory_config: dict[str, Any],
+) -> None:
+    """Keep the hardware/data contract beside every independently loadable policy."""
+    policy_dir = checkpoint_dir / "pretrained_model"
+    write_checkpoint_deployment_metadata(
+        policy_dir, dataset_info, action_config, trajectory_config
+    )
+
+
 def build_dataloader(
     dataset,
     batch_size: int,
@@ -549,6 +569,8 @@ def main() -> None:
 
     require_absolute_joint_action_dataset(dataset_root)
     action_config = load_action_config(dataset_root)
+    trajectory_config = require_dataset_trajectory_config(dataset_root)
+    validate_action_trajectory_contract(action_config, trajectory_config)
     ensure_dataset_stats(args.dataset_repo_id, dataset_root)
 
     dataset_info = json.loads(dataset_info_path.read_text())
@@ -629,6 +651,11 @@ def main() -> None:
             "Action representation: "
             f"arm={action_config.get('arm_action_representation')}, "
             f"gripper={action_config.get('gripper_action_representation')}"
+        )
+        print(
+            "Trajectory contract: "
+            f"{trajectory_config['end_effector']}/{trajectory_config['arm_mode']} "
+            f"{describe_trajectory_layout(trajectory_config)}"
         )
 
     train_dataset = make_dataset(cfg)
@@ -828,6 +855,9 @@ def main() -> None:
                     scheduler=lr_scheduler,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
+                )
+                write_policy_data_contract(
+                    checkpoint_dir, dataset_info, action_config, trajectory_config
                 )
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:

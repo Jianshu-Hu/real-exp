@@ -15,6 +15,8 @@ Both computers use ROS 2 domain `0`. The default server address is
 | Policy commands | robot executor to server bridge | ZMQ `192.168.50.13:5556` |
 | Policy inference | robot executor to policy server | gRPC `192.168.50.13:8080` |
 | Full synchronized camera bundles | bridge to policy-server cache, server-local only | ZMQ `127.0.0.1:5557` |
+| Wuji measured-state telemetry (hand datasets only) | robot hand worker to server bridge | ZMQ `192.168.50.13:5558` |
+| Wuji policy targets (hand datasets only) | robot executor to robot hand worker | ZMQ `127.0.0.1:5561` (left), `127.0.0.1:5562` (right) |
 
 The remote observation stream is metadata/state-only during deployment. It contains camera
 names, shapes, timestamps, bundle sequence, freshness, and synchronization diagnostics, but
@@ -43,36 +45,46 @@ generation. Gripper values are continuous action dimensions and are aggregated w
 Deployment requires `gripper_action_representation: absolute_width`; old binary checkpoints are
 rejected instead of converting their outputs with a threshold.
 
-The startup scripts and executors use these defaults. Set
-`DEPLOYMENT_SERVER_IP` or pass the corresponding CLI options only if the server
-address changes.
+The dataset root passed to the client, server, and executor must identify the
+same data contract. It does not need to have the same absolute path on both
+computers. The startup scripts resolve arm mode, end effector, state/action
+dimensions, FPS, camera subset, FR3 configuration, and gripper/hand processes
+from the metadata; there is no implicit dual-arm default after this migration.
+
+Set `DEPLOYMENT_SERVER_IP` or pass `--server-ip` only if the inference server
+address differs from `192.168.50.13`.
 
 ## Run Deployment
 
-### 1. Start the robot client
+### 1. Start the deployment server
 
-On the robot computer:
-
-```bash
-cd /home/pair1/real-exp
-./scripts/start_deployment_client.sh
-```
-
-This starts the dual-arm deployment controllers, joint-state broadcasters, and
-Franka-hand managers. The controllers initially hold the current pose.
-
-### 2. Start the deployment server
-
-On the server computer:
+Only the server needs the checkpoint. Neither machine needs the source dataset.
+On the server computer, preflight and start the checkpoint contract:
 
 ```bash
 cd /home/pair1/real-exp
-conda activate lerobot
-./scripts/start_deployment_server.sh
+POLICY=/path/to/left-gripper-act/checkpoints/last/pretrained_model
+./scripts/start_deployment_server.sh --policy-path "$POLICY" --print-config
+./scripts/start_deployment_server.sh --policy-path "$POLICY"
 ```
 
-This starts the three RealSense cameras, the server-side deployment bridge,
-and the policy server.
+The server validates `config.json` against the embedded metadata, configures the
+camera/bridge layout and FPS, serves inference on port `8080`, and exposes a
+read-only deployment contract on HTTP port `8081`.
+
+### 2. Start the robot client
+
+On the robot computer, query the running server without starting ROS/hardware:
+
+```bash
+./scripts/start_deployment_client.sh --server-ip 192.168.50.13 --print-config
+./scripts/start_deployment_client.sh --server-ip 192.168.50.13
+```
+
+A hand checkpoint automatically selects the no-gripper controller and Wuji
+worker. Add `--right-hand-ip <WUJI_IP:PORT>` or `--left-hand-ip`; the address can
+be omitted when SDK discovery is unambiguous. The client has no dataset or
+checkpoint path.
 
 ### 3. Start an executor in dry-run mode
 
@@ -85,11 +97,8 @@ source /opt/ros/humble/setup.bash
 source gello_software/ros2/install/setup.bash
 
 python deploy/franka_act_policy_executor.py \
-  --policy-path /home/pair1/real-exp/outputs/test-limit-pick-and-place_act/checkpoints/last/pretrained_model \
-  --dataset-root data/test-limit-pick-and-place \
-  --actions-per-chunk 32 \
+  --server-address 192.168.50.13:8080 \
   --policy-device cuda:0 \
-  --fps 15 \
   --task "pick and place" \
   --temporal-proposal-decay 0.5
 ```
@@ -97,8 +106,8 @@ python deploy/franka_act_policy_executor.py \
 Do not add `--execute` yet. Confirm that the executor reports:
 
 ```text
-state_dim=16, action_dim=16
-cameras=['cam_left', 'cam_front', 'cam_right']
+state_dim=8, action_dim=8
+cameras=['cam_left', 'cam_front']
 execute: False
 ```
 
@@ -121,11 +130,8 @@ Use this instead of ACT, first without `--execute`:
 
 ```bash
 python deploy/franka_diffusion_policy_executor.py \
-  --policy-path /home/pair1/real-exp/outputs/test-limit-pick-and-place_diffusion/checkpoints/last/pretrained_model \
-  --dataset-root data/test-limit-pick-and-place \
-  --actions-per-chunk 8 \
+  --server-address 192.168.50.13:8080 \
   --policy-device cuda:0 \
-  --fps 15 \
   --task "pick and place" \
   --diffusion-chunk-size-threshold 0.5 \
   --temporal-proposal-decay 0.5
@@ -133,6 +139,26 @@ python deploy/franka_diffusion_policy_executor.py \
 
 Diffusion requires two observation frames before its first inference. Add
 `--execute` only after the dry run passes the same validation.
+
+## Metadata-Driven Hardware Contract
+
+The executor fetches the server-owned checkpoint contract instead of
+assuming a 14- or 16-value dual-arm vector. For example, a left-gripper policy
+uses `[left arm(7), left gripper(1)]`, while a right-hand policy uses
+`[right arm(7), right hand(20)]`. Before inference it rejects any live bridge
+whose arm mode, end-effector type, state/action dimensions, or required camera
+set differs from the contract. Checkpoint directories must contain
+`meta/info.json`, `meta/real_exp_trajectory_config.json`,
+`meta/real_exp_action_config.json`, and `meta/real_exp_deployment_config.json`.
+
+The executor sends the fetched trajectory contract during the
+policy handshake. The server rejects any executor/checkpoint disagreement
+before loading weights, including same-dimensional layouts with different
+hardware meaning.
+
+The migrated `test-traj-gen-pick-and-place` checkpoints embed their 16-D
+`duo/gripper` contract under `outputs/test-traj-gen-pick-and-place_act` and
+`outputs/test-traj-gen-pick-and-place_diffusion`.
 
 ## Camera Cache Troubleshooting
 
@@ -156,5 +182,7 @@ Stop processes in this order:
 
 The bridge and deployment controller hold position on stale commands or clean
 shutdown. If the executor cannot start, first check that robot state reaches
-the server over ROS 2 and that server ports `5555`, `5556`, `5557`, and `8080` are
-reachable from the robot computer.
+the server over ROS 2 and that server ports `5555`, `5556`, `5557`, and `8080`
+are reachable from the robot computer. Hand deployment also requires access to
+server ports `5558` and `8081`, plus an available robot-local command port
+(`5561` or `5562`).

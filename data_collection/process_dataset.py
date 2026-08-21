@@ -137,10 +137,8 @@ def motion_indices_from_metadata(
 
     Real-exp trajectories are laid out as one block per active arm. Each block
     starts with seven arm joints, followed by an optional gripper (one value)
-    or Wuji hand (twenty values). The trajectory metadata is authoritative for
-    the block layout; the legacy action config is used by
-    ``load_dataset_trajectory_config`` when the trajectory config predates the
-    metadata file.
+    or Wuji hand (twenty values). The explicit trajectory metadata is
+    authoritative for the block layout.
     """
     features = info.get("features", {})
     try:
@@ -150,18 +148,11 @@ def motion_indices_from_metadata(
             f"Could not determine observation.state dimension from {dataset_root / INFO_PATH}."
         ) from exc
 
-    action_config_path = dataset_root / ACTION_CONFIG_PATH
-    action_config = load_json(action_config_path) if action_config_path.exists() else {}
     try:
-        from utils.trajectory_metadata import load_trajectory_config
+        from utils.trajectory_metadata import require_dataset_trajectory_config
 
-        trajectory_config = load_trajectory_config(
-            dataset_root,
-            action_config,
-            state_dim,
-            int(features.get("action", {}).get("shape", [state_dim])[0]),
-        )
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        trajectory_config = require_dataset_trajectory_config(dataset_root)
+    except (FileNotFoundError, KeyError, IndexError, TypeError, ValueError) as exc:
         raise ValueError(
             f"Invalid trajectory metadata for {dataset_root}; cannot determine state layout."
         ) from exc

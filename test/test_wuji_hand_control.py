@@ -35,8 +35,11 @@ def test_hand_generator_clips_position_targets_and_replans_smoothly() -> None:
 
 def test_smoothed_backend_publishes_from_measured_position() -> None:
     class FakeHand:
+        def __init__(self) -> None:
+            self.value = 0.25
+
         def read_joint_state(self) -> object:
-            return type("State", (), {"position": [0.25] * HAND_JOINT_COUNT})()
+            return type("State", (), {"position": [self.value] * HAND_JOINT_COUNT})()
 
         def get_soft_limits(self) -> tuple[list[float], list[float]]:
             return [1.0] * HAND_JOINT_COUNT, [-1.0] * HAND_JOINT_COUNT
@@ -63,6 +66,14 @@ def test_smoothed_backend_publishes_from_measured_position() -> None:
     backend = SmoothedBackend(command_rate_hz=HAND_COMMAND_RATE_HZ, ip="", kp=1.0, kd=0.1, current_limit=1.0)
     try:
         np.testing.assert_allclose(backend.target_position, np.full(HAND_JOINT_COUNT, 0.25))
+        backend._backend._hand.value = 0.4
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            actual = backend.actual_position()
+            if actual is not None and np.allclose(actual, 0.4):
+                break
+            time.sleep(0.005)
+        np.testing.assert_allclose(backend.actual_position(), np.full(HAND_JOINT_COUNT, 0.4))
         backend.send(np.full(HAND_JOINT_COUNT, 0.75))
         time.sleep(0.03)
         with FakeBackend.lock:

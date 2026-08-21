@@ -50,6 +50,16 @@ The training entry point requires `meta/real_exp_action_config.json` with
 uses `gripper_action_representation=absolute_width`, which preserves continuous
 normalized gripper targets in `[0, 1]`.
 
+It also requires `meta/real_exp_trajectory_config.json`. This metadata is the
+authoritative vector layout: it records `arm_mode` (`left`, `right`, or `duo`),
+the end-effector type (`arm`, `gripper`, or `hand`), active arms, and the state
+and action dimensions. The trainer validates it against `meta/info.json` and
+the action metadata before creating a policy. Every saved `pretrained_model`
+also receives the action, trajectory, and complete dataset feature metadata plus
+a validated deployment manifest. A checkpoint therefore remains self-describing
+when moved to another machine. Deployment reads this embedded metadata from the
+server-owned checkpoint; the robot client needs neither dataset nor checkpoint files.
+
 ## Recommended First Run
 
 Start with `ACT`, because it works cleanly with the three-camera dataset in this repo.

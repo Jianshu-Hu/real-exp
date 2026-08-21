@@ -52,8 +52,8 @@ changing the calling shell. Set `LEROBOT_CONDA_ENV`, `WUJI_CONDA_ENV`, or
 ### Deploy
 
 - Deployment instructions live in [deploy/DEPLOY_README.md](deploy/DEPLOY_README.md).
-- [`scripts/start_deployment_server.sh`](scripts/start_deployment_server.sh): start the cameras, deployment bridge, and policy server on the inference server.
-- [`scripts/start_deployment_client.sh`](scripts/start_deployment_client.sh): start deployment-gated FR3 controllers and gripper managers on the robot computer.
+- [`scripts/start_deployment_server.sh`](scripts/start_deployment_server.sh): configure cameras and the deployment bridge from checkpoint-embedded metadata, then start the policy server on the inference server.
+- [`scripts/start_deployment_client.sh`](scripts/start_deployment_client.sh): query the policy server for its checkpoint contract, then select left/right/duo FR3 hardware plus the matching gripper or Wuji worker. The client does not need the dataset or checkpoint.
 
 ## Notes
 

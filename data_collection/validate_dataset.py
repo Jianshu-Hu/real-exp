@@ -23,7 +23,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from utils.trajectory_metadata import load_trajectory_config  # noqa: E402
+from utils.trajectory_metadata import (  # noqa: E402
+    require_dataset_trajectory_config,
+    validate_action_trajectory_contract,
+)
 from utils.limit import (  # noqa: E402
     TrajectoryViolationCounts,
     arm_joint_slices,
@@ -837,11 +840,9 @@ def validate_dataset(
         raise ValueError(
             "Dataset metadata must declare observation.state and action dimensions."
         )
-    trajectory_config = load_trajectory_config(
-        dataset_root,
-        action_config or {},
-        state_dim,
-        action_dim,
+    trajectory_config = require_dataset_trajectory_config(dataset_root)
+    validate_action_trajectory_contract(
+        action_config or {}, trajectory_config, source=str(dataset_root / "meta")
     )
     video_keys = get_video_keys(info)
 

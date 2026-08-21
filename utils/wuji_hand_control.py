@@ -323,6 +323,17 @@ class SmoothedWujiHand2Backend:
     def _state_loop(self) -> None:
         subscription = self._state_subscription
         if subscription is None:
+            read_joint_state = getattr(self._backend._hand, "read_joint_state", None)
+            if not callable(read_joint_state):
+                return
+            while not self._state_stop_event.wait(0.01):
+                try:
+                    position = normalize_hand_positions(read_joint_state())
+                except Exception:
+                    position = None
+                if position is not None:
+                    with self._actual_lock:
+                        self._actual = position
             return
         try:
             while not self._state_stop_event.is_set():

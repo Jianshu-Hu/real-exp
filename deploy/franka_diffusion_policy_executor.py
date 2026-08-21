@@ -32,11 +32,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from deploy.action_aggregation import TemporalProposalAggregator
+from utils.trajectory_metadata import (
+    describe_trajectory_layout,
+    split_trajectory_vector,
+    validate_action_trajectory_contract,
+    validate_live_packet,
+)
+from utils.deployment_metadata import fetch_deployment_contract, metadata_url_from_server_address
 
 
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_DEPLOYMENT_LOG_ROOT = DEFAULT_OUTPUT_ROOT / "deployment_logs"
-DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "test-limit-pick-and-place"
 DEFAULT_DEPLOYMENT_SERVER_IP = os.environ.get("DEPLOYMENT_SERVER_IP", "192.168.50.13")
 ACTION_CONFIG_REL_PATH = Path("meta/real_exp_action_config.json")
 INFO_REL_PATH = Path("meta/info.json")
@@ -73,23 +79,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--policy-path",
         type=Path,
-        required=True,
-        help="Checkpoint path resolved by the policy server.",
+        required=False,
+        help="Optional local checkpoint path for diagnostics; deployment metadata comes from the server.",
     )
-    parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--server-address", default=f"{DEFAULT_DEPLOYMENT_SERVER_IP}:8080")
+    parser.add_argument("--metadata-address", default=None, help="Metadata HTTP endpoint or HOST:PORT; defaults to server port 8081.")
     parser.add_argument("--policy-device", default="cuda")
     parser.add_argument(
         "--actions-per-chunk",
         type=int,
-        required=True,
+        required=False,
         help=(
-            "Number of actions to request per deployment chunk. Required for diffusion deployment."
+            "Number of actions to request per deployment chunk. Defaults to server metadata."
         ),
     )
     parser.add_argument("--zmq-host", default=DEFAULT_DEPLOYMENT_SERVER_IP)
     parser.add_argument("--zmq-port", type=int, default=5555)
-    parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Control rate. Defaults to server checkpoint metadata and must match it when specified.",
+    )
     parser.add_argument("--task", default="pick and place")
     parser.add_argument(
         "--diffusion-chunk-size-threshold",
@@ -104,6 +115,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--command-zmq-host", default=DEFAULT_DEPLOYMENT_SERVER_IP)
     parser.add_argument("--command-zmq-port", type=int, default=5556)
+    parser.add_argument(
+        "--left-hand-command-address",
+        default="tcp://127.0.0.1:5561",
+        help="Robot-local Wuji left-hand command endpoint for hand trajectories.",
+    )
+    parser.add_argument(
+        "--right-hand-command-address",
+        default="tcp://127.0.0.1:5562",
+        help="Robot-local Wuji right-hand command endpoint for hand trajectories.",
+    )
     parser.add_argument("--bridge-activation-service", default="/set_deployment_active")
     parser.add_argument("--no-auto-activate-bridge", action="store_true")
     parser.add_argument(
@@ -191,23 +212,10 @@ def packet_to_raw_observation(packet: dict[str, Any], task: str) -> dict[str, An
     return raw_observation
 
 
-def split_action(action: np.ndarray | torch.Tensor) -> dict[str, Any]:
-    action = np.asarray(action, dtype=float)
-    if action.shape[0] == 16:
-        return {
-            "left_arm": action[0:7],
-            "left_gripper": float(action[7]),
-            "right_arm": action[8:15],
-            "right_gripper": float(action[15]),
-        }
-    if action.shape[0] == 14:
-        return {
-            "left_arm": action[0:7],
-            "left_gripper": None,
-            "right_arm": action[7:14],
-            "right_gripper": None,
-        }
-    raise ValueError(f"Unsupported action dimension: {action.shape[0]}")
+def split_action(
+    action: np.ndarray | torch.Tensor, trajectory_config: dict[str, Any]
+) -> dict[str, Any]:
+    return split_trajectory_vector(action, trajectory_config)
 
 
 def summarize_values(values: list[float]) -> dict[str, float | None]:
@@ -221,7 +229,17 @@ def summarize_values(values: list[float]) -> dict[str, float | None]:
     }
 
 
-def summarize_action_deltas(actions: list[np.ndarray]) -> dict[str, Any]:
+def _arm_vectors(values: np.ndarray, trajectory_config: dict[str, Any]) -> dict[str, np.ndarray]:
+    split = split_trajectory_vector(values, trajectory_config)
+    return {
+        side: np.asarray(split[f"{side}_arm"], dtype=float)
+        for side in trajectory_config["arms"]
+    }
+
+
+def summarize_action_deltas(
+    actions: list[np.ndarray], trajectory_config: dict[str, Any]
+) -> dict[str, Any]:
     if len(actions) < 2:
         return {
             "count": 0,
@@ -231,69 +249,56 @@ def summarize_action_deltas(actions: list[np.ndarray]) -> dict[str, Any]:
             "right_abs_max": summarize_values([]),
         }
 
-    left_norms = []
-    left_abs_maxes = []
-    right_norms = []
-    right_abs_maxes = []
+    arm_norms = {side: [] for side in trajectory_config["arms"]}
+    arm_abs_maxes = {side: [] for side in trajectory_config["arms"]}
     for previous, current in zip(actions, actions[1:], strict=False):
-        left_delta = current[0:7] - previous[0:7]
-        if current.shape[0] == 16:
-            right_delta = current[8:15] - previous[8:15]
-        else:
-            right_delta = current[7:14] - previous[7:14]
-        left_norms.append(float(np.linalg.norm(left_delta)))
-        left_abs_maxes.append(float(np.max(np.abs(left_delta))))
-        right_norms.append(float(np.linalg.norm(right_delta)))
-        right_abs_maxes.append(float(np.max(np.abs(right_delta))))
+        previous_arms = _arm_vectors(previous, trajectory_config)
+        current_arms = _arm_vectors(current, trajectory_config)
+        for side in trajectory_config["arms"]:
+            delta = current_arms[side] - previous_arms[side]
+            arm_norms[side].append(float(np.linalg.norm(delta)))
+            arm_abs_maxes[side].append(float(np.max(np.abs(delta))))
 
     return {
         "count": len(actions) - 1,
-        "left_norm": summarize_values(left_norms),
-        "left_abs_max": summarize_values(left_abs_maxes),
-        "right_norm": summarize_values(right_norms),
-        "right_abs_max": summarize_values(right_abs_maxes),
+        **{f"{side}_norm": summarize_values(arm_norms[side]) for side in ("left", "right")},
+        **{f"{side}_abs_max": summarize_values(arm_abs_maxes[side]) for side in ("left", "right")},
     }
 
 
-def summarize_action_pairs(pairs: list[tuple[np.ndarray, np.ndarray]]) -> dict[str, Any]:
-    left_norms = []
-    left_abs_maxes = []
-    right_norms = []
-    right_abs_maxes = []
+def summarize_action_pairs(
+    pairs: list[tuple[np.ndarray, np.ndarray]], trajectory_config: dict[str, Any]
+) -> dict[str, Any]:
+    arm_norms = {side: [] for side in trajectory_config["arms"]}
+    arm_abs_maxes = {side: [] for side in trajectory_config["arms"]}
     for old_action, new_action in pairs:
-        left_delta = new_action[0:7] - old_action[0:7]
-        if new_action.shape[0] == 16:
-            right_delta = new_action[8:15] - old_action[8:15]
-        else:
-            right_delta = new_action[7:14] - old_action[7:14]
-        left_norms.append(float(np.linalg.norm(left_delta)))
-        left_abs_maxes.append(float(np.max(np.abs(left_delta))))
-        right_norms.append(float(np.linalg.norm(right_delta)))
-        right_abs_maxes.append(float(np.max(np.abs(right_delta))))
+        old_arms = _arm_vectors(old_action, trajectory_config)
+        new_arms = _arm_vectors(new_action, trajectory_config)
+        for side in trajectory_config["arms"]:
+            delta = new_arms[side] - old_arms[side]
+            arm_norms[side].append(float(np.linalg.norm(delta)))
+            arm_abs_maxes[side].append(float(np.max(np.abs(delta))))
 
     return {
         "count": len(pairs),
-        "left_norm": summarize_values(left_norms),
-        "left_abs_max": summarize_values(left_abs_maxes),
-        "right_norm": summarize_values(right_norms),
-        "right_abs_max": summarize_values(right_abs_maxes),
+        **{f"{side}_norm": summarize_values(arm_norms[side]) for side in ("left", "right")},
+        **{f"{side}_abs_max": summarize_values(arm_abs_maxes[side]) for side in ("left", "right")},
     }
 
 
-def arm_delta_summary(first: np.ndarray, second: np.ndarray) -> dict[str, Any]:
-    left_delta = second[0:7] - first[0:7]
-    if second.shape[0] == 16:
-        right_delta = second[8:15] - first[8:15]
-    else:
-        right_delta = second[7:14] - first[7:14]
-    return {
-        "left": left_delta.tolist(),
-        "left_norm": float(np.linalg.norm(left_delta)),
-        "left_abs_max": float(np.max(np.abs(left_delta))),
-        "right": right_delta.tolist(),
-        "right_norm": float(np.linalg.norm(right_delta)),
-        "right_abs_max": float(np.max(np.abs(right_delta))),
-    }
+def arm_delta_summary(
+    first: np.ndarray, second: np.ndarray, trajectory_config: dict[str, Any]
+) -> dict[str, Any]:
+    first_arms = _arm_vectors(first, trajectory_config)
+    second_arms = _arm_vectors(second, trajectory_config)
+    result: dict[str, Any] = {}
+    for side in ("left", "right"):
+        if side not in trajectory_config["arms"]:
+            result.update({side: None, f"{side}_norm": None, f"{side}_abs_max": None})
+            continue
+        delta = second_arms[side] - first_arms[side]
+        result.update({side: delta.tolist(), f"{side}_norm": float(np.linalg.norm(delta)), f"{side}_abs_max": float(np.max(np.abs(delta)))})
+    return result
 
 
 def json_safe(value: Any) -> Any:
@@ -314,7 +319,7 @@ def json_safe(value: Any) -> Any:
 
 def default_run_name(args: argparse.Namespace) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    policy_name = args.policy_path.expanduser().name
+    policy_name = args.policy_path.expanduser().name if args.policy_path else "remote-policy"
     threshold = args.diffusion_chunk_size_threshold
     proposal_decay = args.temporal_proposal_decay
     return (
@@ -327,13 +332,13 @@ def default_run_name(args: argparse.Namespace) -> str:
 class FrankaPolicyExecutor:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.policy_path = args.policy_path.expanduser()
-        self.dataset_root = args.dataset_root.resolve()
+        self.policy_path = args.policy_path.expanduser() if args.policy_path else Path("<server-checkpoint>")
         local_policy_config = maybe_load_policy_config(self.policy_path)
-        if local_policy_config is not None:
-            self.policy_type = infer_policy_type(self.policy_path)
-        else:
-            self.policy_type = "diffusion"
+        metadata_url = metadata_url_from_server_address(args.server_address, args.metadata_address)
+        self.deployment_contract = fetch_deployment_contract(metadata_url)
+        self.policy_type = str(self.deployment_contract["policy_type"])
+        if local_policy_config is not None and infer_policy_type(self.policy_path) != self.policy_type:
+            raise ValueError("Local checkpoint policy type disagrees with server deployment metadata.")
         if self.policy_type != "diffusion":
             raise ValueError(
                 "deploy/franka_diffusion_policy_executor.py only supports diffusion checkpoints, "
@@ -343,14 +348,18 @@ class FrankaPolicyExecutor:
         self.n_obs_steps = (
             int(local_policy_config.get("n_obs_steps", 1))
             if local_policy_config is not None
-            else None
+            else int(self.deployment_contract.get("n_obs_steps", 1))
         )
         self.min_history_for_inference = max(int(self.n_obs_steps or 2), 1)
         self.observation_history_debug = deque(maxlen=self.min_history_for_inference)
 
-        if args.actions_per_chunk <= 0:
-            raise ValueError(f"--actions-per-chunk must be positive, got {args.actions_per_chunk}")
-        self.actions_per_chunk = args.actions_per_chunk
+        self.actions_per_chunk = (
+            int(args.actions_per_chunk)
+            if args.actions_per_chunk is not None
+            else int(self.deployment_contract["actions_per_chunk"])
+        )
+        if self.actions_per_chunk <= 0:
+            raise ValueError(f"--actions-per-chunk must be positive, got {self.actions_per_chunk}")
 
         if args.actions_per_chunk is not None and local_policy_config is not None:
             max_actions_per_chunk = infer_actions_per_chunk(self.policy_path, self.policy_type)
@@ -372,14 +381,21 @@ class FrankaPolicyExecutor:
             )
         self.chunk_size_threshold = args.diffusion_chunk_size_threshold
         self.temporal_proposal_decay = args.temporal_proposal_decay
-        self.dataset_info = load_json(self.dataset_root / INFO_REL_PATH)
-        action_config_path = self.dataset_root / ACTION_CONFIG_REL_PATH
-        if not action_config_path.exists():
-            raise FileNotFoundError(
-                f"Missing action metadata: {action_config_path}. "
-                "Deployment requires meta/real_exp_action_config.json."
+        self.dataset_info = self.deployment_contract.get("dataset_info", {"fps": self.deployment_contract["fps"], "features": self.deployment_contract["features"]})
+        dataset_fps = float(self.deployment_contract["fps"])
+        if args.fps is not None and not np.isclose(float(args.fps), dataset_fps):
+            raise ValueError(
+                f"--fps={args.fps:g} does not match server checkpoint metadata fps={dataset_fps:g}."
             )
-        self.action_config = load_json(action_config_path)
+        self.fps = dataset_fps
+        self.action_config = self.deployment_contract["action_config"]
+        self.trajectory_config = self.deployment_contract["trajectory_config"]
+        validate_action_trajectory_contract(
+            self.action_config,
+            self.trajectory_config,
+            source=metadata_url,
+        )
+        self.dataset_action_dim = int(self.trajectory_config["action_dim"])
         if self._arm_action_representation() != "absolute_joint_position":
             raise ValueError(
                 "Deployment expects absolute_joint_position arm actions. "
@@ -392,7 +408,7 @@ class FrankaPolicyExecutor:
         self.send_bytes_in_chunks = send_bytes_in_chunks
         self.channel = grpc.insecure_channel(
             args.server_address,
-            grpc_channel_options(initial_backoff=f"{1.0 / args.fps:.4f}s"),
+            grpc_channel_options(initial_backoff=f"{1.0 / self.fps:.4f}s"),
         )
         self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
 
@@ -403,6 +419,7 @@ class FrankaPolicyExecutor:
         self.log_lock = threading.Lock()
         self.shutdown_event = threading.Event()
         self.command_socket = None
+        self.hand_command_sockets: dict[str, Any] = {}
         self.bridge_active = False
         self.latest_executed_timestep = -1
         self.action_chunk_size = max(1, self.actions_per_chunk)
@@ -429,8 +446,8 @@ class FrankaPolicyExecutor:
 
     def _joint_targets_from_action(self, split: dict[str, Any]) -> dict[str, list[float]]:
         return {
-            "left": np.asarray(split["left_arm"], dtype=float).tolist(),
-            "right": np.asarray(split["right_arm"], dtype=float).tolist(),
+            side: np.asarray(split[f"{side}_arm"], dtype=float).tolist()
+            for side in self.trajectory_config["arms"]
         }
 
     def _queue_snapshot(self) -> dict[str, Any]:
@@ -555,7 +572,6 @@ class FrankaPolicyExecutor:
             "policy_path": str(self.policy_path),
             "policy_type": self.policy_type,
             "server_address": self.args.server_address,
-            "dataset_root": str(self.dataset_root),
             "dataset_action_dim": dataset_action_dim,
             "live_robot_state_dim": int(first_packet["robot_state_dim"]),
             "live_action_dim": int(first_packet["action_dim"]),
@@ -569,7 +585,7 @@ class FrankaPolicyExecutor:
             "diffusion_min_history_for_inference": self.min_history_for_inference,
             "diffusion_require_full_observation_history": True,
             "diffusion_repeated_camera_history_warn_only": True,
-            "fps": self.args.fps,
+            "fps": self.fps,
             "task": self.args.task,
             "execute": self.args.execute,
             "command_zmq": f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}",
@@ -747,8 +763,8 @@ class FrankaPolicyExecutor:
             "event": "action_queue_diagnostics",
             "incoming_timesteps": [action.get_timestep() for action in incoming_actions],
             "filtered_timesteps": [action.get_timestep() for action in filtered_actions],
-            "incoming_chunk_delta": summarize_action_deltas(incoming_arrays),
-            "filtered_chunk_delta": summarize_action_deltas(filtered_arrays),
+            "incoming_chunk_delta": summarize_action_deltas(incoming_arrays, self.trajectory_config),
+            "filtered_chunk_delta": summarize_action_deltas(filtered_arrays, self.trajectory_config),
             "overlap_raw_delta": aggregate_stats["overlap_raw_delta"],
             "overlap_blended_delta": aggregate_stats["overlap_blended_delta"],
             "queue_after_update_delta": aggregate_stats["queue_after_update_delta"],
@@ -756,7 +772,7 @@ class FrankaPolicyExecutor:
 
         if incoming_arrays:
             diagnostics["incoming_first_target_minus_state"] = (
-                arm_delta_summary(self.last_executed_state_array, incoming_arrays[0])
+                arm_delta_summary(self.last_executed_state_array, incoming_arrays[0], self.trajectory_config)
                 if self.last_executed_state_array is not None
                 else None
             )
@@ -789,28 +805,36 @@ class FrankaPolicyExecutor:
         queue_snapshot_after_pop: dict[str, Any],
     ) -> None:
         predicted_action = np.asarray(action.get_action(), dtype=float)
-        split = split_action(predicted_action)
+        split = split_action(predicted_action, self.trajectory_config)
         current_state = np.asarray(current_packet["state"], dtype=float)
-        state_split = split_action(current_state) if current_state.shape[0] in {14, 16} else None
+        state_split = split_action(current_state, self.trajectory_config)
         joint_targets = self._joint_targets_from_action(split)
         left_delta_from_state = None
         right_delta_from_state = None
         if state_split is not None:
             left_delta_from_state = (
-                np.asarray(joint_targets["left"], dtype=float)
-                - np.asarray(state_split["left_arm"], dtype=float)
-            ).tolist()
+                None
+                if "left" not in joint_targets
+                else (
+                    np.asarray(joint_targets["left"], dtype=float)
+                    - np.asarray(state_split["left_arm"], dtype=float)
+                ).tolist()
+            )
             right_delta_from_state = (
-                np.asarray(joint_targets["right"], dtype=float)
-                - np.asarray(state_split["right_arm"], dtype=float)
-            ).tolist()
+                None
+                if "right" not in joint_targets
+                else (
+                    np.asarray(joint_targets["right"], dtype=float)
+                    - np.asarray(state_split["right_arm"], dtype=float)
+                ).tolist()
+            )
         previous_target_delta = (
-            arm_delta_summary(self.last_executed_action_array, predicted_action)
+            arm_delta_summary(self.last_executed_action_array, predicted_action, self.trajectory_config)
             if self.last_executed_action_array is not None
             else None
         )
         previous_state_delta = (
-            arm_delta_summary(self.last_executed_state_array, current_state)
+            arm_delta_summary(self.last_executed_state_array, current_state, self.trajectory_config)
             if self.last_executed_state_array is not None
             else None
         )
@@ -911,11 +935,12 @@ class FrankaPolicyExecutor:
         lerobot_features = build_live_lerobot_features(first_packet)
         policy_config = RemotePolicyConfig(
             policy_type=self.policy_type,
-            pretrained_name_or_path=str(self.policy_path),
+            pretrained_name_or_path="",
             lerobot_features=lerobot_features,
             actions_per_chunk=self.actions_per_chunk,
             device=self.args.policy_device,
         )
+        policy_config.trajectory_config = self.trajectory_config
         self.stub.Ready(self.services_pb2.Empty())
         try:
             self.stub.SendPolicyInstructions(self.services_pb2.PolicySetup(data=pickle.dumps(policy_config)))  # nosec
@@ -1032,9 +1057,9 @@ class FrankaPolicyExecutor:
             "last_timestep": ordered_timesteps[-1] if ordered_timesteps else None,
             "chunk_generation": generation,
             "overlap_proposals": overlap_diagnostics,
-            "overlap_raw_delta": summarize_action_pairs(overlap_raw_pairs),
-            "overlap_blended_delta": summarize_action_pairs(overlap_blended_pairs),
-            "queue_after_update_delta": summarize_action_deltas(ordered_actions),
+            "overlap_raw_delta": summarize_action_pairs(overlap_raw_pairs, self.trajectory_config),
+            "overlap_blended_delta": summarize_action_pairs(overlap_blended_pairs, self.trajectory_config),
+            "queue_after_update_delta": summarize_action_deltas(ordered_actions, self.trajectory_config),
         }
 
     def receive_actions(self) -> None:
@@ -1107,6 +1132,22 @@ class FrankaPolicyExecutor:
         self.command_socket.connect(f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}")
         print("Bridge command backend:", f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}")
 
+    def setup_hand_command_sockets(self, zmq_context: Any) -> None:
+        if not self.args.execute or self.trajectory_config["end_effector"] != "hand":
+            return
+        addresses = {
+            "left": self.args.left_hand_command_address,
+            "right": self.args.right_hand_command_address,
+        }
+        zmq = import_zmq_runtime()
+        for side in self.trajectory_config["arms"]:
+            socket = zmq_context.socket(zmq.PUSH)
+            socket.setsockopt(zmq.SNDHWM, 2)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.connect(addresses[side])
+            self.hand_command_sockets[side] = socket
+            print(f"{side.title()} Wuji hand command backend: {addresses[side]}")
+
     def _recv_latest_packet(self, socket: Any) -> tuple[dict[str, Any], int]:
         zmq = import_zmq_runtime()
         packet = socket.recv_pyobj()
@@ -1119,17 +1160,44 @@ class FrankaPolicyExecutor:
                 return packet, dropped
 
     def _command_payload_from_action(self, action: TimedAction) -> dict[str, Any]:
-        split = split_action(np.asarray(action.get_action(), dtype=float))
+        split = split_action(np.asarray(action.get_action(), dtype=float), self.trajectory_config)
         joint_targets = self._joint_targets_from_action(split)
-        left_gripper_command = self._gripper_command_from_action(split["left_gripper"])
-        right_gripper_command = self._gripper_command_from_action(split["right_gripper"])
-        return {
+        payload: dict[str, Any] = {
             "timestamp": time.time(),
-            "left_joint_target": joint_targets["left"],
-            "right_joint_target": joint_targets["right"],
-            "left_gripper_command": left_gripper_command,
-            "right_gripper_command": right_gripper_command,
+            **{f"{side}_joint_target": target for side, target in joint_targets.items()},
         }
+        if self.trajectory_config["end_effector"] == "gripper":
+            for side in self.trajectory_config["arms"]:
+                payload[f"{side}_gripper_command"] = self._gripper_command_from_action(
+                    split[f"{side}_gripper"]
+                )
+        elif self.trajectory_config["end_effector"] == "hand":
+            for side in self.trajectory_config["arms"]:
+                payload[f"{side}_hand_target"] = np.asarray(
+                    split[f"{side}_hand"], dtype=float
+                ).tolist()
+        return payload
+
+    def _validate_live_cameras(self, first_packet: dict[str, Any]) -> None:
+        dataset_cameras = {
+            key.removeprefix("observation.images.")
+            for key, feature in self.dataset_info["features"].items()
+            if key.startswith("observation.images.") and feature.get("dtype") in {"image", "video"}
+        }
+        live_cameras = set(first_packet.get("camera_names", ()))
+        missing = sorted(dataset_cameras - live_cameras)
+        unexpected = sorted(live_cameras - dataset_cameras)
+        if missing or unexpected:
+            details = []
+            if missing:
+                details.append("missing: " + ", ".join(missing))
+            if unexpected:
+                details.append("unexpected: " + ", ".join(unexpected))
+            raise ValueError(
+                "Live bridge camera set does not match server checkpoint metadata ("
+                + "; ".join(details)
+                + ")."
+            )
 
     def _send_bridge_command(self, payload: dict[str, Any]) -> None:
         if self.command_socket is None:
@@ -1137,6 +1205,8 @@ class FrankaPolicyExecutor:
 
         self._set_bridge_active(True)
         self.command_socket.send_pyobj(payload)
+        for side, socket in self.hand_command_sockets.items():
+            socket.send_pyobj(np.asarray(payload[f"{side}_hand_target"], dtype=float))
 
     def maybe_pop_action(self) -> tuple[TimedAction | None, dict[str, Any], dict[str, Any]]:
         with self.action_queue_lock:
@@ -1159,16 +1229,18 @@ class FrankaPolicyExecutor:
 
     def run(self) -> None:
         zmq = import_zmq_runtime()
-        dataset_action_dim = int(self.dataset_info["features"]["action"]["shape"][0])
+        dataset_action_dim = self.dataset_action_dim
         print("Franka policy executor")
         print("----------------------")
         print(f"policy_path: {self.policy_path}")
         print(f"policy_type: {self.policy_type}")
         print(f"server_address: {self.args.server_address}")
         print(f"dataset_action_dim: {dataset_action_dim}")
+        print(f"dataset_fps: {self.fps:g}")
         print(f"actions_per_chunk: {self.actions_per_chunk}")
         print(f"chunk_size_threshold: {self.chunk_size_threshold}")
         print(f"temporal_proposal_decay: {self.temporal_proposal_decay}")
+        print(f"trajectory_layout: {describe_trajectory_layout(self.trajectory_config)}")
         print("observation_streaming: True")
         print(f"policy_n_obs_steps: {self.n_obs_steps}")
         print(f"min_history_for_inference: {self.min_history_for_inference}")
@@ -1200,14 +1272,13 @@ class FrankaPolicyExecutor:
                 f"state_dim={first_packet['robot_state_dim']}, action_dim={first_packet['action_dim']}, "
                 f"cameras={list(first_packet['camera_names'])}"
             )
-            if int(first_packet["action_dim"]) != dataset_action_dim:
-                raise ValueError(
-                    f"Live bridge action_dim={first_packet['action_dim']} does not match dataset action_dim={dataset_action_dim}."
-                )
+            validate_live_packet(self.trajectory_config, first_packet)
+            self._validate_live_cameras(first_packet)
 
             self._init_log(first_packet, dataset_action_dim)
             self.connect_policy_server(first_packet)
             self.setup_command_bridge(context)
+            self.setup_hand_command_sockets(context)
             receiver_thread = threading.Thread(target=self.receive_actions, daemon=True)
             receiver_thread.start()
 
@@ -1277,7 +1348,7 @@ class FrankaPolicyExecutor:
                         queue_after_pop,
                     )
 
-                sleep_time = max(0.0, (1.0 / self.args.fps) - (time.perf_counter() - loop_start))
+                sleep_time = max(0.0, (1.0 / self.fps) - (time.perf_counter() - loop_start))
                 time.sleep(sleep_time)
         except KeyboardInterrupt:
             print("\nStopping Franka policy executor...")
@@ -1289,6 +1360,8 @@ class FrankaPolicyExecutor:
             self._set_bridge_active(False)
             if self.command_socket is not None:
                 self.command_socket.close(0)
+            for hand_socket in self.hand_command_sockets.values():
+                hand_socket.close(0)
             self._close_log()
             socket.close(0)
             context.term()

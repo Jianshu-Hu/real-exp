@@ -31,7 +31,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from utils.trajectory_metadata import load_trajectory_config, validate_setting
+from utils.trajectory_metadata import (
+    require_dataset_trajectory_config,
+    validate_action_trajectory_contract,
+    validate_setting,
+)
 from utils.wuji_hand_control import (
     HAND_INITIAL_POSITION_TOLERANCE_RAD,
     make_smoothed_backend_class,
@@ -328,8 +332,9 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
             "Replay requires two-dimensional state/action arrays with matching dimensions. "
             f"Got state shape {states.shape}, action shape {actions.shape}."
         )
-    trajectory_config = load_trajectory_config(
-        dataset_root, action_config, states.shape[1], actions.shape[1]
+    trajectory_config = require_dataset_trajectory_config(dataset_root)
+    validate_action_trajectory_contract(
+        action_config, trajectory_config, source=str(dataset_root / "meta")
     )
     expected_dim = int(trajectory_config.get("action_dim", actions.shape[1]))
     if actions.shape[1] != expected_dim:

@@ -2,7 +2,8 @@
 
 Usage:
     python deploy/deploy_lerobot_policy.py inspect --policy-path outputs/my_policy
-    python deploy/deploy_lerobot_policy.py server --host 0.0.0.0 --port 8080
+    python deploy/deploy_lerobot_policy.py server --host 0.0.0.0 --port 8080 \
+        --policy-path outputs/my_policy
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import sys
 import time
 import traceback
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent import futures
 from collections import deque
 from dataclasses import asdict
@@ -32,11 +34,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils.image_preprocessing import ResizePadSquare, infer_square_resize_pad_size_from_policy_features
+from utils.trajectory_metadata import (
+    describe_trajectory_layout,
+    require_dataset_trajectory_config,
+    validate_action_trajectory_contract,
+    validate_trajectory_config,
+)
+from utils.deployment_metadata import deployment_camera_names, load_checkpoint_deployment_contract
 from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.transport.utils import receive_bytes_in_chunks
 
-DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "test-limit-pick-and-place"
 DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"
 ACTION_CONFIG_REL_PATH = Path("meta/real_exp_action_config.json")
 INFO_REL_PATH = Path("meta/info.json")
@@ -61,8 +69,8 @@ def parse_args() -> argparse.Namespace:
     inspect_parser.add_argument(
         "--dataset-root",
         type=Path,
-        default=DEFAULT_DATASET_ROOT,
-        help="Path to the local dataset root used for training.",
+        default=None,
+        help="Optional source dataset for an additional checkpoint-vs-dataset consistency check.",
     )
 
     serve_parser = subparsers.add_parser(
@@ -71,7 +79,9 @@ def parse_args() -> argparse.Namespace:
     )
     serve_parser.add_argument("--host", default="0.0.0.0", help="Server bind host.")
     serve_parser.add_argument("--port", type=int, default=8080, help="Server bind port.")
-    serve_parser.add_argument("--fps", type=int, default=15, help="Expected control frequency.")
+    serve_parser.add_argument("--metadata-port", type=int, default=8081, help="Read-only deployment metadata HTTP port.")
+    serve_parser.add_argument("--policy-path", type=Path, required=True, help="Checkpoint directory owned by this server.")
+    serve_parser.add_argument("--fps", type=float, default=None, help="Expected control frequency; defaults to checkpoint metadata.")
     serve_parser.add_argument(
         "--inference-latency",
         type=float,
@@ -160,12 +170,77 @@ def infer_actions_per_chunk(policy_type: str, config: dict[str, Any]) -> int:
     return 1
 
 
-def describe_action_layout(action_dim: int) -> str:
-    if action_dim == 16:
-        return "[Left Arm(7), Left Gripper(1), Right Arm(7), Right Gripper(1)]"
-    if action_dim == 14:
-        return "[Left Arm(7), Right Arm(7)]"
-    return f"Unsupported or custom action layout with dim={action_dim}"
+def policy_feature_dim(
+    policy_config: dict[str, Any], section: str, feature_key: str, *, source: str
+) -> int:
+    try:
+        shape = policy_config[section][feature_key]["shape"]
+    except KeyError as exc:
+        raise ValueError(
+            f"{source} is missing {section}.{feature_key}.shape."
+        ) from exc
+    if not isinstance(shape, (list, tuple)) or len(shape) != 1:
+        raise ValueError(
+            f"{source} {section}.{feature_key}.shape must contain one dimension, got {shape!r}."
+        )
+    try:
+        dimension = int(shape[0])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{source} {section}.{feature_key}.shape has an invalid dimension: {shape!r}."
+        ) from exc
+    if dimension <= 0:
+        raise ValueError(
+            f"{source} {section}.{feature_key}.shape must be positive, got {shape!r}."
+        )
+    return dimension
+
+
+def validate_checkpoint_trajectory_contract(
+    policy_config: dict[str, Any],
+    trajectory_config: dict[str, Any],
+    *,
+    source: str,
+    live_state_dim: int | None = None,
+) -> dict[str, Any]:
+    """Verify a checkpoint's declared robot layout matches its model features."""
+    policy_state_dim = policy_feature_dim(
+        policy_config, "input_features", "observation.state", source=source
+    )
+    policy_action_dim = policy_feature_dim(
+        policy_config, "output_features", "action", source=source
+    )
+    trajectory_config = validate_trajectory_config(
+        trajectory_config,
+        policy_state_dim,
+        policy_action_dim,
+        source=f"{source} trajectory metadata",
+    )
+    if live_state_dim is not None and live_state_dim != policy_state_dim:
+        raise ValueError(
+            "Deployment observation state dimension does not match the checkpoint trajectory "
+            f"contract: live={live_state_dim}, checkpoint={policy_state_dim}."
+        )
+    return trajectory_config
+
+
+def trajectory_contract_mismatches(
+    expected: dict[str, Any], actual: dict[str, Any]
+) -> list[str]:
+    fields = (
+        "arm_mode",
+        "arms",
+        "end_effector",
+        "include_gripper",
+        "include_hand",
+        "robot_state_dim",
+        "action_dim",
+    )
+    return [
+        f"{field}: dataset={expected[field]!r}, checkpoint={actual[field]!r}"
+        for field in fields
+        if expected[field] != actual[field]
+    ]
 
 
 def resize_pad_robot_observation_image(
@@ -416,6 +491,8 @@ def make_deployment_policy_server(
     camera_bundle_cache: CameraBundleCache | None = None,
     max_observation_age_s: float = 0.25,
     max_camera_skew_s: float = 0.067,
+    checkpoint_path: Path | None = None,
+    deployment_contract: dict[str, Any] | None = None,
 ):
     from lerobot.async_inference.constants import SUPPORTED_POLICIES
     from lerobot.async_inference.helpers import Observation, RemotePolicyConfig
@@ -424,6 +501,11 @@ def make_deployment_policy_server(
     from lerobot.transport import services_pb2
 
     class DeploymentPolicyServer(PolicyServer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.checkpoint_path = checkpoint_path
+            self.deployment_contract = deployment_contract
+
         def _resolve_server_local_observation(self, timed_observation):
             return resolve_server_local_observation(
                 timed_observation,
@@ -451,6 +533,11 @@ def make_deployment_policy_server(
                     f"Policy type {policy_specs.policy_type} not supported. "
                     f"Supported policies: {SUPPORTED_POLICIES}"
                 )
+            if self.deployment_contract is not None and policy_specs.policy_type != self.deployment_contract["policy_type"]:
+                raise ValueError(
+                    "Deployment executor policy type disagrees with checkpoint metadata: "
+                    f"client={policy_specs.policy_type!r}, server={self.deployment_contract['policy_type']!r}"
+                )
 
             self.logger.info(
                 f"Receiving policy instructions from {client_id} | "
@@ -464,9 +551,19 @@ def make_deployment_policy_server(
             self.policy_type = policy_specs.policy_type
             self.lerobot_features = policy_specs.lerobot_features
             self.rename_map = policy_specs.rename_map
-            self.actions_per_chunk = policy_specs.actions_per_chunk
+            if self.deployment_contract is None:
+                raise RuntimeError("Policy server has no configured deployment contract.")
+            self.actions_per_chunk = int(policy_specs.actions_per_chunk)
+            max_contract_chunk = int(self.deployment_contract["max_actions_per_chunk"])
+            if self.actions_per_chunk <= 0 or self.actions_per_chunk > max_contract_chunk:
+                raise ValueError(
+                    "Deployment executor actions_per_chunk exceeds the checkpoint contract: "
+                    f"client={self.actions_per_chunk}, maximum={max_contract_chunk}"
+                )
 
-            pretrained_path = Path(policy_specs.pretrained_name_or_path).expanduser()
+            if self.checkpoint_path is None:
+                raise RuntimeError("Policy server has no configured checkpoint deployment contract.")
+            pretrained_path = self.checkpoint_path
             if not pretrained_path.exists():
                 raise FileNotFoundError(
                     f"Policy checkpoint does not exist on the policy server: {pretrained_path}"
@@ -481,6 +578,56 @@ def make_deployment_policy_server(
                 raise FileNotFoundError(
                     f"Policy checkpoint {pretrained_path} is missing required files: "
                     + ", ".join(missing_files)
+                )
+            policy_state_shape = tuple(
+                policy_specs.lerobot_features.get("observation.state", {}).get("shape", ())
+            )
+            if len(policy_state_shape) != 1:
+                raise ValueError(
+                    "Deployment observations must provide a one-dimensional observation.state feature; "
+                    f"got {policy_state_shape!r}."
+                )
+            checkpoint_trajectory = validate_checkpoint_trajectory_contract(
+                load_json(pretrained_path / "config.json"),
+                self.deployment_contract["trajectory_config"],
+                source=str(pretrained_path),
+                live_state_dim=int(policy_state_shape[0]),
+            )
+            validate_action_trajectory_contract(
+                self.deployment_contract["action_config"],
+                checkpoint_trajectory,
+                source=str(pretrained_path / "meta"),
+            )
+            client_trajectory = getattr(policy_specs, "trajectory_config", None)
+            if not isinstance(client_trajectory, dict):
+                raise ValueError(
+                    "Deployment executor did not provide its dataset trajectory contract. "
+                    "Update the robot-side executor before loading this checkpoint."
+                )
+            client_trajectory = validate_trajectory_config(
+                client_trajectory,
+                int(policy_state_shape[0]),
+                checkpoint_trajectory["action_dim"],
+                source="deployment executor trajectory metadata",
+            )
+            contract_mismatches = trajectory_contract_mismatches(
+                client_trajectory, checkpoint_trajectory
+            )
+            if contract_mismatches:
+                raise ValueError(
+                    "Deployment executor and checkpoint trajectory contracts disagree: "
+                    + "; ".join(contract_mismatches)
+                )
+            expected_cameras = set(deployment_camera_names(self.deployment_contract))
+            actual_cameras = {
+                key.removeprefix("observation.images.")
+                for key in policy_specs.lerobot_features
+                if key.startswith("observation.images.")
+            }
+            if expected_cameras != actual_cameras:
+                raise ValueError(
+                    "Deployment executor camera features disagree with checkpoint metadata: "
+                    f"expected={sorted(expected_cameras)}, actual={sorted(actual_cameras)}"
                 )
             self.logger.info(
                 "Policy checkpoint preflight passed: "
@@ -732,6 +879,9 @@ def serve_deployment_policy_server(
     camera_cache_address: str = "tcp://127.0.0.1:5557",
     max_observation_age_s: float = 0.25,
     max_camera_skew_s: float = 0.067,
+    checkpoint_path: Path | None = None,
+    deployment_contract: dict[str, Any] | None = None,
+    metadata_port: int = 8081,
 ) -> None:
     import grpc
 
@@ -745,6 +895,8 @@ def serve_deployment_policy_server(
         camera_bundle_cache=camera_bundle_cache,
         max_observation_age_s=max_observation_age_s,
         max_camera_skew_s=max_camera_skew_s,
+        checkpoint_path=checkpoint_path,
+        deployment_contract=deployment_contract,
     )
 
     logging.info(pformat(asdict(cfg)))
@@ -754,38 +906,72 @@ def serve_deployment_policy_server(
     services_pb2_grpc.add_AsyncInferenceServicer_to_server(policy_server, server)
     server.add_insecure_port(f"{cfg.host}:{cfg.port}")
 
+    class MetadataHandler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path != "/deployment-metadata":
+                self.send_error(404)
+                return
+            payload = json.dumps(deployment_contract, sort_keys=True).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            return
+
+    metadata_server = ThreadingHTTPServer((cfg.host, metadata_port), MetadataHandler)
+    metadata_thread = threading.Thread(target=metadata_server.serve_forever, daemon=True)
+    metadata_thread.start()
+
     policy_server.logger.info(f"PolicyServer started on {cfg.host}:{cfg.port}")
     server.start()
     try:
         server.wait_for_termination()
     finally:
+        metadata_server.shutdown()
+        metadata_server.server_close()
         camera_bundle_cache.close()
         policy_server.logger.info("Server terminated")
 
 
-def inspect_policy(policy_path: Path, dataset_root: Path) -> None:
+def inspect_policy(policy_path: Path, dataset_root: Path | None = None) -> None:
     from lerobot.policies.factory import get_policy_class
 
     policy_path = policy_path.resolve()
-    dataset_root = dataset_root.resolve()
+    dataset_root = dataset_root.resolve() if dataset_root is not None else None
 
     if not policy_path.exists():
         raise FileNotFoundError(f"Policy path not found: {policy_path}")
-    if not dataset_root.exists():
+    if dataset_root is not None and not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
 
     config_path = policy_path / "config.json"
     if not config_path.exists():
         raise FileNotFoundError(f"Missing policy config: {config_path}")
 
-    dataset_info_path = dataset_root / INFO_REL_PATH
-    action_config_path = dataset_root / ACTION_CONFIG_REL_PATH
-    if not dataset_info_path.exists():
-        raise FileNotFoundError(f"Missing dataset metadata: {dataset_info_path}")
-
     policy_cfg = load_json(config_path)
-    dataset_info = load_json(dataset_info_path)
-    action_cfg = load_json(action_config_path) if action_config_path.exists() else None
+    checkpoint_contract = load_checkpoint_deployment_contract(policy_path)
+    dataset_info = {
+        "fps": checkpoint_contract["fps"],
+        "features": checkpoint_contract["features"],
+        "total_episodes": "unknown",
+    }
+    action_cfg = checkpoint_contract["action_config"]
+    trajectory_cfg = checkpoint_contract["trajectory_config"]
+    if dataset_root is not None:
+        dataset_info_path = dataset_root / INFO_REL_PATH
+        action_config_path = dataset_root / ACTION_CONFIG_REL_PATH
+        if not dataset_info_path.exists() or not action_config_path.exists():
+            raise FileNotFoundError(f"Dataset metadata is incomplete under {dataset_root / 'meta'}")
+        source_info = load_json(dataset_info_path)
+        source_action = load_json(action_config_path)
+        source_trajectory = require_dataset_trajectory_config(dataset_root)
+        validate_action_trajectory_contract(source_action, source_trajectory, source=str(dataset_root / "meta"))
+        if trajectory_contract_mismatches(source_trajectory, trajectory_cfg):
+            raise ValueError("Dataset and checkpoint trajectory contracts disagree.")
+        dataset_info = source_info
 
     policy_type = infer_policy_type(policy_cfg)
     max_actions_per_chunk = infer_actions_per_chunk(policy_type, policy_cfg)
@@ -805,12 +991,16 @@ def inspect_policy(policy_path: Path, dataset_root: Path) -> None:
     print(f"policy_path: {policy_path}")
     print(f"policy_type: {policy_type}")
     print(f"max_actions_per_chunk: {max_actions_per_chunk}")
-    print(f"dataset_root: {dataset_root}")
+    print(f"dataset_root: {dataset_root if dataset_root is not None else '<embedded checkpoint metadata>'}")
     print(f"dataset_fps: {dataset_info['fps']}")
     print(f"dataset_total_episodes: {dataset_info['total_episodes']}")
     print(f"dataset_state_dim: {state_dim}")
     print(f"dataset_action_dim: {action_dim}")
-    print(f"dataset_action_layout: {describe_action_layout(action_dim)}")
+    print(f"dataset_action_layout: {describe_trajectory_layout(trajectory_cfg)}")
+    print(
+        "dataset_trajectory_setting: "
+        f"{trajectory_cfg['end_effector']}/{trajectory_cfg['arm_mode']}"
+    )
     print(f"dataset_image_keys: {', '.join(image_keys)}")
     if action_cfg is not None:
         arm_action_representation = action_cfg.get("arm_action_representation")
@@ -853,14 +1043,23 @@ def inspect_policy(policy_path: Path, dataset_root: Path) -> None:
 def run_server(args: argparse.Namespace) -> None:
     from lerobot.async_inference.configs import PolicyServerConfig
 
+    checkpoint_path = args.policy_path.expanduser().resolve()
+    deployment_contract = load_checkpoint_deployment_contract(checkpoint_path)
+    metadata_fps = float(deployment_contract["fps"])
+    if args.fps is not None and not np.isclose(float(args.fps), metadata_fps):
+        raise ValueError(
+            f"--fps={args.fps:g} does not match checkpoint metadata fps={metadata_fps:g}."
+        )
+    fps = metadata_fps
+
     inference_latency = args.inference_latency
     if inference_latency is None:
-        inference_latency = 1.0 / args.fps
+        inference_latency = 1.0 / fps
 
     cfg = PolicyServerConfig(
         host=args.host,
         port=args.port,
-        fps=args.fps,
+        fps=fps,
         inference_latency=inference_latency,
         obs_queue_timeout=args.obs_queue_timeout,
     )
@@ -876,6 +1075,9 @@ def run_server(args: argparse.Namespace) -> None:
         camera_cache_address=args.camera_cache_address,
         max_observation_age_s=args.max_observation_age,
         max_camera_skew_s=args.max_camera_skew,
+        checkpoint_path=checkpoint_path,
+        deployment_contract=deployment_contract,
+        metadata_port=args.metadata_port,
     )
 
 

@@ -11,6 +11,8 @@ TRAJECTORY_CONFIG_PATH = Path("meta/real_exp_trajectory_config.json")
 TRAJECTORY_CONFIG_SCHEMA_VERSION = 1
 END_EFFECTOR_MODES = {"arm", "gripper", "hand"}
 ARM_MODES = {"duo", "left", "right"}
+ARM_JOINT_DIM = 7
+HAND_JOINT_DIM = 20
 
 
 def normalize_arm_mode(value: str) -> str:
@@ -50,38 +52,6 @@ def trajectory_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def legacy_trajectory_config(action_config: dict[str, Any], state_dim: int, action_dim: int) -> dict[str, Any]:
-    include_hand = bool(action_config.get("include_hand", False))
-    include_gripper = bool(action_config.get("include_gripper", False))
-    recorded_arm_mode = action_config.get("arm_mode")
-    arm_mode = (
-        normalize_arm_mode(str(recorded_arm_mode))
-        if recorded_arm_mode is not None
-        else "duo" if bool(action_config.get("include_right_arm", True)) else "left"
-    )
-    return {
-        "schema_version": TRAJECTORY_CONFIG_SCHEMA_VERSION,
-        "end_effector": "hand" if include_hand else "gripper" if include_gripper else "arm",
-        "arm_mode": arm_mode,
-        "arms": ["left", "right"] if arm_mode == "duo" else [arm_mode],
-        "include_gripper": include_gripper,
-        "include_hand": include_hand,
-        "robot_state_dim": int(state_dim),
-        "action_dim": int(action_dim),
-        "legacy_inferred": True,
-    }
-
-
-def load_trajectory_config(dataset_root: Path, action_config: dict[str, Any], state_dim: int, action_dim: int) -> dict[str, Any]:
-    path = dataset_root / TRAJECTORY_CONFIG_PATH
-    if path.exists():
-        config = json.loads(path.read_text())
-        if not isinstance(config, dict):
-            raise ValueError(f"Trajectory metadata must be a JSON object: {path}")
-        return config
-    return legacy_trajectory_config(action_config, state_dim, action_dim)
-
-
 def validate_setting(config: dict[str, Any], end_effector: str, arm_mode: str) -> None:
     expected_end_effector = str(end_effector).strip().lower()
     if expected_end_effector not in END_EFFECTOR_MODES:
@@ -104,42 +74,262 @@ def write_trajectory_config(dataset_root: Path, config: dict[str, Any]) -> None:
     path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
 
-def load_dataset_trajectory_config(dataset_root: Path) -> dict[str, Any]:
-    dataset_root = dataset_root.expanduser()
-    trajectory_path = dataset_root / TRAJECTORY_CONFIG_PATH
-    if trajectory_path.exists():
-        config = json.loads(trajectory_path.read_text())
-        if not isinstance(config, dict):
-            raise ValueError(f"Trajectory metadata must be a JSON object: {trajectory_path}")
-        return config
-
-    action_path = dataset_root / "meta/real_exp_action_config.json"
-    info_path = dataset_root / "meta/info.json"
-    if not action_path.exists() or not info_path.exists():
-        raise FileNotFoundError(
-            f"Trajectory metadata is missing at {trajectory_path}, and the legacy action/info metadata "
-            "needed to infer it is incomplete."
+def validate_trajectory_config(
+    config: dict[str, Any],
+    state_dim: int,
+    action_dim: int,
+    *,
+    source: str = "trajectory metadata",
+) -> dict[str, Any]:
+    """Validate and normalize the metadata-driven robot vector contract."""
+    if int(config.get("schema_version", -1)) != TRAJECTORY_CONFIG_SCHEMA_VERSION:
+        raise ValueError(
+            f"{source} has unsupported schema_version={config.get('schema_version')!r}; "
+            f"expected {TRAJECTORY_CONFIG_SCHEMA_VERSION}."
         )
-    action_config = json.loads(action_path.read_text())
+    arm_mode = normalize_arm_mode(str(config.get("arm_mode", "")))
+    expected_arms = ["left", "right"] if arm_mode == "duo" else [arm_mode]
+    arms = config.get("arms")
+    if arms != expected_arms:
+        raise ValueError(f"{source} arms={arms!r} does not match arm_mode={arm_mode!r}.")
+
+    end_effector = str(config.get("end_effector", "")).strip().lower()
+    if end_effector not in END_EFFECTOR_MODES:
+        raise ValueError(
+            f"{source} has unsupported end_effector={end_effector!r}; "
+            "expected arm, gripper, or hand."
+        )
+    include_gripper = bool(config.get("include_gripper", False))
+    include_hand = bool(config.get("include_hand", False))
+    if include_gripper != (end_effector == "gripper") or include_hand != (end_effector == "hand"):
+        raise ValueError(
+            f"{source} end-effector flags are inconsistent: end_effector={end_effector!r}, "
+            f"include_gripper={include_gripper}, include_hand={include_hand}."
+        )
+
+    block_dim = ARM_JOINT_DIM
+    if end_effector == "gripper":
+        block_dim += 1
+    elif end_effector == "hand":
+        block_dim += HAND_JOINT_DIM
+    expected_dim = block_dim * len(expected_arms)
+    recorded_state_dim = int(config.get("robot_state_dim", -1))
+    recorded_action_dim = int(config.get("action_dim", -1))
+    if (recorded_state_dim, recorded_action_dim) != (int(state_dim), int(action_dim)):
+        raise ValueError(
+            f"{source} records state/action dimensions "
+            f"{recorded_state_dim}/{recorded_action_dim}, but the feature contract is "
+            f"{state_dim}/{action_dim}."
+        )
+    if int(state_dim) != expected_dim or int(action_dim) != expected_dim:
+        raise ValueError(
+            f"{source} describes {len(expected_arms)} {end_effector} arm block(s), which require "
+            f"{expected_dim} values, but state/action dimensions are {state_dim}/{action_dim}."
+        )
+    return {
+        **config,
+        "arm_mode": arm_mode,
+        "arms": expected_arms,
+        "end_effector": end_effector,
+        "include_gripper": include_gripper,
+        "include_hand": include_hand,
+        "robot_state_dim": int(state_dim),
+        "action_dim": int(action_dim),
+    }
+
+
+def validate_action_trajectory_contract(
+    action_config: dict[str, Any],
+    trajectory_config: dict[str, Any],
+    *,
+    source: str = "dataset metadata",
+) -> None:
+    """Require action semantics metadata to agree with the vector layout."""
+    expected = {
+        "action_dim": int(trajectory_config["action_dim"]),
+        "arm_mode": trajectory_config["arm_mode"],
+        "include_gripper": bool(trajectory_config["include_gripper"]),
+        "include_hand": bool(trajectory_config["include_hand"]),
+        "include_right_arm": trajectory_config["arm_mode"] == "duo",
+    }
+    mismatches = [
+        f"{key}: action metadata={action_config.get(key)!r}, trajectory metadata={value!r}"
+        for key, value in expected.items()
+        if action_config.get(key) != value
+    ]
+    if mismatches:
+        raise ValueError(f"{source} contracts disagree: " + "; ".join(mismatches))
+
+    arm_representation = str(
+        action_config.get("arm_action_representation", "")
+    ).strip().lower()
+    if arm_representation != "absolute_joint_position":
+        raise ValueError(
+            f"{source} requires arm_action_representation='absolute_joint_position'; "
+            f"got {arm_representation!r}."
+        )
+    end_effector = trajectory_config["end_effector"]
+    if end_effector == "gripper":
+        gripper_representation = str(
+            action_config.get("gripper_action_representation", "")
+        ).strip().lower()
+        if gripper_representation != "absolute_width":
+            raise ValueError(
+                f"{source} requires gripper_action_representation='absolute_width'; "
+                f"got {gripper_representation!r}."
+            )
+    elif end_effector == "hand":
+        hand_representation = str(
+            action_config.get("hand_action_representation", "")
+        ).strip().lower()
+        if hand_representation != "absolute_joint_position":
+            raise ValueError(
+                f"{source} requires hand_action_representation='absolute_joint_position'; "
+                f"got {hand_representation!r}."
+            )
+
+
+def require_dataset_trajectory_config(dataset_root: Path) -> dict[str, Any]:
+    """Load the current trajectory contract without legacy inference."""
+    dataset_root = dataset_root.expanduser().resolve()
+    trajectory_path = dataset_root / TRAJECTORY_CONFIG_PATH
+    info_path = dataset_root / "meta/info.json"
+    if not trajectory_path.exists():
+        raise FileNotFoundError(
+            f"Missing trajectory metadata: {trajectory_path}. Current training and deployment "
+            "require an explicit real_exp_trajectory_config.json."
+        )
+    if not info_path.exists():
+        raise FileNotFoundError(f"Missing dataset metadata: {info_path}")
+    config = json.loads(trajectory_path.read_text())
     info = json.loads(info_path.read_text())
-    features = info.get("features", {})
+    if not isinstance(config, dict):
+        raise ValueError(f"Trajectory metadata must be a JSON object: {trajectory_path}")
     try:
-        state_dim = int(features["observation.state"]["shape"][0])
-        action_dim = int(features["action"]["shape"][0])
+        state_dim = int(info["features"]["observation.state"]["shape"][0])
+        action_dim = int(info["features"]["action"]["shape"][0])
     except (KeyError, IndexError, TypeError, ValueError) as exc:
-        raise ValueError(f"Could not infer trajectory dimensions from {info_path}") from exc
-    return legacy_trajectory_config(action_config, state_dim, action_dim)
+        raise ValueError(f"Could not read state/action dimensions from {info_path}") from exc
+    return validate_trajectory_config(
+        config, state_dim, action_dim, source=str(trajectory_path)
+    )
+
+
+def describe_trajectory_layout(config: dict[str, Any]) -> str:
+    parts: list[str] = []
+    end_effector = str(config["end_effector"])
+    for side in config["arms"]:
+        parts.append(f"{side.title()} Arm(7)")
+        if end_effector == "gripper":
+            parts.append(f"{side.title()} Gripper(1)")
+        elif end_effector == "hand":
+            parts.append(f"{side.title()} Hand(20)")
+    return "[" + ", ".join(parts) + "]"
+
+
+def split_trajectory_vector(
+    values: Any, config: dict[str, Any]
+) -> dict[str, Any]:
+    """Split one state/action vector according to the explicit trajectory metadata."""
+    import numpy as np
+
+    array = np.asarray(values, dtype=float)
+    expected_dim = int(config["action_dim"])
+    if array.ndim != 1 or array.shape[0] != expected_dim:
+        raise ValueError(
+            f"Expected a one-dimensional {expected_dim}-value trajectory vector, got {array.shape}."
+        )
+    result: dict[str, Any] = {
+        "left_arm": None,
+        "left_gripper": None,
+        "left_hand": None,
+        "right_arm": None,
+        "right_gripper": None,
+        "right_hand": None,
+    }
+    offset = 0
+    for side in config["arms"]:
+        result[f"{side}_arm"] = array[offset : offset + ARM_JOINT_DIM]
+        offset += ARM_JOINT_DIM
+        if config["end_effector"] == "gripper":
+            result[f"{side}_gripper"] = float(array[offset])
+            offset += 1
+        elif config["end_effector"] == "hand":
+            result[f"{side}_hand"] = array[offset : offset + HAND_JOINT_DIM]
+            offset += HAND_JOINT_DIM
+    if offset != expected_dim:  # pragma: no cover - guarded by config validation
+        raise ValueError(f"Trajectory layout consumed {offset} of {expected_dim} values.")
+    return result
+
+
+def validate_live_packet(config: dict[str, Any], packet: dict[str, Any]) -> None:
+    """Require the live bridge to match the dataset/checkpoint hardware contract."""
+    packet_config = trajectory_config_from_packet(packet)
+    fields = (
+        "arm_mode",
+        "arms",
+        "end_effector",
+        "include_gripper",
+        "include_hand",
+        "robot_state_dim",
+        "action_dim",
+    )
+    mismatches = [
+        f"{field}: dataset={config.get(field)!r}, live={packet_config.get(field)!r}"
+        for field in fields
+        if config.get(field) != packet_config.get(field)
+    ]
+    if mismatches:
+        raise ValueError(
+            "Live deployment bridge does not match trajectory metadata: " + "; ".join(mismatches)
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect real-exp trajectory hardware metadata.")
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--field", choices=["end_effector", "arm_mode"], default=None)
+    parser.add_argument(
+        "--deployment-lines",
+        action="store_true",
+        help=(
+            "Print the validated explicit deployment contract as stable newline-delimited fields: "
+            "arm mode, end effector, fps, state dim, action dim, and comma-separated cameras."
+        ),
+    )
     args = parser.parse_args()
-    config = load_dataset_trajectory_config(args.dataset_root)
-    if args.field is not None:
+    if args.deployment_lines:
+        config = require_dataset_trajectory_config(args.dataset_root)
+        dataset_root = args.dataset_root.expanduser().resolve()
+        info = json.loads((dataset_root / "meta/info.json").read_text())
+        action_path = dataset_root / "meta/real_exp_action_config.json"
+        if not action_path.is_file():
+            raise FileNotFoundError(f"Missing dataset action metadata: {action_path}")
+        validate_action_trajectory_contract(
+            json.loads(action_path.read_text()), config, source=str(dataset_root / "meta")
+        )
+        cameras = [
+            key.removeprefix("observation.images.")
+            for key, feature in info["features"].items()
+            if key.startswith("observation.images.")
+            and feature.get("dtype") in {"image", "video"}
+        ]
+        if not cameras:
+            raise ValueError("Deployment dataset has no image/video observation features.")
+        for value in (
+            config["arm_mode"],
+            config["end_effector"],
+            info["fps"],
+            config["robot_state_dim"],
+            config["action_dim"],
+            ",".join(cameras),
+        ):
+            print(value)
+    elif args.field is not None:
+        config = require_dataset_trajectory_config(args.dataset_root)
         print(config[args.field])
     else:
+        config = require_dataset_trajectory_config(args.dataset_root)
         print(json.dumps(config, indent=2, sort_keys=True))
 
 

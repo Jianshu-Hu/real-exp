@@ -23,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from data_collection.trajectory_metadata import load_trajectory_config  # noqa: E402
 from utils.limit import (  # noqa: E402
     TrajectoryViolationCounts,
     arm_joint_slices,
@@ -32,6 +33,62 @@ from utils.limit import (  # noqa: E402
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 PROCESSED_FLAG = "processed"
+
+
+def trajectory_vector_layout(
+    trajectory_config: dict[str, Any],
+    vector_size: int,
+) -> tuple[dict[str, slice], tuple[int, ...]]:
+    """Return arm slices and gripper indices from trajectory metadata.
+
+    A trajectory consists of one block per active arm. Each block starts with
+    seven Franka joints and is followed by no values, one gripper value, or
+    twenty hand-joint values. In particular, a 27-D hand trajectory must not be
+    interpreted as a 16-D dual-arm/gripper trajectory merely because it is long
+    enough to contain the old hard-coded indices.
+    """
+    raw_arms = trajectory_config.get("arms")
+    if not isinstance(raw_arms, list) or not raw_arms:
+        arm_mode = str(trajectory_config.get("arm_mode", "")).strip().lower()
+        raw_arms = ["left", "right"] if arm_mode == "duo" else [arm_mode]
+    arms = [str(arm).strip().lower() for arm in raw_arms]
+    if not arms or len(set(arms)) != len(arms) or any(
+        arm not in {"left", "right"} for arm in arms
+    ):
+        raise ValueError(f"invalid active arms in trajectory metadata: {raw_arms!r}")
+
+    end_effector = str(trajectory_config.get("end_effector", "arm")).strip().lower()
+    end_effector_size = {"arm": 0, "gripper": 1, "hand": 20}.get(end_effector)
+    if end_effector_size is None:
+        raise ValueError(
+            f"unsupported end-effector mode {end_effector!r}; expected arm, gripper, or hand"
+        )
+
+    block_size = 7 + end_effector_size
+    expected_size = block_size * len(arms)
+    if vector_size != expected_size:
+        raise ValueError(
+            f"trajectory metadata describes {len(arms)} {end_effector} arm block(s) "
+            f"({expected_size} values), but vector has {vector_size} dimensions"
+        )
+
+    arm_layout = {
+        arm: slice(block_index * block_size, block_index * block_size + 7)
+        for block_index, arm in enumerate(arms)
+    }
+    gripper_indices = (
+        tuple(block_index * block_size + 7 for block_index in range(len(arms)))
+        if end_effector == "gripper"
+        else ()
+    )
+    return arm_layout, gripper_indices
+
+
+def legacy_vector_layout(vector_size: int) -> tuple[dict[str, slice], tuple[int, ...]]:
+    """Return the historical arm/gripper layout when metadata is unavailable."""
+    arm_layout = dict(arm_joint_slices(vector_size))
+    gripper_indices = {8: (7,), 16: (7, 15)}.get(vector_size, ())
+    return arm_layout, gripper_indices
 
 
 def parse_args() -> argparse.Namespace:
@@ -232,6 +289,7 @@ def check_state_action_semantics(
     gripper_min: float,
     gripper_max: float,
     gripper_tolerance: float,
+    trajectory_config: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     issues: list[str] = []
     metrics: dict[str, Any] = {
@@ -241,6 +299,7 @@ def check_state_action_semantics(
         "delta_action_bad_frames": 0,
         "arm_action_outlier_frames": [],
         "gripper_outlier_frames": [],
+        "gripper_checked": False,
         "non_finite_frames": [],
     }
 
@@ -248,6 +307,34 @@ def check_state_action_semantics(
     states: list[list[float]] = []
     actions: list[list[float]] = []
     frame_indices: list[int] = []
+
+    state_layout: dict[str, slice] = {}
+    action_layout: dict[str, slice] = {}
+    state_gripper_indices: tuple[int, ...] = ()
+    action_gripper_indices: tuple[int, ...] = ()
+    if sorted_rows:
+        first_state = flatten_numeric(sorted_rows[0].get("observation.state"))
+        first_action = flatten_numeric(sorted_rows[0].get("action"))
+        try:
+            if trajectory_config is None:
+                state_layout, state_gripper_indices = legacy_vector_layout(
+                    len(first_state)
+                )
+                action_layout, action_gripper_indices = legacy_vector_layout(
+                    len(first_action)
+                )
+            else:
+                state_layout, state_gripper_indices = trajectory_vector_layout(
+                    trajectory_config, len(first_state)
+                )
+                action_layout, action_gripper_indices = trajectory_vector_layout(
+                    trajectory_config, len(first_action)
+                )
+        except ValueError as exc:
+            issues.append(f"semantic layout check failed: {exc}")
+        metrics["gripper_checked"] = bool(
+            state_gripper_indices or action_gripper_indices
+        )
 
     for row in sorted_rows:
         frame_index = int(row["frame_index"])
@@ -260,33 +347,38 @@ def check_state_action_semantics(
         if has_non_finite(state) or has_non_finite(action):
             metrics["non_finite_frames"].append(frame_index)
 
-        if len(state) >= 16:
-            for value in (state[7], state[15]):
-                if value < gripper_min - gripper_tolerance or value > gripper_max + gripper_tolerance:
+        if state_gripper_indices and max(state_gripper_indices) < len(state):
+            for value in (state[index] for index in state_gripper_indices):
+                if (
+                    value < gripper_min - gripper_tolerance
+                    or value > gripper_max + gripper_tolerance
+                ):
                     metrics["gripper_outlier_frames"].append(frame_index)
                     break
 
-        if len(action) >= 16:
-            for value in (action[7], action[15]):
-                if value < gripper_min - gripper_tolerance or value > gripper_max + gripper_tolerance:
+        if action_gripper_indices and max(action_gripper_indices) < len(action):
+            for value in (action[index] for index in action_gripper_indices):
+                if (
+                    value < gripper_min - gripper_tolerance
+                    or value > gripper_max + gripper_tolerance
+                ):
                     metrics["gripper_outlier_frames"].append(frame_index)
                     break
 
-            left_max = max((abs(value) for value in action[0:7]), default=0.0)
-            right_max = max((abs(value) for value in action[8:15]), default=0.0)
-            metrics["max_left_arm_delta"] = max(metrics["max_left_arm_delta"], left_max)
-            metrics["max_right_arm_delta"] = max(metrics["max_right_arm_delta"], right_max)
+        action_outlier: dict[str, Any] = {"frame_index": frame_index}
+        for arm_name, arm_slice in action_layout.items():
+            if arm_slice.stop is None or arm_slice.stop > len(action):
+                continue
+            arm_max = max((abs(value) for value in action[arm_slice]), default=0.0)
+            metric_name = f"max_{arm_name}_arm_delta"
+            metrics[metric_name] = max(metrics[metric_name], arm_max)
             if (
                 arm_action_representation == "delta_joint_position"
-                and (left_max > action_outlier_threshold or right_max > action_outlier_threshold)
+                and arm_max > action_outlier_threshold
             ):
-                metrics["arm_action_outlier_frames"].append(
-                    {
-                        "frame_index": frame_index,
-                        "left_max": left_max,
-                        "right_max": right_max,
-                    }
-                )
+                action_outlier[f"{arm_name}_max"] = arm_max
+        if len(action_outlier) > 1:
+            metrics["arm_action_outlier_frames"].append(action_outlier)
 
     if metrics["non_finite_frames"]:
         issues.append(
@@ -316,18 +408,31 @@ def check_state_action_semantics(
             action = actions[idx]
             frame_index = frame_indices[idx]
 
-            if len(state) < 16 or len(next_state) < 16 or len(action) < 16:
+            shared_arms = [arm for arm in state_layout if arm in action_layout]
+            if not shared_arms:
                 continue
 
-            expected_left = [next_state[j] - state[j] for j in range(0, 7)]
-            expected_right = [next_state[j] - state[j] for j in range(8, 15)]
-            actual_left = action[0:7]
-            actual_right = action[8:15]
-            frame_error = max(
-                [abs(actual_left[j] - expected_left[j]) for j in range(7)]
-                + [abs(actual_right[j] - expected_right[j]) for j in range(7)]
+            errors: list[float] = []
+            for arm_name in shared_arms:
+                state_slice = state_layout[arm_name]
+                action_slice = action_layout[arm_name]
+                if (
+                    state_slice.stop is None
+                    or action_slice.stop is None
+                    or state_slice.stop > len(state)
+                    or state_slice.stop > len(next_state)
+                    or action_slice.stop > len(action)
+                ):
+                    continue
+                expected = np.asarray(next_state[state_slice]) - np.asarray(
+                    state[state_slice]
+                )
+                actual = np.asarray(action[action_slice])
+                errors.extend(np.abs(actual - expected).tolist())
+            frame_error = max(errors, default=0.0)
+            metrics["delta_action_max_error"] = max(
+                metrics["delta_action_max_error"], frame_error
             )
-            metrics["delta_action_max_error"] = max(metrics["delta_action_max_error"], frame_error)
             if frame_error > delta_action_tolerance:
                 metrics["delta_action_bad_frames"] += 1
 
@@ -423,6 +528,7 @@ def format_accepted_target_warning(
 def check_joint_safety_constraints(
     rows: list[dict[str, Any]],
     arm_action_representation: str,
+    trajectory_config: dict[str, Any] | None = None,
 ) -> tuple[list[str], list[str], dict[str, int]]:
     """Validate measured states and accepted action targets.
 
@@ -464,8 +570,16 @@ def check_joint_safety_constraints(
         ], warnings, metrics
 
     try:
-        state_layout = dict(arm_joint_slices(len(states[0])))
-        action_layout = dict(arm_joint_slices(len(actions[0])))
+        if trajectory_config is None:
+            state_layout, _ = legacy_vector_layout(len(states[0]))
+            action_layout, _ = legacy_vector_layout(len(actions[0]))
+        else:
+            state_layout, _ = trajectory_vector_layout(
+                trajectory_config, len(states[0])
+            )
+            action_layout, _ = trajectory_vector_layout(
+                trajectory_config, len(actions[0])
+            )
     except ValueError as exc:
         return [f"joint safety check skipped: {exc}"], warnings, metrics
 
@@ -719,6 +833,16 @@ def validate_dataset(
     total_frames = int(info["total_frames"])
     state_dim = get_feature_dim(info, "observation.state")
     action_dim = get_feature_dim(info, "action")
+    if state_dim is None or action_dim is None:
+        raise ValueError(
+            "Dataset metadata must declare observation.state and action dimensions."
+        )
+    trajectory_config = load_trajectory_config(
+        dataset_root,
+        action_config or {},
+        state_dim,
+        action_dim,
+    )
     video_keys = get_video_keys(info)
 
     episodes = load_parquet_rows(dataset_root / "meta/episodes")
@@ -762,6 +886,7 @@ def validate_dataset(
     total_delta_action_bad_frames = 0
     total_arm_action_outlier_frames = 0
     total_gripper_outlier_frames = 0
+    gripper_checks_enabled = False
     total_non_finite_frames = 0
     total_state_safety_violation_steps = 0
     total_state_motion_warning_steps = 0
@@ -860,6 +985,7 @@ def validate_dataset(
             gripper_min=gripper_min,
             gripper_max=gripper_max,
             gripper_tolerance=gripper_tolerance,
+            trajectory_config=trajectory_config,
         )
         episode_issues.extend(semantic_issues)
 
@@ -869,11 +995,15 @@ def validate_dataset(
         total_delta_action_bad_frames += int(semantic_metrics["delta_action_bad_frames"])
         total_arm_action_outlier_frames += len(semantic_metrics["arm_action_outlier_frames"])
         total_gripper_outlier_frames += len(set(semantic_metrics["gripper_outlier_frames"]))
+        gripper_checks_enabled = gripper_checks_enabled or bool(
+            semantic_metrics["gripper_checked"]
+        )
         total_non_finite_frames += len(set(semantic_metrics["non_finite_frames"]))
 
         safety_issues, safety_warnings, safety_metrics = check_joint_safety_constraints(
             rows,
             arm_action_representation,
+            trajectory_config,
         )
         episode_issues.extend(safety_issues)
         total_state_safety_violation_steps += safety_metrics["state_violation_steps"]
@@ -911,8 +1041,14 @@ def validate_dataset(
     else:
         print(f"  max absolute left arm target value: {max_left_arm_delta:.6g}")
         print(f"  max absolute right arm target value: {max_right_arm_delta:.6g}")
-    print(f"  gripper valid range: [{gripper_min:.6g}, {gripper_max:.6g}] +/- {gripper_tolerance:.6g}")
-    print(f"  gripper outlier frames: {total_gripper_outlier_frames}")
+    if gripper_checks_enabled:
+        print(
+            f"  gripper valid range: [{gripper_min:.6g}, {gripper_max:.6g}] "
+            f"+/- {gripper_tolerance:.6g}"
+        )
+        print(f"  gripper outlier frames: {total_gripper_outlier_frames}")
+    else:
+        print("  gripper range check: skipped (trajectory has no gripper)")
     print(f"  non-finite state/action frames: {total_non_finite_frames}")
     if arm_action_representation == "delta_joint_position":
         print(f"  delta-action tolerance: {delta_action_tolerance:.6g}")

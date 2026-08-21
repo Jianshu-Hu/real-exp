@@ -8,6 +8,7 @@ import numpy as np
 from data_collection.validate_dataset import (
     check_joint_safety_constraints,
     check_physical_video_frames,
+    check_state_action_semantics,
 )
 from utils.limit import (
     FR3_SAFE_POSITION_LOWER_RAD,
@@ -116,6 +117,52 @@ def test_dataset_still_checks_accepted_action_position_envelope() -> None:
     assert metrics["state_violation_steps"] == 0
     assert metrics["action_violation_steps"] == 1
     assert metrics["action_waypoint_slew_steps"] == 2
+
+
+def test_single_right_arm_hand_layout_ignores_hand_as_grippers() -> None:
+    midpoint = 0.5 * (FR3_SAFE_POSITION_LOWER_RAD + FR3_SAFE_POSITION_UPPER_RAD)
+    hand = np.linspace(-1.5, 1.5, 20)
+    vector = [*midpoint, *hand]
+    rows = [
+        {
+            "frame_index": frame_index,
+            "timestamp": frame_index * 0.1,
+            "observation.state": vector,
+            "action": vector,
+        }
+        for frame_index in range(3)
+    ]
+    trajectory_config = {
+        "end_effector": "hand",
+        "arm_mode": "right",
+        "arms": ["right"],
+    }
+
+    semantic_issues, semantic_metrics = check_state_action_semantics(
+        episode_index=0,
+        rows=rows,
+        arm_action_representation="absolute_joint_position",
+        delta_action_tolerance=1e-4,
+        action_outlier_threshold=0.3,
+        gripper_min=0.0,
+        gripper_max=1.0,
+        gripper_tolerance=1e-5,
+        trajectory_config=trajectory_config,
+    )
+    safety_issues, _, safety_metrics = check_joint_safety_constraints(
+        rows,
+        "absolute_joint_position",
+        trajectory_config,
+    )
+
+    assert semantic_issues == []
+    assert semantic_metrics["gripper_checked"] is False
+    assert semantic_metrics["gripper_outlier_frames"] == []
+    assert semantic_metrics["max_left_arm_delta"] == 0.0
+    assert semantic_metrics["max_right_arm_delta"] == max(abs(midpoint))
+    assert safety_issues == []
+    assert safety_metrics["state_violation_steps"] == 0
+    assert safety_metrics["action_violation_steps"] == 0
 
 
 def write_test_video(path, *, frame_count: int, fps: int = 10) -> None:

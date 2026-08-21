@@ -126,9 +126,11 @@ fi
 unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH LD_LIBRARY_PATH
 setup_files=(
   "${ros_setup_file}"
-  "${HOME}/franka_ros2_ws/install/local_setup.bash"
-  "${repository_root}/gello_software/ros2/install/local_setup.bash"
 )
+if [[ -r "${HOME}/franka_ros2_ws/install/local_setup.bash" ]]; then
+  setup_files+=("${HOME}/franka_ros2_ws/install/local_setup.bash")
+fi
+setup_files+=("${repository_root}/gello_software/ros2/install/local_setup.bash")
 set +u
 for setup_file in "${setup_files[@]}"; do
   [[ -r "${setup_file}" ]] || die "ROS setup file is missing: ${setup_file}"
@@ -143,6 +145,10 @@ export ROS_LOCALHOST_ONLY=0
 export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 command -v setsid >/dev/null || die "setsid is required"
 command -v ros2 >/dev/null || die "ros2 is unavailable after sourcing ROS"
+for required_package in franka_realsense_camera_publisher franka_lerobot_data_bridge; do
+  ros2 pkg prefix "${required_package}" >/dev/null 2>&1 || die \
+    "required ROS package is unavailable after sourcing overlays: ${required_package}"
+done
 declare -a policy_command=()
 if [[ -n "${policy_python}" ]]; then
   command -v "${policy_python}" >/dev/null || die "policy Python not found: ${policy_python}"

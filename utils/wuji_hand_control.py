@@ -326,7 +326,15 @@ class SmoothedWujiHand2Backend:
             return
         try:
             while not self._state_stop_event.is_set():
-                position = normalize_hand_positions(subscription.recv())
+                # Wuji SDK ``Subscription.recv`` is non-blocking and returns
+                # ``None`` when no frame is ready.  Do not busy-spin here:
+                # an unthrottled loop can starve the SDK receive/callback
+                # machinery and make the bounded stream queue report lag.
+                state = subscription.recv()
+                if state is None:
+                    self._state_stop_event.wait(0.001)
+                    continue
+                position = normalize_hand_positions(state)
                 if position is not None:
                     with self._actual_lock:
                         self._actual = position

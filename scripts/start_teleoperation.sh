@@ -409,6 +409,8 @@ Environment defaults:
   WUJI_RIGHT_GLOVE_SN      Defaults to WG1KA06260623515 for this setup.
   WUJI_LEFT_HAND_IP
   WUJI_RIGHT_HAND_IP
+  HAND_TELEMETRY_RATE_HZ   Hand telemetry publish rate (default: 15 Hz; keep
+                           this equal to the bridge sample_rate_hz).
 
 For a single side, an omitted glove serial or hand address lets wuji_sdk
 auto-discover the device. For --duo, both glove serials and both hand addresses
@@ -718,6 +720,8 @@ Examples:
 
 The Wuji options can also come from WUJI_LEFT_GLOVE_SN,
 WUJI_RIGHT_GLOVE_SN, WUJI_LEFT_HAND_IP, and WUJI_RIGHT_HAND_IP.
+Hand telemetry defaults to 15 Hz; set HAND_TELEMETRY_RATE_HZ when changing the
+bridge sample rate.
 EOF
 }
 

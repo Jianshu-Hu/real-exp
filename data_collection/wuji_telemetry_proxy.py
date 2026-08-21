@@ -11,6 +11,7 @@ from __future__ import annotations
 import atexit
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -18,6 +19,26 @@ import zmq
 
 DEFAULT_TELEMETRY_HOST = "192.168.50.13"
 DEFAULT_TELEMETRY_PORT = 5558
+DEFAULT_TELEMETRY_RATE_HZ = 15.0
+
+
+def _joint_state_positions(state) -> list[float] | None:
+    """Normalize Wuji SDK joint-state variants to device/NID order.
+
+    ``HandJointStates`` (returned by the synchronous read API) exposes a flat
+    ``position`` list, while the streaming Wuji Hand 2 resource delivers a
+    ``JointStateFrame`` containing ``joints[].position`` entries.
+    """
+    positions = getattr(state, "position", None)
+    if positions is not None:
+        values = [float(value) for value in positions]
+    else:
+        joints = getattr(state, "joints", None)
+        if joints is None:
+            return None
+        ordered_joints = sorted(joints, key=lambda joint: int(joint.nid))
+        values = [float(joint.position) for joint in ordered_joints]
+    return values if len(values) == 20 else None
 
 
 def _take_option(argv: list[str], name: str, default: str) -> tuple[list[str], str]:
@@ -52,6 +73,15 @@ def main() -> None:
         telemetry_port = int(telemetry_port_text)
     except ValueError as exc:
         raise SystemExit("--telemetry-port must be an integer") from exc
+    telemetry_rate_text = os.environ.get(
+        "HAND_TELEMETRY_RATE_HZ", str(DEFAULT_TELEMETRY_RATE_HZ)
+    )
+    try:
+        telemetry_rate_hz = float(telemetry_rate_text)
+    except ValueError as exc:
+        raise SystemExit("HAND_TELEMETRY_RATE_HZ must be a number") from exc
+    if telemetry_rate_hz <= 0.0:
+        raise SystemExit("HAND_TELEMETRY_RATE_HZ must be greater than zero")
 
     example_dir = Path(__file__).resolve().parents[1] / "libs" / "wuji-retargeting" / "example"
     os.chdir(example_dir)
@@ -68,27 +98,92 @@ def main() -> None:
         telemetry_socket.connect(f"tcp://{telemetry_host}:{telemetry_port}")
         atexit.register(telemetry_socket.close, 0)
         print(
-            f"Wuji hand telemetry: pushing to tcp://{telemetry_host}:{telemetry_port}",
+            "Wuji hand telemetry: pushing "
+            f"to tcp://{telemetry_host}:{telemetry_port} at {telemetry_rate_hz:g} Hz",
             flush=True,
         )
     else:
         print("Wuji hand telemetry: disabled", flush=True)
 
     original_send = teleop_real.WujiHand2Backend.send
+    original_close = teleop_real.WujiHand2Backend.close
+    telemetry_subscriptions = {}
+    latest_current_values = {}
+    latest_current_lock = threading.Lock()
     telemetry_sent = 0
     telemetry_error_count = 0
     telemetry_last_error_time = 0.0
+    telemetry_callback_error_count = 0
+    telemetry_last_callback_error_time = 0.0
+    telemetry_last_send_time = 0.0
+    telemetry_period_s = 1.0 / telemetry_rate_hz
 
     def send_with_telemetry(backend, qpos):
         nonlocal telemetry_sent, telemetry_error_count, telemetry_last_error_time
+        nonlocal telemetry_last_send_time
+        nonlocal telemetry_callback_error_count, telemetry_last_callback_error_time
         original_send(backend, qpos)
         if telemetry_socket is None:
             return
         try:
-            current = backend._hand.read_joint_state().position
-            current_values = [float(value) for value in current]
+            backend_key = id(backend)
+            subscription = telemetry_subscriptions.get(backend_key)
+            if subscription is None:
+                def on_joint_state(state, key=backend_key):
+                    nonlocal telemetry_callback_error_count, telemetry_last_callback_error_time
+                    try:
+                        values = _joint_state_positions(state)
+                        if values is None:
+                            return
+                        with latest_current_lock:
+                            latest_current_values[key] = values
+                    except Exception as exc:
+                        telemetry_callback_error_count += 1
+                        now = time.monotonic()
+                        if (
+                            telemetry_callback_error_count == 1
+                            or now - telemetry_last_callback_error_time >= 5.0
+                        ):
+                            print(
+                                "Wuji hand telemetry: cannot parse joint-state frame "
+                                f"({type(exc).__name__}: {exc}); "
+                                f"failures={telemetry_callback_error_count}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            telemetry_last_callback_error_time = now
+
+                def on_joint_state_error(error):
+                    nonlocal telemetry_error_count, telemetry_last_error_time
+                    telemetry_error_count += 1
+                    now = time.monotonic()
+                    if telemetry_error_count == 1 or now - telemetry_last_error_time >= 5.0:
+                        print(
+                            "Wuji hand telemetry: joint-state subscription error "
+                            f"({error}); failures={telemetry_error_count}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        telemetry_last_error_time = now
+
+                subscription = backend._hand.joint_states().subscribe_with_callback(
+                    on_joint_state,
+                    on_error=on_joint_state_error,
+                )
+                telemetry_subscriptions[backend_key] = subscription
+
+            with latest_current_lock:
+                current_values = latest_current_values.get(backend_key)
+                if current_values is not None:
+                    current_values = list(current_values)
             target_values = [float(value) for value in qpos]
-            if len(current_values) != 20 or len(target_values) != 20:
+            if current_values is None or len(target_values) != 20:
+                return
+            now = time.monotonic()
+            if (
+                telemetry_last_send_time > 0.0
+                and now - telemetry_last_send_time < telemetry_period_s
+            ):
                 return
             telemetry_socket.send_pyobj(
                 {
@@ -99,6 +194,7 @@ def main() -> None:
                 },
                 flags=zmq.NOBLOCK,
             )
+            telemetry_last_send_time = now
             telemetry_sent += 1
             if telemetry_sent == 1:
                 print("Wuji hand telemetry: first packet queued", flush=True)
@@ -114,7 +210,19 @@ def main() -> None:
                 )
                 telemetry_last_error_time = now
 
+    def close_with_telemetry(backend):
+        subscription = telemetry_subscriptions.pop(id(backend), None)
+        with latest_current_lock:
+            latest_current_values.pop(id(backend), None)
+        if subscription is not None:
+            try:
+                subscription.close()
+            except Exception:
+                pass
+        original_close(backend)
+
     teleop_real.WujiHand2Backend.send = send_with_telemetry
+    teleop_real.WujiHand2Backend.close = close_with_telemetry
     teleop_real.main()
 
 

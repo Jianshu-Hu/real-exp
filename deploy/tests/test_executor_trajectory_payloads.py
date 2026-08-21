@@ -12,6 +12,7 @@ import pytest
 
 from deploy.franka_act_policy_executor import FrankaPolicyExecutor as ActExecutor
 from deploy.deploy_lerobot_policy import (
+    run_server,
     trajectory_contract_mismatches,
     validate_checkpoint_trajectory_contract,
 )
@@ -159,6 +160,34 @@ def test_checkpoint_manifest_is_self_contained(tmp_path: Path) -> None:
     assert manifest["fps"] == 15.0
     assert manifest["camera_names"] == ["cam_front", "cam_left"]
     assert manifest["max_actions_per_chunk"] == 32
+
+
+def test_policy_server_fps_preflight_rejects_mismatch_before_starting(tmp_path: Path) -> None:
+    dataset = Path("data/test-left-gripper")
+    info = json.loads((dataset / "meta/info.json").read_text())
+    action = json.loads((dataset / "meta/real_exp_action_config.json").read_text())
+    trajectory = require_dataset_trajectory_config(dataset)
+    checkpoint = tmp_path / "pretrained_model"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps(
+            {
+                "type": "act",
+                "n_action_steps": 32,
+                "input_features": {
+                    "observation.state": {"shape": [8]},
+                    "observation.images.cam_left": {"shape": [3, 224, 224]},
+                    "observation.images.cam_front": {"shape": [3, 224, 224]},
+                },
+                "output_features": {"action": {"shape": [8]}},
+            }
+        )
+    )
+    write_checkpoint_deployment_metadata(checkpoint, info, action, trajectory)
+    args = type("Args", (), {"policy_path": checkpoint, "fps": 14.0})()
+
+    with pytest.raises(ValueError, match="does not match checkpoint metadata fps=15"):
+        run_server(args)
 
 
 def test_dataset_checkpoint_contract_mismatch_identifies_the_changed_hardware() -> None:

@@ -26,6 +26,7 @@ from pprint import pformat
 from queue import Empty
 from typing import Any
 
+import numpy as np
 import torch
 import zmq
 

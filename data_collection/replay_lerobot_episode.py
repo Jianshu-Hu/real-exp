@@ -787,7 +787,7 @@ def move_hands_to_initial_state(
     for side, target in targets.items():
         status = request_hand_status(
             hand_status_sockets[side],
-            {"kind": "initial", "target": target},
+            {"kind": "initial", "target": target.tolist()},
         )
         if not bool(status.get("initial_received", False)):
             raise RuntimeError(f"{side} hand worker did not acknowledge its initial target.")
@@ -1161,7 +1161,9 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
                         socket.send_pyobj(
                             {
                                 "kind": "target",
-                                "target": np.asarray(targets[f"{side}_hand"][local_idx], dtype=float),
+                                "target": np.asarray(
+                                    targets[f"{side}_hand"][local_idx], dtype=float
+                                ).tolist(),
                             }
                         )
                 rclpy.spin_once(node, timeout_sec=0.0)

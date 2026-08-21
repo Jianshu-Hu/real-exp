@@ -229,28 +229,6 @@ wait_for_topic() {
   die "timed out after ${timeout_seconds}s waiting for ${topic}"
 }
 
-wait_for_node() {
-  local node_name="$1"
-  local process_pid="$2"
-  local process_description="$3"
-  local timeout_seconds=90
-  local deadline=$((SECONDS + timeout_seconds))
-
-  while ((SECONDS < deadline)); do
-    if ! kill -0 "${process_pid}" 2>/dev/null; then
-      wait "${process_pid}" || true
-      die "${process_description} exited before ROS node ${node_name} became available"
-    fi
-    if timeout 5s ros2 node list --no-daemon 2>/dev/null | grep -Fxq "${node_name}"; then
-      echo "Ready: ROS node ${node_name}"
-      return 0
-    fi
-    sleep 0.5
-  done
-
-  die "timed out after ${timeout_seconds}s waiting for ROS node ${node_name}"
-}
-
 wait_for_subscription() {
   local topic="$1"
   local process_pid="$2"
@@ -264,13 +242,13 @@ wait_for_subscription() {
     fi
     if timeout 5s ros2 topic info "${topic}" --no-daemon 2>/dev/null \
       | grep -Eq 'Subscription count: [1-9][0-9]*'; then
-      echo "Ready: gripper manager subscription ${topic}"
+      echo "Ready: subscription ${topic}"
       return 0
     fi
     sleep 0.5
   done
 
-  die "timed out after ${timeout_seconds}s waiting for gripper manager subscription ${topic}"
+  die "timed out after ${timeout_seconds}s waiting for subscription ${topic}"
 }
 
 wait_for_tcp_port() {
@@ -293,7 +271,15 @@ wait_for_tcp_port() {
 echo "Starting ${arm_mode} FR3 replay stack for ${end_effector} trajectory."
 echo "The robot will receive recorded commands after you confirm replay with 's'."
 
-if [[ "${arm_mode}" == "duo" ]]; then
+if [[ "${end_effector}" == "gripper" ]]; then
+  if [[ "${arm_mode}" == "duo" ]]; then
+    robot_config="example_fr3_duo_config.yaml"
+  elif [[ "${arm_mode}" == "right" ]]; then
+    robot_config="example_fr3_right_config.yaml"
+  else
+    robot_config="example_fr3_config.yaml"
+  fi
+elif [[ "${arm_mode}" == "duo" ]]; then
   robot_config="example_fr3_duo_config_no_gripper.yaml"
 elif [[ "${arm_mode}" == "right" ]]; then
   robot_config="example_fr3_right_config_no_gripper.yaml"
@@ -308,12 +294,12 @@ start_process \
 controller_pid="${child_pids[0]}"
 
 if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "left" ]]; then
-  wait_for_node "/left/controller_manager" "${controller_pid}" "FR3 controller launch"
   wait_for_topic "/left/franka/joint_states" "${controller_pid}"
+  wait_for_subscription "/left/gello/raw_joint_states" "${controller_pid}"
 fi
 if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "right" ]]; then
-  wait_for_node "/right/controller_manager" "${controller_pid}" "FR3 controller launch"
   wait_for_topic "/right/franka/joint_states" "${controller_pid}"
+  wait_for_subscription "/right/gello/raw_joint_states" "${controller_pid}"
 fi
 echo "FR3 controllers are ready."
 
@@ -326,15 +312,15 @@ if [[ "${end_effector}" == "gripper" ]]; then
     ros2 launch franka_gripper_manager franka_gripper_client.launch.py \
     "config_file:=${gripper_config}"
   gripper_pid="${child_pids[${#child_pids[@]} - 1]}"
-  # The executable creates a node named `franka_gripper_client` inside each
-  # configured namespace (see the launch output: /left.franka_gripper_client).
+  # Readiness is based on the state sample and command subscription actually
+  # needed by replay. Avoid global node-list discovery here: one malformed
+  # participant elsewhere in the DDS graph can make `ros2 node list` fail even
+  # while these topic endpoints are healthy.
   if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "left" ]]; then
-    wait_for_node "/left/franka_gripper_client" "${gripper_pid}" "Franka-hand manager launch"
     wait_for_topic "/left/franka_gripper/joint_states" "${gripper_pid}"
     wait_for_subscription "/left/gripper/gripper_client/target_gripper_width_percent" "${gripper_pid}"
   fi
   if [[ "${arm_mode}" == "duo" || "${arm_mode}" == "right" ]]; then
-    wait_for_node "/right/franka_gripper_client" "${gripper_pid}" "Franka-hand manager launch"
     wait_for_topic "/right/franka_gripper/joint_states" "${gripper_pid}"
     wait_for_subscription "/right/gripper/gripper_client/target_gripper_width_percent" "${gripper_pid}"
   fi

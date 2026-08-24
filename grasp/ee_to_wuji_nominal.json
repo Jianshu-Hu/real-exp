@@ -1,0 +1,11 @@
+{
+  "format": "real_exp_ee_to_wuji_v1",
+  "description": "Temporary nominal CAD transform. Assumes the controller EE frame coincides with panda_link8 and the hand root is hand_docking_link. Replace with a measured physical mount calibration before executing hardware motion.",
+  "source": "calibration/README.md: panda_link8_T_hand_docking",
+  "ee_T_hand": [
+    [-0.70710678, -0.70710678, 0.0, 0.0],
+    [0.70710678, -0.70710678, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}

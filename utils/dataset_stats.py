@@ -1,9 +1,17 @@
+"""Create and maintain training-ready statistics for local LeRobot datasets.
+
+Import ``ensure_dataset_stats`` from this module after adding the repository
+root and local LeRobot source directory to the Python module search path.
+"""
+
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
+import pyarrow.parquet as pq
 
 from lerobot.datasets.dataset_tools import recompute_stats
 from lerobot.datasets.io_utils import write_stats
@@ -17,6 +25,50 @@ IMAGENET_CAMERA_STATS = {
     "min": np.array([[[0.0]], [[0.0]], [[0.0]]], dtype=np.float32),
     "max": np.array([[[1.0]], [[1.0]], [[1.0]]], dtype=np.float32),
 }
+
+EPISODES_DIR = Path("meta/episodes")
+
+
+def normalize_episode_metadata(dataset_root: Path) -> bool:
+    """Remove optional per-episode stats columns from mixed-schema metadata files.
+
+    Older LeRobot metadata files may not contain ``stats/*`` columns while files
+    written during a resumed recording do. The stock LeRobot loader requires all
+    episode parquet files to have one schema, and it discards these columns after
+    loading anyway. Strip them before constructing ``LeRobotDataset`` so the
+    parent project remains compatible with an unmodified LeRobot submodule.
+
+    Returns ``True`` when one or more parquet files were rewritten.
+    """
+    episodes_dir = dataset_root / EPISODES_DIR
+    paths = sorted(episodes_dir.glob("*/*.parquet"))
+    if not paths:
+        return False
+
+    structural_columns = [name for name in pq.read_schema(paths[0]).names if not name.startswith("stats/")]
+    structural_set = set(structural_columns)
+    changed = False
+    for path in paths:
+        schema = pq.read_schema(path)
+        columns = set(schema.names)
+        missing = structural_set - columns
+        if missing:
+            raise ValueError(
+                f"Episode metadata file '{path}' is missing structural columns: {sorted(missing)}"
+            )
+        if not any(name.startswith("stats/") for name in schema.names):
+            continue
+
+        table = pq.read_table(path, columns=structural_columns)
+        temporary_path = path.with_name(f".{path.name}.tmp")
+        try:
+            pq.write_table(table, temporary_path, compression="snappy")
+            os.replace(temporary_path, path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        changed = True
+
+    return changed
 
 
 def ensure_dataset_stats(
@@ -34,6 +86,7 @@ def ensure_dataset_stats(
     ``DatasetConfig.use_imagenet_stats=True`` path can safely overwrite/use them.
     """
     dataset_root = dataset_root.expanduser().resolve()
+    normalize_episode_metadata(dataset_root)
     dataset = LeRobotDataset(repo_id=repo_id, root=dataset_root)
 
     stats_missing = dataset.meta.stats is None

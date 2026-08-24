@@ -1,21 +1,101 @@
+"""Validate local LeRobot datasets.
+
+Usage:
+    python data_collection/validate_dataset.py \
+        --dataset-root data/my_dataset
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils.trajectory_metadata import (  # noqa: E402
+    require_dataset_trajectory_config,
+    validate_action_trajectory_contract,
+)
+from utils.limit import (  # noqa: E402
+    TrajectoryViolationCounts,
+    arm_joint_slices,
+    validate_joint_trajectory,
+)
 
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
+PROCESSED_FLAG = "processed"
+
+
+def trajectory_vector_layout(
+    trajectory_config: dict[str, Any],
+    vector_size: int,
+) -> tuple[dict[str, slice], tuple[int, ...]]:
+    """Return arm slices and gripper indices from trajectory metadata.
+
+    A trajectory consists of one block per active arm. Each block starts with
+    seven Franka joints and is followed by no values, one gripper value, or
+    twenty hand-joint values. In particular, a 27-D hand trajectory must not be
+    interpreted as a 16-D dual-arm/gripper trajectory merely because it is long
+    enough to contain the old hard-coded indices.
+    """
+    raw_arms = trajectory_config.get("arms")
+    if not isinstance(raw_arms, list) or not raw_arms:
+        arm_mode = str(trajectory_config.get("arm_mode", "")).strip().lower()
+        raw_arms = ["left", "right"] if arm_mode == "duo" else [arm_mode]
+    arms = [str(arm).strip().lower() for arm in raw_arms]
+    if not arms or len(set(arms)) != len(arms) or any(
+        arm not in {"left", "right"} for arm in arms
+    ):
+        raise ValueError(f"invalid active arms in trajectory metadata: {raw_arms!r}")
+
+    end_effector = str(trajectory_config.get("end_effector", "arm")).strip().lower()
+    end_effector_size = {"arm": 0, "gripper": 1, "hand": 20}.get(end_effector)
+    if end_effector_size is None:
+        raise ValueError(
+            f"unsupported end-effector mode {end_effector!r}; expected arm, gripper, or hand"
+        )
+
+    block_size = 7 + end_effector_size
+    expected_size = block_size * len(arms)
+    if vector_size != expected_size:
+        raise ValueError(
+            f"trajectory metadata describes {len(arms)} {end_effector} arm block(s) "
+            f"({expected_size} values), but vector has {vector_size} dimensions"
+        )
+
+    arm_layout = {
+        arm: slice(block_index * block_size, block_index * block_size + 7)
+        for block_index, arm in enumerate(arms)
+    }
+    gripper_indices = (
+        tuple(block_index * block_size + 7 for block_index in range(len(arms)))
+        if end_effector == "gripper"
+        else ()
+    )
+    return arm_layout, gripper_indices
+
+
+def legacy_vector_layout(vector_size: int) -> tuple[dict[str, slice], tuple[int, ...]]:
+    """Return the historical arm/gripper layout when metadata is unavailable."""
+    arm_layout = dict(arm_joint_slices(vector_size))
+    gripper_indices = {8: (7,), 16: (7, 15)}.get(vector_size, ())
+    return arm_layout, gripper_indices
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Validate a local LeRobot dataset and print dataset information."
-    )
+    parser = argparse.ArgumentParser(description="Validate a local LeRobot dataset.")
     parser.add_argument(
         "--dataset-root",
         required=True,
@@ -24,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-video-frames",
         action="store_true",
-        help="Skip physical MP4 frame count checks.",
+        help="Skip full MP4 decode, frame count, resolution, and FPS checks.",
     )
     parser.add_argument(
         "--verbose",
@@ -117,7 +197,9 @@ def flatten_numeric(value: Any) -> list[float]:
         return []
     if isinstance(value, (int, float)):
         return [float(value)]
-    if isinstance(value, list):
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
         flattened: list[float] = []
         for item in value:
             flattened.extend(flatten_numeric(item))
@@ -210,6 +292,7 @@ def check_state_action_semantics(
     gripper_min: float,
     gripper_max: float,
     gripper_tolerance: float,
+    trajectory_config: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     issues: list[str] = []
     metrics: dict[str, Any] = {
@@ -219,6 +302,7 @@ def check_state_action_semantics(
         "delta_action_bad_frames": 0,
         "arm_action_outlier_frames": [],
         "gripper_outlier_frames": [],
+        "gripper_checked": False,
         "non_finite_frames": [],
     }
 
@@ -226,6 +310,34 @@ def check_state_action_semantics(
     states: list[list[float]] = []
     actions: list[list[float]] = []
     frame_indices: list[int] = []
+
+    state_layout: dict[str, slice] = {}
+    action_layout: dict[str, slice] = {}
+    state_gripper_indices: tuple[int, ...] = ()
+    action_gripper_indices: tuple[int, ...] = ()
+    if sorted_rows:
+        first_state = flatten_numeric(sorted_rows[0].get("observation.state"))
+        first_action = flatten_numeric(sorted_rows[0].get("action"))
+        try:
+            if trajectory_config is None:
+                state_layout, state_gripper_indices = legacy_vector_layout(
+                    len(first_state)
+                )
+                action_layout, action_gripper_indices = legacy_vector_layout(
+                    len(first_action)
+                )
+            else:
+                state_layout, state_gripper_indices = trajectory_vector_layout(
+                    trajectory_config, len(first_state)
+                )
+                action_layout, action_gripper_indices = trajectory_vector_layout(
+                    trajectory_config, len(first_action)
+                )
+        except ValueError as exc:
+            issues.append(f"semantic layout check failed: {exc}")
+        metrics["gripper_checked"] = bool(
+            state_gripper_indices or action_gripper_indices
+        )
 
     for row in sorted_rows:
         frame_index = int(row["frame_index"])
@@ -238,33 +350,38 @@ def check_state_action_semantics(
         if has_non_finite(state) or has_non_finite(action):
             metrics["non_finite_frames"].append(frame_index)
 
-        if len(state) >= 16:
-            for value in (state[7], state[15]):
-                if value < gripper_min - gripper_tolerance or value > gripper_max + gripper_tolerance:
+        if state_gripper_indices and max(state_gripper_indices) < len(state):
+            for value in (state[index] for index in state_gripper_indices):
+                if (
+                    value < gripper_min - gripper_tolerance
+                    or value > gripper_max + gripper_tolerance
+                ):
                     metrics["gripper_outlier_frames"].append(frame_index)
                     break
 
-        if len(action) >= 16:
-            for value in (action[7], action[15]):
-                if value < gripper_min - gripper_tolerance or value > gripper_max + gripper_tolerance:
+        if action_gripper_indices and max(action_gripper_indices) < len(action):
+            for value in (action[index] for index in action_gripper_indices):
+                if (
+                    value < gripper_min - gripper_tolerance
+                    or value > gripper_max + gripper_tolerance
+                ):
                     metrics["gripper_outlier_frames"].append(frame_index)
                     break
 
-            left_max = max((abs(value) for value in action[0:7]), default=0.0)
-            right_max = max((abs(value) for value in action[8:15]), default=0.0)
-            metrics["max_left_arm_delta"] = max(metrics["max_left_arm_delta"], left_max)
-            metrics["max_right_arm_delta"] = max(metrics["max_right_arm_delta"], right_max)
+        action_outlier: dict[str, Any] = {"frame_index": frame_index}
+        for arm_name, arm_slice in action_layout.items():
+            if arm_slice.stop is None or arm_slice.stop > len(action):
+                continue
+            arm_max = max((abs(value) for value in action[arm_slice]), default=0.0)
+            metric_name = f"max_{arm_name}_arm_delta"
+            metrics[metric_name] = max(metrics[metric_name], arm_max)
             if (
                 arm_action_representation == "delta_joint_position"
-                and (left_max > action_outlier_threshold or right_max > action_outlier_threshold)
+                and arm_max > action_outlier_threshold
             ):
-                metrics["arm_action_outlier_frames"].append(
-                    {
-                        "frame_index": frame_index,
-                        "left_max": left_max,
-                        "right_max": right_max,
-                    }
-                )
+                action_outlier[f"{arm_name}_max"] = arm_max
+        if len(action_outlier) > 1:
+            metrics["arm_action_outlier_frames"].append(action_outlier)
 
     if metrics["non_finite_frames"]:
         issues.append(
@@ -294,18 +411,31 @@ def check_state_action_semantics(
             action = actions[idx]
             frame_index = frame_indices[idx]
 
-            if len(state) < 16 or len(next_state) < 16 or len(action) < 16:
+            shared_arms = [arm for arm in state_layout if arm in action_layout]
+            if not shared_arms:
                 continue
 
-            expected_left = [next_state[j] - state[j] for j in range(0, 7)]
-            expected_right = [next_state[j] - state[j] for j in range(8, 15)]
-            actual_left = action[0:7]
-            actual_right = action[8:15]
-            frame_error = max(
-                [abs(actual_left[j] - expected_left[j]) for j in range(7)]
-                + [abs(actual_right[j] - expected_right[j]) for j in range(7)]
+            errors: list[float] = []
+            for arm_name in shared_arms:
+                state_slice = state_layout[arm_name]
+                action_slice = action_layout[arm_name]
+                if (
+                    state_slice.stop is None
+                    or action_slice.stop is None
+                    or state_slice.stop > len(state)
+                    or state_slice.stop > len(next_state)
+                    or action_slice.stop > len(action)
+                ):
+                    continue
+                expected = np.asarray(next_state[state_slice]) - np.asarray(
+                    state[state_slice]
+                )
+                actual = np.asarray(action[action_slice])
+                errors.extend(np.abs(actual - expected).tolist())
+            frame_error = max(errors, default=0.0)
+            metrics["delta_action_max_error"] = max(
+                metrics["delta_action_max_error"], frame_error
             )
-            metrics["delta_action_max_error"] = max(metrics["delta_action_max_error"], frame_error)
             if frame_error > delta_action_tolerance:
                 metrics["delta_action_bad_frames"] += 1
 
@@ -320,17 +450,240 @@ def check_state_action_semantics(
     return issues, metrics
 
 
+def format_sampled_state_warning(
+    arm_name: str,
+    counts: TrajectoryViolationCounts,
+    frame_indices: list[int],
+    *,
+    motion: bool,
+) -> str:
+    """Format state validity or sampled finite-difference motion warnings."""
+
+    def episode_frames(offsets: tuple[int, ...]) -> str:
+        return format_indices([frame_indices[offset] for offset in offsets])
+
+    if motion:
+        warning_indices = tuple(
+            sorted(set(counts.velocity_indices) | set(counts.acceleration_indices))
+        )
+        return (
+            f"{arm_name} sampled state motion warnings: "
+            f"total={len(warning_indices)} frames=[{episode_frames(warning_indices)}], "
+            f"velocity={counts.velocity_steps} "
+            f"frames=[{episode_frames(counts.velocity_indices)}], "
+            f"acceleration={counts.acceleration_steps} "
+            f"frames=[{episode_frames(counts.acceleration_indices)}]"
+        )
+
+    validity_indices = tuple(
+        sorted(
+            set(counts.non_finite_indices)
+            | set(counts.timing_indices)
+            | set(counts.position_indices)
+        )
+    )
+    return (
+        f"{arm_name} measured-state validity violations: "
+        f"total={len(validity_indices)} frames=[{episode_frames(validity_indices)}], "
+        f"position={counts.position_steps} "
+        f"frames=[{episode_frames(counts.position_indices)}], "
+        f"non_finite={counts.non_finite_steps} "
+        f"frames=[{episode_frames(counts.non_finite_indices)}], "
+        f"timing={counts.timing_steps} "
+        f"frames=[{episode_frames(counts.timing_indices)}]"
+    )
+
+
+def format_accepted_target_warning(
+    arm_name: str,
+    counts: TrajectoryViolationCounts,
+    frame_indices: list[int],
+) -> str:
+    """Format validity violations for accepted low-rate joint waypoints.
+
+    Velocity and acceleration are deliberately omitted. Consecutive accepted
+    targets are waypoints for the robot-side trajectory generator, not samples
+    of the generated controller reference.
+    """
+
+    def episode_frames(offsets: tuple[int, ...]) -> str:
+        return format_indices([frame_indices[offset] for offset in offsets])
+
+    target_indices = tuple(
+        sorted(
+            set(counts.non_finite_indices)
+            | set(counts.timing_indices)
+            | set(counts.position_indices)
+        )
+    )
+    return (
+        f"{arm_name} accepted action-target validity violations: "
+        f"total={len(target_indices)} frames=[{episode_frames(target_indices)}], "
+        f"position={counts.position_steps} "
+        f"frames=[{episode_frames(counts.position_indices)}], "
+        f"non_finite={counts.non_finite_steps} "
+        f"frames=[{episode_frames(counts.non_finite_indices)}], "
+        f"timing={counts.timing_steps} "
+        f"frames=[{episode_frames(counts.timing_indices)}]"
+    )
+
+
+def check_joint_safety_constraints(
+    rows: list[dict[str, Any]],
+    arm_action_representation: str,
+    trajectory_config: dict[str, Any] | None = None,
+) -> tuple[list[str], list[str], dict[str, int]]:
+    """Validate measured states and accepted action targets.
+
+    Measured states are sampled trajectories, so their finite differences are
+    useful (but approximate) motion diagnostics. Absolute actions are accepted
+    low-rate waypoints. Their finite differences are *not* the velocity or
+    acceleration of the 1 kHz reference generated inside the robot controller.
+    For actions, only finite values, timestamps, and the position envelope are
+    safety-validity checks; waypoint derivatives are reported separately as a
+    slew diagnostic.
+    """
+    empty_metrics = {
+        "state_violation_steps": 0,
+        "state_motion_warning_steps": 0,
+        "action_violation_steps": 0,
+        "action_waypoint_slew_steps": 0,
+    }
+    if not rows:
+        return [], [], empty_metrics.copy()
+
+    sorted_rows = sorted(rows, key=lambda row: int(row["frame_index"]))
+    states = [flatten_numeric(row.get("observation.state")) for row in sorted_rows]
+    actions = [flatten_numeric(row.get("action")) for row in sorted_rows]
+    timestamps = np.asarray(
+        [float(row["timestamp"]) for row in sorted_rows],
+        dtype=np.float64,
+    )
+    issues: list[str] = []
+    warnings: list[str] = []
+    metrics = empty_metrics.copy()
+
+    if not states or any(len(state) != len(states[0]) for state in states):
+        return [
+            "joint safety check skipped because state vector lengths are inconsistent"
+        ], warnings, metrics
+    if not actions or any(len(action) != len(actions[0]) for action in actions):
+        return [
+            "joint safety check skipped because action vector lengths are inconsistent"
+        ], warnings, metrics
+
+    try:
+        if trajectory_config is None:
+            state_layout, _ = legacy_vector_layout(len(states[0]))
+            action_layout, _ = legacy_vector_layout(len(actions[0]))
+        else:
+            state_layout, _ = trajectory_vector_layout(
+                trajectory_config, len(states[0])
+            )
+            action_layout, _ = trajectory_vector_layout(
+                trajectory_config, len(actions[0])
+            )
+    except ValueError as exc:
+        return [f"joint safety check skipped: {exc}"], warnings, metrics
+
+    state_array = np.asarray(states, dtype=np.float64)
+    action_array = np.asarray(actions, dtype=np.float64)
+    frame_indices = [int(row["frame_index"]) for row in sorted_rows]
+    shared_arms = [arm_name for arm_name in state_layout if arm_name in action_layout]
+    if not shared_arms:
+        return [
+            "joint safety check found no matching arms in state and action layouts"
+        ], warnings, metrics
+
+    for arm_name in shared_arms:
+        state_trajectory = state_array[:, state_layout[arm_name]]
+        state_counts = validate_joint_trajectory(state_trajectory, timestamps)
+        state_validity_indices = (
+            set(state_counts.non_finite_indices)
+            | set(state_counts.timing_indices)
+            | set(state_counts.position_indices)
+        )
+        state_motion_indices = (
+            set(state_counts.velocity_indices)
+            | set(state_counts.acceleration_indices)
+        )
+        metrics["state_violation_steps"] += len(state_validity_indices)
+        metrics["state_motion_warning_steps"] += len(state_motion_indices)
+        if state_validity_indices:
+            warnings.append(
+                format_sampled_state_warning(
+                    arm_name,
+                    state_counts,
+                    frame_indices,
+                    motion=False,
+                )
+            )
+        if state_motion_indices:
+            warnings.append(
+                format_sampled_state_warning(
+                    arm_name,
+                    state_counts,
+                    frame_indices,
+                    motion=True,
+                )
+            )
+
+        action_trajectory = action_array[:, action_layout[arm_name]]
+        if arm_action_representation == "delta_joint_position":
+            action_trajectory = state_trajectory + action_trajectory
+        elif arm_action_representation != "absolute_joint_position":
+            issues.append(
+                f"joint action safety check does not support representation "
+                f"'{arm_action_representation}'"
+            )
+            continue
+
+        action_counts = validate_joint_trajectory(action_trajectory, timestamps)
+        target_violation_indices = (
+            set(action_counts.non_finite_indices)
+            | set(action_counts.timing_indices)
+            | set(action_counts.position_indices)
+        )
+        waypoint_slew_indices = (
+            set(action_counts.velocity_indices)
+            | set(action_counts.acceleration_indices)
+        )
+        metrics["action_violation_steps"] += len(target_violation_indices)
+        metrics["action_waypoint_slew_steps"] += len(waypoint_slew_indices)
+        if target_violation_indices:
+            warnings.append(
+                format_accepted_target_warning(
+                    arm_name,
+                    action_counts,
+                    frame_indices,
+                )
+            )
+
+    return issues, warnings, metrics
+
+
 def check_physical_video_frames(
     dataset_root: Path,
     info: dict[str, Any],
     episodes: list[dict[str, Any]],
     video_keys: list[str],
 ) -> list[str]:
-    try:
-        import cv2
-    except ModuleNotFoundError:
+    """Fully decode each referenced video and compare it with dataset metadata.
+
+    Strict FFmpeg decoding rejects codec/packet errors, while ``ffprobe
+    -count_frames`` counts decoded frames instead of trusting the MP4 header. Both
+    run out of process so malformed native codec input cannot crash the validator.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if ffmpeg is None or ffprobe is None:
+        missing_tools = ", ".join(
+            tool_name
+            for tool_name, tool_path in (("ffmpeg", ffmpeg), ("ffprobe", ffprobe))
+            if tool_path is None
+        )
         return [
-            "physical video frame checks skipped because OpenCV (cv2) is not installed"
+            f"physical video quality checks require {missing_tools}, but it is not installed"
         ]
 
     issues: list[str] = []
@@ -357,24 +710,94 @@ def check_physical_video_frames(
                 issues.append(f"{video_key} file {chunk_index}/{file_index}: missing {video_path}")
                 continue
 
-            capture = cv2.VideoCapture(str(video_path))
-            if not capture.isOpened():
-                issues.append(f"{video_key} file {chunk_index}/{file_index}: failed to open {video_path}")
+            strict_decode = subprocess.run(
+                [
+                    ffmpeg,
+                    "-v",
+                    "error",
+                    "-xerror",
+                    "-i",
+                    str(video_path),
+                    "-map",
+                    "0:v:0",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if strict_decode.returncode != 0:
+                issues.append(
+                    f"{video_key} file {chunk_index}/{file_index}: full decode failed: "
+                    f"{strict_decode.stderr.strip() or 'ffmpeg returned a non-zero status'}"
+                )
                 continue
 
-            actual_frames = round(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-            actual_fps = capture.get(cv2.CAP_PROP_FPS)
-            capture.release()
+            expected_spec = info.get("features", {}).get(video_key, {})
+            expected_shape = expected_spec.get("shape")
+            expected_height = int(expected_shape[-2]) if expected_shape and len(expected_shape) >= 2 else None
+            expected_width = int(expected_shape[-1]) if expected_shape and len(expected_shape) >= 1 else None
+            probe = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-count_frames",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height,avg_frame_rate,nb_read_frames",
+                    "-of",
+                    "json",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if probe.returncode != 0:
+                issues.append(
+                    f"{video_key} file {chunk_index}/{file_index}: full decode failed: "
+                    f"{probe.stderr.strip() or 'ffprobe returned a non-zero status'}"
+                )
+                continue
+
+            try:
+                streams = json.loads(probe.stdout).get("streams", [])
+                stream = streams[0]
+                actual_frames = int(stream["nb_read_frames"])
+                actual_fps = float(stream["avg_frame_rate"].split("/")[0]) / float(
+                    stream["avg_frame_rate"].split("/")[1]
+                )
+                actual_width = int(stream["width"])
+                actual_height = int(stream["height"])
+            except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError) as exc:
+                issues.append(
+                    f"{video_key} file {chunk_index}/{file_index}: invalid ffprobe output: {exc}"
+                )
+                continue
 
             if actual_frames != expected_frames:
                 issues.append(
                     f"{video_key} file {chunk_index}/{file_index}: "
                     f"physical frames {actual_frames} != expected {expected_frames}"
                 )
-            if actual_fps and abs(actual_fps - float(info["fps"])) > 1e-3:
+            if abs(actual_fps - float(info["fps"])) > 1e-3:
                 issues.append(
                     f"{video_key} file {chunk_index}/{file_index}: "
                     f"physical fps {actual_fps:.6f} != dataset fps {float(info['fps']):.6f}"
+                )
+            if (
+                expected_width is not None
+                and expected_height is not None
+                and (actual_width != expected_width or actual_height != expected_height)
+            ):
+                issues.append(
+                    f"{video_key} file {chunk_index}/{file_index}: decoded frame shape "
+                    f"{actual_width}x{actual_height} != expected "
+                    f"{expected_width}x{expected_height}"
                 )
 
     return issues
@@ -396,6 +819,14 @@ def validate_dataset(
         )
 
     info = load_json(dataset_root / INFO_PATH)
+    processing_warning = None
+    if info.get(PROCESSED_FLAG) is not True:
+        processing_warning = (
+            "Dataset is not marked as processed in meta/info.json. "
+            "Run process_dataset.py trim-initial before using this dataset."
+        )
+        print(f"WARNING: {processing_warning}", file=sys.stderr)
+
     action_config = load_action_config(dataset_root)
     arm_action_representation = str(
         (action_config or {}).get("arm_action_representation", "absolute_joint_position")
@@ -405,6 +836,14 @@ def validate_dataset(
     total_frames = int(info["total_frames"])
     state_dim = get_feature_dim(info, "observation.state")
     action_dim = get_feature_dim(info, "action")
+    if state_dim is None or action_dim is None:
+        raise ValueError(
+            "Dataset metadata must declare observation.state and action dimensions."
+        )
+    trajectory_config = require_dataset_trajectory_config(dataset_root)
+    validate_action_trajectory_contract(
+        action_config or {}, trajectory_config, source=str(dataset_root / "meta")
+    )
     video_keys = get_video_keys(info)
 
     episodes = load_parquet_rows(dataset_root / "meta/episodes")
@@ -413,7 +852,7 @@ def validate_dataset(
     data_by_episode = build_data_index(data_rows)
 
     issues: list[str] = []
-    warning_issues: list[str] = []
+    warning_issues: list[str] = [processing_warning] if processing_warning else []
 
     episode_indices = [int(row["episode_index"]) for row in episodes]
     data_episode_indices = sorted(data_by_episode)
@@ -448,7 +887,12 @@ def validate_dataset(
     total_delta_action_bad_frames = 0
     total_arm_action_outlier_frames = 0
     total_gripper_outlier_frames = 0
+    gripper_checks_enabled = False
     total_non_finite_frames = 0
+    total_state_safety_violation_steps = 0
+    total_state_motion_warning_steps = 0
+    total_action_safety_violation_steps = 0
+    total_action_waypoint_slew_steps = 0
 
     if verbose:
         print("\nEpisodes")
@@ -542,6 +986,7 @@ def validate_dataset(
             gripper_min=gripper_min,
             gripper_max=gripper_max,
             gripper_tolerance=gripper_tolerance,
+            trajectory_config=trajectory_config,
         )
         episode_issues.extend(semantic_issues)
 
@@ -551,7 +996,24 @@ def validate_dataset(
         total_delta_action_bad_frames += int(semantic_metrics["delta_action_bad_frames"])
         total_arm_action_outlier_frames += len(semantic_metrics["arm_action_outlier_frames"])
         total_gripper_outlier_frames += len(set(semantic_metrics["gripper_outlier_frames"]))
+        gripper_checks_enabled = gripper_checks_enabled or bool(
+            semantic_metrics["gripper_checked"]
+        )
         total_non_finite_frames += len(set(semantic_metrics["non_finite_frames"]))
+
+        safety_issues, safety_warnings, safety_metrics = check_joint_safety_constraints(
+            rows,
+            arm_action_representation,
+            trajectory_config,
+        )
+        episode_issues.extend(safety_issues)
+        total_state_safety_violation_steps += safety_metrics["state_violation_steps"]
+        total_state_motion_warning_steps += safety_metrics["state_motion_warning_steps"]
+        total_action_safety_violation_steps += safety_metrics["action_violation_steps"]
+        total_action_waypoint_slew_steps += safety_metrics["action_waypoint_slew_steps"]
+        warning_issues.extend(
+            f"episode {episode_index}: {warning}" for warning in safety_warnings
+        )
 
         if verbose:
             video_status = "ok" if not bad_video_ranges else "BAD"
@@ -580,8 +1042,14 @@ def validate_dataset(
     else:
         print(f"  max absolute left arm target value: {max_left_arm_delta:.6g}")
         print(f"  max absolute right arm target value: {max_right_arm_delta:.6g}")
-    print(f"  gripper valid range: [{gripper_min:.6g}, {gripper_max:.6g}] +/- {gripper_tolerance:.6g}")
-    print(f"  gripper outlier frames: {total_gripper_outlier_frames}")
+    if gripper_checks_enabled:
+        print(
+            f"  gripper valid range: [{gripper_min:.6g}, {gripper_max:.6g}] "
+            f"+/- {gripper_tolerance:.6g}"
+        )
+        print(f"  gripper outlier frames: {total_gripper_outlier_frames}")
+    else:
+        print("  gripper range check: skipped (trajectory has no gripper)")
     print(f"  non-finite state/action frames: {total_non_finite_frames}")
     if arm_action_representation == "delta_joint_position":
         print(f"  delta-action tolerance: {delta_action_tolerance:.6g}")
@@ -590,11 +1058,33 @@ def validate_dataset(
     else:
         print("  delta-action consistency check: skipped for absolute_joint_position actions")
 
+    print("\nJoint safety checks")
+    print(
+        "  measured-state validity violation steps: "
+        f"{total_state_safety_violation_steps}"
+    )
+    print(
+        "  sampled measured-state motion warning steps: "
+        f"{total_state_motion_warning_steps}"
+    )
+    print(
+        "  accepted action-target validity violation steps: "
+        f"{total_action_safety_violation_steps}"
+    )
+    print(
+        "  accepted waypoint slew diagnostic steps: "
+        f"{total_action_waypoint_slew_steps}"
+    )
+    print(
+        "  note: waypoint slew is not controller-reference velocity/acceleration; "
+        "the constrained reference is generated internally at 1 kHz"
+    )
+
     if not skip_video_frames and video_keys:
         print("\nPhysical video checks")
         physical_video_issues = check_physical_video_frames(dataset_root, info, episodes, video_keys)
         for issue in physical_video_issues:
-            if issue.startswith("physical video frame checks skipped"):
+            if issue.startswith("physical video quality checks skipped"):
                 warning_issues.append(issue)
             else:
                 issues.append(issue)
@@ -602,7 +1092,7 @@ def validate_dataset(
             print("  ok")
         else:
             for issue in physical_video_issues:
-                prefix = "  warning:" if issue.startswith("physical video frame checks skipped") else "  issue:"
+                prefix = "  warning:" if issue.startswith("physical video quality checks skipped") else "  issue:"
                 print(f"{prefix} {issue}")
     elif skip_video_frames:
         print("\nPhysical video checks skipped by --skip-video-frames")
@@ -610,6 +1100,8 @@ def validate_dataset(
     print("\nValidation summary")
     if warning_issues:
         print(f"  warnings: {len(warning_issues)}")
+        for warning in warning_issues:
+            print(f"  - {warning}")
     if issues:
         print(f"  status: FAILED")
         print(f"  issues: {len(issues)}")
@@ -629,12 +1121,12 @@ def main() -> None:
             dataset_root=dataset_root,
             skip_video_frames=args.skip_video_frames,
             verbose=args.verbose,
-        delta_action_tolerance=args.delta_action_tolerance,
-        action_outlier_threshold=args.action_outlier_threshold,
-        gripper_min=args.gripper_min,
-        gripper_max=args.gripper_max,
-        gripper_tolerance=args.gripper_tolerance,
-    )
+            delta_action_tolerance=args.delta_action_tolerance,
+            action_outlier_threshold=args.action_outlier_threshold,
+            gripper_min=args.gripper_min,
+            gripper_max=args.gripper_max,
+            gripper_tolerance=args.gripper_tolerance,
+        )
     except Exception as exc:
         print(f"Validation failed with error: {exc}", file=sys.stderr)
         raise

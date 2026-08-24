@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import math
 import os
@@ -11,9 +12,8 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DATA_COLLECTION_DIR = REPO_ROOT / "data_collection"
-if str(DATA_COLLECTION_DIR) not in sys.path:
-    sys.path.insert(0, str(DATA_COLLECTION_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 from accelerate import Accelerator
@@ -38,17 +38,25 @@ from lerobot.utils.train_utils import (
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.utils import init_logging
 
-from dataset_stats import ensure_dataset_stats
-from image_preprocessing import (
+from utils.dataset_stats import ensure_dataset_stats
+from utils.image_preprocessing import (
     ResizePadConfig,
     apply_resize_pad_to_feature_specs,
     make_resize_pad_transform,
 )
+from utils.trajectory_metadata import (
+    TRAJECTORY_CONFIG_PATH,
+    describe_trajectory_layout,
+    require_dataset_trajectory_config,
+    validate_action_trajectory_contract,
+)
+from utils.deployment_metadata import write_checkpoint_deployment_metadata
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_HF_CACHE = REPO_ROOT / ".hf-cache"
 ACTION_CONFIG_REL_PATH = Path("meta/real_exp_action_config.json")
+DEFAULT_MAX_CHECKPOINTS = 10
 
 
 def format_duration(seconds: float) -> str:
@@ -83,12 +91,23 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Directory where checkpoints and logs will be written.",
+        help=(
+            "Parent directory for a new timestamped run. With --resume, this must be the "
+            "exact existing run directory containing the checkpoints."
+        ),
     )
     parser.add_argument("--steps", type=int, default=50_000, help="Number of optimizer steps.")
-    parser.add_argument("--batch-size", type=int, default=16, help="Training batch size.")
+    parser.add_argument("--batch-size", type=int, default=128, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader worker count.")
-    parser.add_argument("--save-freq", type=int, default=2_500, help="Checkpoint save frequency.")
+    parser.add_argument(
+        "--save-freq",
+        type=int,
+        default=None,
+        help=(
+            "Checkpoint save frequency in optimizer steps. By default, the interval is chosen "
+            "from --steps to produce 10 model checkpoints for the standard run."
+        ),
+    )
     parser.add_argument("--log-freq", type=int, default=100, help="Logging frequency in steps.")
     parser.add_argument("--seed", type=int, default=1000, help="Random seed.")
     parser.add_argument(
@@ -239,10 +258,127 @@ def resolve_resize_pad_config(args: argparse.Namespace) -> ResizePadConfig:
     )
 
 
-def resolve_output_dir(args: argparse.Namespace) -> Path:
-    if args.output_dir is not None:
+def format_run_timestamp(now: dt.datetime) -> str:
+    """Return a filesystem-safe, chronologically sortable local run timestamp."""
+    return now.strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def resolve_output_dir(
+    args: argparse.Namespace,
+    now: dt.datetime | None = None,
+) -> Path:
+    """Resolve the concrete directory that owns one training run.
+
+    New runs live below a dataset/policy parent in a timestamped directory. A
+    resumed run must name its existing concrete directory explicitly so there is
+    no ambiguity when several timestamped runs share the same parent.
+    """
+    if args.resume:
+        if args.output_dir is None:
+            raise ValueError(
+                "--resume requires --output-dir to point to the exact existing run directory."
+            )
         return args.output_dir.resolve()
-    return (DEFAULT_OUTPUT_ROOT / f"{args.dataset_root.name}_{args.policy_type}").resolve()
+
+    output_parent = (
+        args.output_dir
+        if args.output_dir is not None
+        else DEFAULT_OUTPUT_ROOT / f"{args.dataset_root.name}_{args.policy_type}"
+    ).resolve()
+    timestamp = format_run_timestamp(now if now is not None else dt.datetime.now())
+    return output_parent / timestamp
+
+
+def resolve_save_freq(total_steps: int, requested_save_freq: int | None) -> int:
+    """Choose the default checkpoint interval, or honor an explicit interval."""
+    if total_steps <= 0:
+        raise ValueError("--steps must be greater than 0.")
+    if requested_save_freq is not None and requested_save_freq <= 0:
+        raise ValueError("--save-freq must be greater than 0 when provided.")
+
+    minimum_save_freq = math.ceil(total_steps / DEFAULT_MAX_CHECKPOINTS)
+    if requested_save_freq is None:
+        return minimum_save_freq
+    return requested_save_freq
+
+
+class LocalTrainingLogger:
+    """Append step and epoch training metrics below a run's ``logs`` directory."""
+
+    def __init__(
+        self,
+        output_dir: Path,
+        num_samples_per_epoch: int,
+        initial_samples: int,
+    ) -> None:
+        if num_samples_per_epoch <= 0:
+            raise ValueError("Training dataset must contain at least one frame.")
+
+        self.logs_dir = output_dir / "logs"
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.step_log_path = self.logs_dir / "train_metrics.jsonl"
+        self.epoch_log_path = self.logs_dir / "epoch_metrics.jsonl"
+        self.num_samples_per_epoch = num_samples_per_epoch
+        self.epoch = initial_samples // num_samples_per_epoch + 1
+        self.samples_into_epoch = initial_samples % num_samples_per_epoch
+        self.epoch_loss_sum = 0.0
+        self.epoch_logged_samples = 0
+
+    @staticmethod
+    def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
+        with path.open("a", encoding="utf-8") as stream:
+            json.dump(record, stream, sort_keys=True)
+            stream.write("\n")
+
+    def log_step(self, metrics: dict[str, Any]) -> None:
+        self._append_jsonl(self.step_log_path, metrics)
+
+    def log_validation(self, step: int, epoch: float, val_loss: float) -> None:
+        """Append a validation result to both local metric streams."""
+        record = {
+            "record_type": "validation",
+            "step": step,
+            "epoch": epoch,
+            "val_loss": val_loss,
+        }
+        self._append_jsonl(self.step_log_path, record)
+        self._append_jsonl(self.epoch_log_path, record)
+
+    def update_epoch_loss(self, step: int, train_loss: float, sample_count: int) -> None:
+        """Assign a batch loss across any dataset-sized epoch boundaries it crosses."""
+        remaining_samples = sample_count
+        while remaining_samples > 0:
+            samples_to_boundary = self.num_samples_per_epoch - self.samples_into_epoch
+            samples_in_epoch = min(remaining_samples, samples_to_boundary)
+            self.epoch_loss_sum += train_loss * samples_in_epoch
+            self.epoch_logged_samples += samples_in_epoch
+            self.samples_into_epoch += samples_in_epoch
+            remaining_samples -= samples_in_epoch
+
+            if self.samples_into_epoch == self.num_samples_per_epoch:
+                self._write_epoch_record(step=step, complete=True)
+                self.epoch += 1
+                self.samples_into_epoch = 0
+                self.epoch_loss_sum = 0.0
+                self.epoch_logged_samples = 0
+
+    def log_partial_epoch(self, step: int) -> None:
+        """Persist the last incomplete epoch when training stops."""
+        if self.epoch_logged_samples > 0:
+            self._write_epoch_record(step=step, complete=False)
+
+    def _write_epoch_record(self, step: int, complete: bool) -> None:
+        record = {
+            "record_type": "train",
+            "epoch": self.epoch,
+            "step": step,
+            "train_loss": self.epoch_loss_sum / self.epoch_logged_samples,
+            "logged_samples": self.epoch_logged_samples,
+            "dataset_samples": self.num_samples_per_epoch,
+            "coverage_fraction": self.epoch_logged_samples / self.num_samples_per_epoch,
+            "complete": complete,
+        }
+        self._append_jsonl(self.epoch_log_path, record)
 
 
 def resolve_episode_split(args: argparse.Namespace, total_episodes: int) -> tuple[list[int], list[int]]:
@@ -295,6 +431,19 @@ def require_absolute_joint_action_dataset(dataset_root: Path) -> None:
 def load_action_config(dataset_root: Path) -> dict[str, Any]:
     action_config_path = dataset_root / ACTION_CONFIG_REL_PATH
     return json.loads(action_config_path.read_text())
+
+
+def write_policy_data_contract(
+    checkpoint_dir: Path,
+    dataset_info: dict[str, Any],
+    action_config: dict[str, Any],
+    trajectory_config: dict[str, Any],
+) -> None:
+    """Keep the hardware/data contract beside every independently loadable policy."""
+    policy_dir = checkpoint_dir / "pretrained_model"
+    write_checkpoint_deployment_metadata(
+        policy_dir, dataset_info, action_config, trajectory_config
+    )
 
 
 def build_dataloader(
@@ -404,7 +553,8 @@ def evaluate_validation_loss(
 def main() -> None:
     args = parse_args()
     ensure_runtime_env()
-    val_freq = args.save_freq if args.val_freq is None else args.val_freq
+    save_freq = resolve_save_freq(args.steps, args.save_freq)
+    val_freq = save_freq if args.val_freq is None else args.val_freq
 
     dataset_root = args.dataset_root.resolve()
     if not dataset_root.exists():
@@ -419,6 +569,8 @@ def main() -> None:
 
     require_absolute_joint_action_dataset(dataset_root)
     action_config = load_action_config(dataset_root)
+    trajectory_config = require_dataset_trajectory_config(dataset_root)
+    validate_action_trajectory_contract(action_config, trajectory_config)
     ensure_dataset_stats(args.dataset_repo_id, dataset_root)
 
     dataset_info = json.loads(dataset_info_path.read_text())
@@ -429,8 +581,10 @@ def main() -> None:
 
     if not train_episodes:
         raise ValueError("Training split is empty.")
-    if val_freq > 0 and not val_episodes:
-        raise ValueError("Validation is enabled but validation split is empty.")
+    if not val_episodes:
+        # A validation frequency alone does not create a validation split. Keep the
+        # default training command usable and only evaluate when held-out episodes exist.
+        val_freq = 0
 
     output_dir = resolve_output_dir(args)
     policy_cfg = build_policy_config(args)
@@ -457,7 +611,7 @@ def main() -> None:
         steps=args.steps,
         eval_freq=0,
         log_freq=args.log_freq,
-        save_freq=args.save_freq,
+        save_freq=save_freq,
         wandb=wandb_cfg,
     )
     cfg.validate()
@@ -480,13 +634,28 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
 
     if is_main_process:
+        print(f"Run output directory: {cfg.output_dir}")
         print(f"Train episodes: {train_episodes}")
         print(f"Validation episodes: {val_episodes}")
         print(f"Validation frequency: {val_freq}")
+        checkpoint_description = (
+            f"default target of {DEFAULT_MAX_CHECKPOINTS} checkpoints"
+            if args.save_freq is None
+            else "explicit save frequency"
+        )
+        print(
+            f"Checkpoint frequency: {save_freq} steps "
+            f"({checkpoint_description})"
+        )
         print(
             "Action representation: "
             f"arm={action_config.get('arm_action_representation')}, "
             f"gripper={action_config.get('gripper_action_representation')}"
+        )
+        print(
+            "Trajectory contract: "
+            f"{trajectory_config['end_effector']}/{trajectory_config['arm_mode']} "
+            f"{describe_trajectory_layout(trajectory_config)}"
         )
 
     train_dataset = make_dataset(cfg)
@@ -509,7 +678,7 @@ def main() -> None:
             steps=args.steps,
             eval_freq=0,
             log_freq=args.log_freq,
-            save_freq=args.save_freq,
+            save_freq=save_freq,
             wandb=wandb_cfg,
         )
         val_dataset = make_dataset(val_cfg)
@@ -578,6 +747,14 @@ def main() -> None:
         initial_step=step,
         accelerator=accelerator,
     )
+    local_logger = None
+    if is_main_process:
+        local_logger = LocalTrainingLogger(
+            output_dir=cfg.output_dir,
+            num_samples_per_epoch=train_dataset.num_frames,
+            initial_samples=int(train_tracker.samples),
+        )
+    accelerator.wait_for_everyone()
 
     train_iter = iter(train_dataloader)
     policy.train()
@@ -607,7 +784,31 @@ def main() -> None:
         step += 1
         train_tracker.step()
 
-        is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
+        reduced_step_stats = accelerator.reduce(
+            torch.tensor(
+                [
+                    train_tracker.loss.val * batch[ACTION].shape[0],
+                    float(batch[ACTION].shape[0]),
+                ],
+                device=device,
+                dtype=torch.float64,
+            ),
+            reduction="sum",
+        )
+        sample_count = int(round(reduced_step_stats[1].item()))
+        step_loss = reduced_step_stats[0].item() / max(1, sample_count)
+        if local_logger is not None:
+            local_logger.update_epoch_loss(
+                step=step,
+                train_loss=step_loss,
+                sample_count=sample_count,
+            )
+
+        is_log_step = (
+            cfg.log_freq > 0
+            and (step % cfg.log_freq == 0 or step == cfg.steps)
+            and is_main_process
+        )
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_val_step = val_freq > 0 and step % val_freq == 0 and val_dataloader is not None
 
@@ -620,6 +821,19 @@ def main() -> None:
             print(
                 f"{train_tracker} elapsed:{format_duration(elapsed_s)} eta:{format_duration(eta_s)}"
             )
+            local_log_dict = train_tracker.to_dict()
+            local_log_dict["record_type"] = "train"
+            if output_dict:
+                for key, value in output_dict.items():
+                    if isinstance(value, torch.Tensor) and value.numel() == 1:
+                        local_log_dict[f"policy_{key}"] = value.detach().item()
+                    elif isinstance(value, (bool, int, float)):
+                        local_log_dict[f"policy_{key}"] = value
+            local_log_dict["elapsed_s"] = elapsed_s
+            local_log_dict["eta_s"] = eta_s
+            local_log_dict["step_loss"] = step_loss
+            if local_logger is not None:
+                local_logger.log_step(local_log_dict)
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
@@ -642,6 +856,9 @@ def main() -> None:
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
                 )
+                write_policy_data_contract(
+                    checkpoint_dir, dataset_info, action_config, trajectory_config
+                )
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
@@ -657,8 +874,17 @@ def main() -> None:
             )
             if is_main_process:
                 print(f"validation step={step} loss={val_loss:.6f}")
+                if local_logger is not None:
+                    local_logger.log_validation(
+                        step=step,
+                        epoch=float(train_tracker.epochs),
+                        val_loss=val_loss,
+                    )
                 if wandb_logger:
                     wandb_logger.log_dict({"val_loss": val_loss}, step=step, mode="eval")
+
+    if local_logger is not None:
+        local_logger.log_partial_epoch(step=step)
 
 
 if __name__ == "__main__":

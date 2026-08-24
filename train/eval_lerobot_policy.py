@@ -14,9 +14,8 @@ DEFAULT_HF_DATASETS_CACHE = DEFAULT_HF_CACHE / "datasets"
 os.environ["HF_HOME"] = str(DEFAULT_HF_CACHE)
 os.environ["HF_DATASETS_CACHE"] = str(DEFAULT_HF_DATASETS_CACHE)
 
-DATA_COLLECTION_DIR = REPO_ROOT / "data_collection"
-if str(DATA_COLLECTION_DIR) not in sys.path:
-    sys.path.insert(0, str(DATA_COLLECTION_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from accelerate import Accelerator
 
@@ -24,15 +23,25 @@ from lerobot.configs.default import DatasetConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
-from image_preprocessing import ResizePadConfig, infer_square_resize_pad_size_from_policy_features
-from train_lerobot_policy import (
-    DEFAULT_DATASET_ROOT,
-    apply_dataset_image_transform,
-    build_dataloader,
-    ensure_runtime_env,
-    evaluate_validation_loss,
-    require_absolute_joint_action_dataset,
-)
+from utils.image_preprocessing import ResizePadConfig, infer_square_resize_pad_size_from_policy_features
+try:
+    from .train_lerobot_policy import (
+        DEFAULT_DATASET_ROOT,
+        apply_dataset_image_transform,
+        build_dataloader,
+        ensure_runtime_env,
+        evaluate_validation_loss,
+        require_absolute_joint_action_dataset,
+    )
+except ImportError:
+    from train_lerobot_policy import (
+        DEFAULT_DATASET_ROOT,
+        apply_dataset_image_transform,
+        build_dataloader,
+        ensure_runtime_env,
+        evaluate_validation_loss,
+        require_absolute_joint_action_dataset,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -139,10 +148,16 @@ def policy_type_matches(policy_type: str, requested_policy_type: str) -> bool:
 
 def discover_run_dirs(outputs_root: Path, requested_policy_type: str) -> list[Path]:
     run_dirs: list[Path] = []
-    for candidate in sorted(path for path in outputs_root.iterdir() if path.is_dir()):
-        checkpoint_root = candidate / "checkpoints"
-        if not checkpoint_root.exists():
+    if not outputs_root.exists():
+        return run_dirs
+
+    # New training runs are nested below a dataset/policy parent as
+    # ``<parent>/<timestamp>/checkpoints``. ``rglob`` also preserves discovery of
+    # legacy flat runs at ``<outputs-root>/<run>/checkpoints``.
+    for checkpoint_root in sorted(outputs_root.rglob("checkpoints")):
+        if not checkpoint_root.is_dir():
             continue
+        candidate = checkpoint_root.parent
         configs = sorted(checkpoint_root.glob("*/pretrained_model/config.json"))
         if not configs:
             continue

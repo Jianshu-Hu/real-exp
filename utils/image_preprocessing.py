@@ -1,3 +1,9 @@
+"""Provide shared aspect-preserving resize-and-pad transforms for policy images.
+
+Import ``ResizePadConfig`` and ``make_resize_pad_transform`` in training,
+evaluation, or deployment entry points that need the repository image contract.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

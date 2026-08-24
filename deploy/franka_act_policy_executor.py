@@ -1,28 +1,48 @@
+"""Run an ACT policy executor against the Franka ROS 2 deployment bridge.
+
+Usage:
+    python deploy/franka_act_policy_executor.py --policy-path outputs/my_policy
+
+Hardware warning: passing ``--execute`` enables commands to the real robots.
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle  # nosec
 import subprocess  # nosec
+import sys
 import threading
 import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 import torch
 
-# from lerobot.async_inference.configs import get_aggregate_function
 from lerobot.async_inference.helpers import RemotePolicyConfig, TimedAction, TimedObservation
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from deploy.action_aggregation import TemporalProposalAggregator
+from utils.trajectory_metadata import (
+    describe_trajectory_layout,
+    split_trajectory_vector,
+    validate_action_trajectory_contract,
+    validate_live_packet,
+)
+from utils.deployment_metadata import fetch_deployment_contract, metadata_url_from_server_address
+
+
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_DEPLOYMENT_LOG_ROOT = DEFAULT_OUTPUT_ROOT / "deployment_logs"
-DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
+DEFAULT_DEPLOYMENT_SERVER_IP = os.environ.get("DEPLOYMENT_SERVER_IP", "192.168.50.13")
 ACTION_CONFIG_REL_PATH = Path("meta/real_exp_action_config.json")
 INFO_REL_PATH = Path("meta/info.json")
 
@@ -55,9 +75,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Robot-side Franka executor for a remote ACT LeRobot policy server."
     )
-    parser.add_argument("--policy-path", type=Path, required=True)
-    parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
-    parser.add_argument("--server-address", default="127.0.0.1:8080")
+    parser.add_argument(
+        "--policy-path",
+        type=Path,
+        required=False,
+        help="Optional local checkpoint path for diagnostics; deployment metadata comes from the server.",
+    )
+    parser.add_argument("--server-address", default=f"{DEFAULT_DEPLOYMENT_SERVER_IP}:8080")
+    parser.add_argument("--metadata-address", default=None, help="Metadata HTTP endpoint or HOST:PORT; defaults to server port 8081.")
     parser.add_argument("--policy-device", default="cuda")
     parser.add_argument(
         "--actions-per-chunk",
@@ -67,9 +92,14 @@ def parse_args() -> argparse.Namespace:
             "Number of actions to request per deployment chunk. Defaults to the checkpoint chunk size."
         ),
     )
-    parser.add_argument("--zmq-host", default="127.0.0.1")
+    parser.add_argument("--zmq-host", default=DEFAULT_DEPLOYMENT_SERVER_IP)
     parser.add_argument("--zmq-port", type=int, default=5555)
-    parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Control rate. Defaults to server checkpoint metadata and must match it when specified.",
+    )
     parser.add_argument("--task", default="pick and place")
     parser.add_argument(
         "--act-chunk-size-threshold",
@@ -81,8 +111,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--command-zmq-host", default="127.0.0.1")
+    parser.add_argument("--command-zmq-host", default=DEFAULT_DEPLOYMENT_SERVER_IP)
     parser.add_argument("--command-zmq-port", type=int, default=5556)
+    parser.add_argument(
+        "--left-hand-command-address",
+        default="tcp://127.0.0.1:5561",
+        help="Robot-local Wuji left-hand command endpoint for hand trajectories.",
+    )
+    parser.add_argument(
+        "--right-hand-command-address",
+        default="tcp://127.0.0.1:5562",
+        help="Robot-local Wuji right-hand command endpoint for hand trajectories.",
+    )
     parser.add_argument("--bridge-activation-service", default="/set_deployment_active")
     parser.add_argument("--no-auto-activate-bridge", action="store_true")
     parser.add_argument(
@@ -97,12 +137,13 @@ def parse_args() -> argparse.Namespace:
         help="Optional deployment log run name. Defaults to a timestamp plus policy/chunk settings.",
     )
     parser.add_argument(
-        "--act-aggregate-ratio-old",
+        "--temporal-proposal-decay",
         type=float,
-        default=0.8,
+        default=0.5,
         help=(
-            "ACT-only weight assigned to the queued action when aggregating overlapping timesteps. "
-            "The blended action is old_ratio * old + (1 - old_ratio) * new."
+            "Exponential generation-age decay for overlapping action proposals. The newest "
+            "proposal has weight 1 and each older generation has weight decay**age. "
+            "Defaults to 0.5."
         ),
     )
     return parser.parse_args()
@@ -110,11 +151,6 @@ def parse_args() -> argparse.Namespace:
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
-
-
-def get_aggregate_function(old_ration: float) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Build an aggregate function from the queued-action ratio."""
-    return lambda old, new: old_ration * old + (1.0 - old_ration) * new
 
 
 def infer_policy_type(policy_path: Path) -> str:
@@ -167,28 +203,17 @@ def packet_to_raw_observation(packet: dict[str, Any], task: str) -> dict[str, An
     state = np.asarray(packet["state"], dtype=np.float32)
     raw_observation: dict[str, Any] = {f"state_{idx}": float(value) for idx, value in enumerate(state)}
     for camera_name in packet["camera_names"]:
-        raw_observation[camera_name] = np.asarray(packet["cameras"][camera_name]["rgb"], dtype=np.uint8)
+        camera = packet["cameras"][camera_name]
+        if "rgb" in camera:
+            raw_observation[camera_name] = np.asarray(camera["rgb"], dtype=np.uint8)
     raw_observation["task"] = task
     return raw_observation
 
 
-def split_action(action: np.ndarray | torch.Tensor) -> dict[str, Any]:
-    action = np.asarray(action, dtype=float)
-    if action.shape[0] == 16:
-        return {
-            "left_arm": action[0:7],
-            "left_gripper": float(action[7]),
-            "right_arm": action[8:15],
-            "right_gripper": float(action[15]),
-        }
-    if action.shape[0] == 14:
-        return {
-            "left_arm": action[0:7],
-            "left_gripper": None,
-            "right_arm": action[7:14],
-            "right_gripper": None,
-        }
-    raise ValueError(f"Unsupported action dimension: {action.shape[0]}")
+def split_action(
+    action: np.ndarray | torch.Tensor, trajectory_config: dict[str, Any]
+) -> dict[str, Any]:
+    return split_trajectory_vector(action, trajectory_config)
 
 
 def json_safe(value: Any) -> Any:
@@ -209,42 +234,37 @@ def json_safe(value: Any) -> Any:
 
 def default_run_name(args: argparse.Namespace) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    policy_name = args.policy_path.expanduser().name
+    policy_name = args.policy_path.expanduser().name if args.policy_path else "remote-policy"
     threshold = args.act_chunk_size_threshold
-    aggregate_ratio = args.act_aggregate_ratio_old
+    proposal_decay = args.temporal_proposal_decay
     return (
         f"{timestamp}_{policy_name}_act"
         f"_apc{args.actions_per_chunk or 'auto'}"
-        f"_thr{threshold:g}_{aggregate_ratio}"
+        f"_thr{threshold:g}_decay{proposal_decay:g}"
     )
 
 
 class FrankaPolicyExecutor:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.policy_path = args.policy_path.expanduser()
-        self.dataset_root = args.dataset_root.resolve()
+        self.policy_path = args.policy_path.expanduser() if args.policy_path else Path("<server-checkpoint>")
         local_policy_config = maybe_load_policy_config(self.policy_path)
-        if local_policy_config is not None:
-            self.policy_type = infer_policy_type(self.policy_path)
-        else:
-            self.policy_type = "act"
+        metadata_url = metadata_url_from_server_address(args.server_address, args.metadata_address)
+        self.deployment_contract = fetch_deployment_contract(metadata_url)
+        self.policy_type = str(self.deployment_contract["policy_type"])
+        if local_policy_config is not None and infer_policy_type(self.policy_path) != self.policy_type:
+            raise ValueError("Local checkpoint policy type disagrees with server deployment metadata.")
         if self.policy_type != "act":
             raise ValueError(
-                f"train/franka_act_policy_executor.py only supports ACT checkpoints, got {self.policy_type!r}."
+                f"deploy/franka_act_policy_executor.py only supports ACT checkpoints, got {self.policy_type!r}."
             )
 
         if args.actions_per_chunk is not None:
             if args.actions_per_chunk <= 0:
                 raise ValueError(f"--actions-per-chunk must be positive, got {args.actions_per_chunk}")
             self.actions_per_chunk = args.actions_per_chunk
-        elif local_policy_config is not None:
-            self.actions_per_chunk = infer_actions_per_chunk(self.policy_path, self.policy_type)
         else:
-            raise FileNotFoundError(
-                "Could not find a local policy config.json for --policy-path. "
-                "Pass --actions-per-chunk explicitly when the checkpoint only exists on the server."
-            )
+            self.actions_per_chunk = int(self.deployment_contract["actions_per_chunk"])
 
         if args.actions_per_chunk is not None and local_policy_config is not None:
             max_actions_per_chunk = infer_actions_per_chunk(self.policy_path, self.policy_type)
@@ -258,22 +278,28 @@ class FrankaPolicyExecutor:
             raise ValueError(
                 f"--act-chunk-size-threshold must be between 0 and 1, got {args.act_chunk_size_threshold}"
             )
-        if not 0.0 <= args.act_aggregate_ratio_old <= 1.0:
+        if not 0.0 <= args.temporal_proposal_decay <= 1.0:
             raise ValueError(
-                f"--act-aggregate-ratio-old must be between 0 and 1, got {args.act_aggregate_ratio_old}"
+                "--temporal-proposal-decay must be between 0 and 1, "
+                f"got {args.temporal_proposal_decay}"
             )
         self.chunk_size_threshold = args.act_chunk_size_threshold
-        self.aggregate_ratio_old = args.act_aggregate_ratio_old
-
-        self.aggregate_fn = get_aggregate_function(self.aggregate_ratio_old)
-        self.dataset_info = load_json(self.dataset_root / INFO_REL_PATH)
-        action_config_path = self.dataset_root / ACTION_CONFIG_REL_PATH
-        if not action_config_path.exists():
-            raise FileNotFoundError(
-                f"Missing action metadata: {action_config_path}. "
-                "Deployment requires meta/real_exp_action_config.json."
+        self.temporal_proposal_decay = args.temporal_proposal_decay
+        self.dataset_info = self.deployment_contract.get("dataset_info", {"fps": self.deployment_contract["fps"], "features": self.deployment_contract["features"]})
+        dataset_fps = float(self.deployment_contract["fps"])
+        if args.fps is not None and not np.isclose(float(args.fps), dataset_fps):
+            raise ValueError(
+                f"--fps={args.fps:g} does not match server checkpoint metadata fps={dataset_fps:g}."
             )
-        self.action_config = load_json(action_config_path)
+        self.fps = dataset_fps
+        self.action_config = self.deployment_contract["action_config"]
+        self.trajectory_config = self.deployment_contract["trajectory_config"]
+        validate_action_trajectory_contract(
+            self.action_config,
+            self.trajectory_config,
+            source=metadata_url,
+        )
+        self.dataset_action_dim = int(self.trajectory_config["action_dim"])
         if self._arm_action_representation() != "absolute_joint_position":
             raise ValueError(
                 "Deployment expects absolute_joint_position arm actions. "
@@ -286,16 +312,18 @@ class FrankaPolicyExecutor:
         self.send_bytes_in_chunks = send_bytes_in_chunks
         self.channel = grpc.insecure_channel(
             args.server_address,
-            grpc_channel_options(initial_backoff=f"{1.0 / args.fps:.4f}s"),
+            grpc_channel_options(initial_backoff=f"{1.0 / self.fps:.4f}s"),
         )
         self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
 
         self.action_queue: deque[TimedAction] = deque()
+        self.action_aggregator = TemporalProposalAggregator(self.temporal_proposal_decay)
         self.action_queue_lock = threading.Lock()
         self.inflight_observation_lock = threading.Lock()
         self.log_lock = threading.Lock()
         self.shutdown_event = threading.Event()
         self.command_socket = None
+        self.hand_command_sockets: dict[str, Any] = {}
         self.bridge_active = False
         self.latest_executed_timestep = -1
         self.must_go_pending = True
@@ -314,13 +342,13 @@ class FrankaPolicyExecutor:
 
     def _gripper_action_representation(self) -> str:
         return str(
-            self.action_config.get("gripper_action_representation", "binary_open_close")
+            self.action_config.get("gripper_action_representation", "absolute_width")
         ).strip().lower()
 
     def _joint_targets_from_action(self, split: dict[str, Any]) -> dict[str, list[float]]:
         return {
-            "left": np.asarray(split["left_arm"], dtype=float).tolist(),
-            "right": np.asarray(split["right_arm"], dtype=float).tolist(),
+            side: np.asarray(split[f"{side}_arm"], dtype=float).tolist()
+            for side in self.trajectory_config["arms"]
         }
 
     def _queue_snapshot(self) -> dict[str, Any]:
@@ -375,17 +403,15 @@ class FrankaPolicyExecutor:
             "policy_path": str(self.policy_path),
             "policy_type": self.policy_type,
             "server_address": self.args.server_address,
-            "dataset_root": str(self.dataset_root),
             "dataset_action_dim": dataset_action_dim,
             "live_robot_state_dim": int(first_packet["robot_state_dim"]),
             "live_action_dim": int(first_packet["action_dim"]),
             "camera_names": list(first_packet["camera_names"]),
             "actions_per_chunk": self.actions_per_chunk,
             "chunk_size_threshold": self.chunk_size_threshold,
-            "aggregate_ratio_old": self.aggregate_ratio_old,
+            "temporal_proposal_decay": self.temporal_proposal_decay,
             "act_chunk_size_threshold": self.args.act_chunk_size_threshold,
-            "act_aggregate_ratio_old": self.args.act_aggregate_ratio_old,
-            "fps": self.args.fps,
+            "fps": self.fps,
             "task": self.args.task,
             "execute": self.args.execute,
             "command_zmq": f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}",
@@ -513,21 +539,29 @@ class FrankaPolicyExecutor:
         queue_snapshot_after_pop: dict[str, Any],
     ) -> None:
         predicted_action = np.asarray(action.get_action(), dtype=float)
-        split = split_action(predicted_action)
+        split = split_action(predicted_action, self.trajectory_config)
         current_state = np.asarray(current_packet["state"], dtype=float)
-        state_split = split_action(current_state) if current_state.shape[0] in {14, 16} else None
+        state_split = split_action(current_state, self.trajectory_config)
         joint_targets = self._joint_targets_from_action(split)
         left_delta_from_state = None
         right_delta_from_state = None
         if state_split is not None:
             left_delta_from_state = (
-                np.asarray(joint_targets["left"], dtype=float)
-                - np.asarray(state_split["left_arm"], dtype=float)
-            ).tolist()
+                None
+                if "left" not in joint_targets
+                else (
+                    np.asarray(joint_targets["left"], dtype=float)
+                    - np.asarray(state_split["left_arm"], dtype=float)
+                ).tolist()
+            )
             right_delta_from_state = (
-                np.asarray(joint_targets["right"], dtype=float)
-                - np.asarray(state_split["right_arm"], dtype=float)
-            ).tolist()
+                None
+                if "right" not in joint_targets
+                else (
+                    np.asarray(joint_targets["right"], dtype=float)
+                    - np.asarray(state_split["right_arm"], dtype=float)
+                ).tolist()
+            )
 
         self._write_log_record(
             {
@@ -551,11 +585,12 @@ class FrankaPolicyExecutor:
         if value is None:
             return None
         representation = self._gripper_action_representation()
-        if representation == "binary_open_close":
-            return 1.0 if float(value) >= 0.5 else 0.0
         if representation == "absolute_width":
             return max(0.0, min(1.0, float(value)))
-        raise ValueError(f"Unsupported gripper action representation '{representation}' for bridge execution.")
+        raise ValueError(
+            "Deployment requires continuous gripper action representation 'absolute_width'; "
+            f"got {representation!r}. Retrain or regenerate action metadata instead of thresholding it."
+        )
 
     def _set_bridge_active(self, active: bool) -> None:
         if self.args.no_auto_activate_bridge:
@@ -572,7 +607,35 @@ class FrankaPolicyExecutor:
             "std_srvs/srv/SetBool",
             f"{{data: {state}}}",
         ]
-        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=5.0)  # nosec B603
+        ros_env = os.environ.copy()
+        ros_env.setdefault("ROS_DOMAIN_ID", "0")
+        ros_env["ROS_LOCALHOST_ONLY"] = "0"
+        ros_env["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "SUBNET"
+        last_timeout: subprocess.TimeoutExpired | None = None
+        for attempt in range(3):
+            try:
+                result = subprocess.run(  # nosec B603
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                    env=ros_env,
+                )
+                last_timeout = None
+                break
+            except subprocess.TimeoutExpired as exc:
+                last_timeout = exc
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"Timed out waiting for ROS 2 service {self.args.bridge_activation_service!r} "
+                        "after 3 attempts. The deployment bridge must be running in deployment mode "
+                        "and discoverable from this computer; verify ROS_DOMAIN_ID, "
+                        "RMW_IMPLEMENTATION, and ROS_LOCALHOST_ONLY on both hosts."
+                    ) from exc
+                time.sleep(1.0)
+        if last_timeout is not None:  # pragma: no cover - loop either returns or raises
+            raise RuntimeError("ROS 2 bridge activation did not produce a result.") from last_timeout
         if result.returncode != 0 or "success=True" not in result.stdout:
             raise RuntimeError(
                 f"Failed to {'activate' if active else 'deactivate'} bridge via "
@@ -585,11 +648,12 @@ class FrankaPolicyExecutor:
         lerobot_features = build_live_lerobot_features(first_packet)
         policy_config = RemotePolicyConfig(
             policy_type=self.policy_type,
-            pretrained_name_or_path=str(self.policy_path),
+            pretrained_name_or_path="",
             lerobot_features=lerobot_features,
             actions_per_chunk=self.actions_per_chunk,
             device=self.args.policy_device,
         )
+        policy_config.trajectory_config = self.trajectory_config
         self.stub.Ready(self.services_pb2.Empty())
         self.stub.SendPolicyInstructions(self.services_pb2.PolicySetup(data=pickle.dumps(policy_config)))  # nosec
 
@@ -611,32 +675,48 @@ class FrankaPolicyExecutor:
             queue_fraction = len(self.action_queue) / float(max(self.action_chunk_size, 1))
         return queue_fraction <= self.chunk_size_threshold
 
+    def _observation_debug_metadata(
+        self, observation: TimedObservation, current_packet: dict[str, Any]
+    ) -> dict[str, Any]:
+        camera_sync = current_packet.get("camera_sync") or {}
+        return {
+            "observation_timestep": observation.get_timestep(),
+            "camera_bundle_sequence": current_packet.get(
+                "camera_bundle_sequence", camera_sync.get("bundle_sequence")
+            ),
+            "bridge_publish_s": current_packet.get("bridge_publish_s"),
+            "robot_state_stamp_s": current_packet.get("robot_state_stamp_s"),
+            "robot_state_freshness": current_packet.get("robot_state_freshness"),
+            "camera_sync": camera_sync,
+            "camera_freshness": current_packet.get("camera_freshness"),
+            "executor_send_s": time.time(),
+        }
+
     def _aggregate_action_queue(self, incoming_actions: list[TimedAction]) -> dict[str, Any]:
         with self.action_queue_lock:
             current_queue = {action.get_timestep(): action for action in self.action_queue}
             latest_executed_timestep = self.latest_executed_timestep
+            generation = self.action_aggregator.begin_chunk()
 
             added = 0
             blended = 0
             dropped = 0
+            overlap_diagnostics = []
             for new_action in incoming_actions:
                 timestep = new_action.get_timestep()
                 if timestep <= latest_executed_timestep:
                     dropped += 1
                     continue
 
+                new_action.action = self.action_aggregator.add(
+                    timestep, generation, np.asarray(new_action.get_action(), dtype=np.float32)
+                )
                 if timestep not in current_queue:
-                    current_queue[timestep] = new_action
                     added += 1
-                    continue
-
-                old_action = current_queue[timestep]
-                old_tensor = torch.as_tensor(np.asarray(old_action.get_action(), dtype=np.float32))
-                new_tensor = torch.as_tensor(np.asarray(new_action.get_action(), dtype=np.float32))
-                blended_tensor = self.aggregate_fn(old_tensor, new_tensor)
-                new_action.action = blended_tensor.detach().cpu().numpy()
+                else:
+                    blended += 1
+                    overlap_diagnostics.append(self.action_aggregator.diagnostics(timestep))
                 current_queue[timestep] = new_action
-                blended += 1
 
             # Drop any stale timesteps again while still holding the queue lock, so an action
             # executed concurrently with chunk reception cannot be reinserted into the queue.
@@ -645,6 +725,7 @@ class FrankaPolicyExecutor:
                 dropped += len(stale_timesteps)
                 for timestep in stale_timesteps:
                     current_queue.pop(timestep, None)
+                    self.action_aggregator.discard(timestep)
 
             ordered_timesteps = sorted(current_queue)
             self.action_queue = deque(current_queue[timestep] for timestep in ordered_timesteps)
@@ -656,6 +737,8 @@ class FrankaPolicyExecutor:
             "queue_size": len(ordered_timesteps),
             "first_timestep": ordered_timesteps[0] if ordered_timesteps else None,
             "last_timestep": ordered_timesteps[-1] if ordered_timesteps else None,
+            "chunk_generation": generation,
+            "overlap_proposals": overlap_diagnostics,
         }
 
     def receive_actions(self) -> None:
@@ -728,6 +811,22 @@ class FrankaPolicyExecutor:
         self.command_socket.connect(f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}")
         print("Bridge command backend:", f"tcp://{self.args.command_zmq_host}:{self.args.command_zmq_port}")
 
+    def setup_hand_command_sockets(self, zmq_context: Any) -> None:
+        if not self.args.execute or self.trajectory_config["end_effector"] != "hand":
+            return
+        addresses = {
+            "left": self.args.left_hand_command_address,
+            "right": self.args.right_hand_command_address,
+        }
+        zmq = import_zmq_runtime()
+        for side in self.trajectory_config["arms"]:
+            socket = zmq_context.socket(zmq.PUSH)
+            socket.setsockopt(zmq.SNDHWM, 2)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.connect(addresses[side])
+            self.hand_command_sockets[side] = socket
+            print(f"{side.title()} Wuji hand command backend: {addresses[side]}")
+
     def _recv_latest_packet(self, socket: Any) -> tuple[dict[str, Any], int]:
         zmq = import_zmq_runtime()
         packet = socket.recv_pyobj()
@@ -740,17 +839,44 @@ class FrankaPolicyExecutor:
                 return packet, dropped
 
     def _command_payload_from_action(self, action: TimedAction) -> dict[str, Any]:
-        split = split_action(np.asarray(action.get_action(), dtype=float))
+        split = split_action(np.asarray(action.get_action(), dtype=float), self.trajectory_config)
         joint_targets = self._joint_targets_from_action(split)
-        left_gripper_command = self._gripper_command_from_action(split["left_gripper"])
-        right_gripper_command = self._gripper_command_from_action(split["right_gripper"])
-        return {
+        payload: dict[str, Any] = {
             "timestamp": time.time(),
-            "left_joint_target": joint_targets["left"],
-            "right_joint_target": joint_targets["right"],
-            "left_gripper_command": left_gripper_command,
-            "right_gripper_command": right_gripper_command,
+            **{f"{side}_joint_target": target for side, target in joint_targets.items()},
         }
+        if self.trajectory_config["end_effector"] == "gripper":
+            for side in self.trajectory_config["arms"]:
+                payload[f"{side}_gripper_command"] = self._gripper_command_from_action(
+                    split[f"{side}_gripper"]
+                )
+        elif self.trajectory_config["end_effector"] == "hand":
+            for side in self.trajectory_config["arms"]:
+                payload[f"{side}_hand_target"] = np.asarray(
+                    split[f"{side}_hand"], dtype=float
+                ).tolist()
+        return payload
+
+    def _validate_live_cameras(self, first_packet: dict[str, Any]) -> None:
+        dataset_cameras = {
+            key.removeprefix("observation.images.")
+            for key, feature in self.dataset_info["features"].items()
+            if key.startswith("observation.images.") and feature.get("dtype") in {"image", "video"}
+        }
+        live_cameras = set(first_packet.get("camera_names", ()))
+        missing = sorted(dataset_cameras - live_cameras)
+        unexpected = sorted(live_cameras - dataset_cameras)
+        if missing or unexpected:
+            details = []
+            if missing:
+                details.append("missing: " + ", ".join(missing))
+            if unexpected:
+                details.append("unexpected: " + ", ".join(unexpected))
+            raise ValueError(
+                "Live bridge camera set does not match server checkpoint metadata ("
+                + "; ".join(details)
+                + ")."
+            )
 
     def _send_bridge_command(self, payload: dict[str, Any]) -> None:
         if self.command_socket is None:
@@ -758,6 +884,8 @@ class FrankaPolicyExecutor:
 
         self._set_bridge_active(True)
         self.command_socket.send_pyobj(payload)
+        for side, socket in self.hand_command_sockets.items():
+            socket.send_pyobj(np.asarray(payload[f"{side}_hand_target"], dtype=float))
 
     def maybe_pop_action(self) -> tuple[TimedAction | None, dict[str, Any], dict[str, Any]]:
         with self.action_queue_lock:
@@ -766,6 +894,7 @@ class FrankaPolicyExecutor:
                 return None, queue_before, queue_before
             action = self.action_queue.popleft()
             self.latest_executed_timestep = action.get_timestep()
+            self.action_aggregator.discard(action.get_timestep())
             queue_after = self._queue_snapshot_unlocked()
         return action, queue_before, queue_after
 
@@ -779,16 +908,18 @@ class FrankaPolicyExecutor:
 
     def run(self) -> None:
         zmq = import_zmq_runtime()
-        dataset_action_dim = int(self.dataset_info["features"]["action"]["shape"][0])
+        dataset_action_dim = self.dataset_action_dim
         print("Franka policy executor")
         print("----------------------")
         print(f"policy_path: {self.policy_path}")
         print(f"policy_type: {self.policy_type}")
         print(f"server_address: {self.args.server_address}")
         print(f"dataset_action_dim: {dataset_action_dim}")
+        print(f"dataset_fps: {self.fps:g}")
         print(f"actions_per_chunk: {self.actions_per_chunk}")
         print(f"chunk_size_threshold: {self.chunk_size_threshold}")
-        print(f"aggregate_ratio_old: {self.aggregate_ratio_old}")
+        print(f"temporal_proposal_decay: {self.temporal_proposal_decay}")
+        print(f"trajectory_layout: {describe_trajectory_layout(self.trajectory_config)}")
         print(f"execute: {self.args.execute}")
 
         context = zmq.Context()
@@ -814,14 +945,13 @@ class FrankaPolicyExecutor:
             f"state_dim={first_packet['robot_state_dim']}, action_dim={first_packet['action_dim']}, "
             f"cameras={list(first_packet['camera_names'])}"
         )
-        if int(first_packet["action_dim"]) != dataset_action_dim:
-            raise ValueError(
-                f"Live bridge action_dim={first_packet['action_dim']} does not match dataset action_dim={dataset_action_dim}."
-            )
+        validate_live_packet(self.trajectory_config, first_packet)
+        self._validate_live_cameras(first_packet)
 
         self._init_log(first_packet, dataset_action_dim)
         self.connect_policy_server(first_packet)
         self.setup_command_bridge(context)
+        self.setup_hand_command_sockets(context)
         receiver_thread = threading.Thread(target=self.receive_actions, daemon=True)
         receiver_thread.start()
 
@@ -843,6 +973,9 @@ class FrankaPolicyExecutor:
                         observation=packet_to_raw_observation(current_packet, self.args.task),
                         timestep=observation_timestep,
                         must_go=must_go,
+                    )
+                    observation.deployment_debug = self._observation_debug_metadata(
+                        observation, current_packet
                     )
                     try:
                         self.send_observation(observation)
@@ -870,7 +1003,7 @@ class FrankaPolicyExecutor:
                         queue_after_pop,
                     )
 
-                sleep_time = max(0.0, (1.0 / self.args.fps) - (time.perf_counter() - loop_start))
+                sleep_time = max(0.0, (1.0 / self.fps) - (time.perf_counter() - loop_start))
                 time.sleep(sleep_time)
         except KeyboardInterrupt:
             print("\nStopping Franka policy executor...")
@@ -881,6 +1014,8 @@ class FrankaPolicyExecutor:
             self._set_bridge_active(False)
             if self.command_socket is not None:
                 self.command_socket.close(0)
+            for hand_socket in self.hand_command_sockets.values():
+                hand_socket.close(0)
             self._close_log()
             socket.close(0)
             context.term()

@@ -11,13 +11,16 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(LOCAL_LEROBOT_SRC) not in sys.path:
     sys.path.insert(0, str(LOCAL_LEROBOT_SRC))
 
-from dataset_stats import ensure_dataset_stats
+from utils.dataset_stats import ensure_dataset_stats
 
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
+TRAJECTORY_CONFIG_PATH = Path("meta/real_exp_trajectory_config.json")
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,10 +44,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--episode-indices",
-        type=int,
         nargs="+",
         default=None,
-        help="Space-separated episode indices to delete.",
+        help=(
+            "Comma/whitespace-separated episode indices to delete, supporting "
+            "inclusive ranges like 0,1,4-8,12."
+        ),
     )
     parser.add_argument(
         "--repo-id",
@@ -110,12 +115,39 @@ def load_action_config(dataset_root: Path) -> dict | None:
         return json.load(f)
 
 
+def parse_episode_selection(text: str, source: str) -> list[int]:
+    """Parse non-negative episode numbers and inclusive ranges."""
+    tokens = [token for token in text.replace(",", " ").split() if token]
+    if not tokens:
+        raise ValueError(f"No episode indices found in {source}.")
+
+    selected: set[int] = set()
+    for token in tokens:
+        if token.isdigit():
+            selected.add(int(token))
+            continue
+        if token.startswith("-") and token[1:].isdigit():
+            raise ValueError(f"Episode indices must be non-negative in {source}: {token!r}.")
+        parts = token.split("-")
+        if len(parts) == 2 and all(part.isdigit() for part in parts):
+            start, end = map(int, parts)
+            if start > end:
+                raise ValueError(f"Invalid episode range {token!r}: start must be <= end.")
+            selected.update(range(start, end + 1))
+            continue
+        raise ValueError(
+            f"Invalid episode token {token!r} in {source}. "
+            "Use non-negative integers or inclusive ranges like 4-8."
+        )
+    return sorted(selected)
+
+
 def collect_episode_indices(args: argparse.Namespace) -> list[int]:
     indices: list[int] = []
     if args.episode_indices_single:
         indices.extend(args.episode_indices_single)
     if args.episode_indices:
-        indices.extend(args.episode_indices)
+        indices.extend(parse_episode_selection(" ".join(args.episode_indices), "--episode-indices"))
 
     if not indices:
         raise ValueError("At least one episode index must be provided.")
@@ -142,13 +174,11 @@ def resolve_repo_id(dataset_root: Path, repo_id: str | None) -> str:
 
 
 def copy_optional_metadata(source_root: Path, target_root: Path) -> None:
-    source_action_config = source_root / ACTION_CONFIG_PATH
-    if not source_action_config.exists():
-        return
-
-    target_action_config = target_root / ACTION_CONFIG_PATH
-    target_action_config.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_action_config, target_action_config)
+    target_root.joinpath("meta").mkdir(parents=True, exist_ok=True)
+    for relative_path in (ACTION_CONFIG_PATH, TRAJECTORY_CONFIG_PATH):
+        source_path = source_root / relative_path
+        if source_path.exists():
+            shutil.copy2(source_path, target_root / relative_path)
 
 
 def load_frame_episode_indices(dataset_root: Path) -> list[int] | None:

@@ -4,3 +4,6 @@
 [submodule "gello_software"]
 	path = gello_software
 	url = https://github.com/Jianshu-Hu/gello_software.git
+[submodule "libs/wuji-retargeting"]
+	path = libs/wuji-retargeting
+	url = https://github.com/wuji-technology/wuji-retargeting.git

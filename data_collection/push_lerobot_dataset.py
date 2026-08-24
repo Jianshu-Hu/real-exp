@@ -9,12 +9,14 @@ from huggingface_hub import HfApi
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(LOCAL_LEROBOT_SRC) not in sys.path:
     sys.path.insert(0, str(LOCAL_LEROBOT_SRC))
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-from dataset_stats import ensure_dataset_stats
+from utils.dataset_stats import ensure_dataset_stats
 
 INFO_PATH = Path("meta/info.json")
 TASKS_PATH = Path("meta/tasks.parquet")
@@ -24,6 +26,7 @@ CRITICAL_METADATA_FILES = [
     Path("meta/tasks.parquet"),
     Path("meta/stats.json"),
     Path("meta/real_exp_action_config.json"),
+    Path("meta/real_exp_trajectory_config.json"),
 ]
 DATASET_ALLOW_PATTERNS = [
     "README.md",
@@ -99,7 +102,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Do not explicitly upload meta/info.json, meta/tasks.parquet, meta/stats.json, "
-            "and meta/real_exp_action_config.json after the normal LeRobot push."
+            "meta/real_exp_action_config.json, and meta/real_exp_trajectory_config.json "
+            "after the normal LeRobot push."
         ),
     )
     return parser.parse_args()

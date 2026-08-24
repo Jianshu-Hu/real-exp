@@ -32,6 +32,27 @@ EOF
 }
 die() { echo "Error: $*" >&2; exit 1; }
 validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535)); }
+check_port_available() {
+  local port="$1" label="$2"
+  command -v ss >/dev/null 2>&1 || return 0
+  if ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
+    die "${label} port ${port} is already in use; stop the existing service or choose another port"
+  fi
+}
+clear_port() {
+  local port="$1"
+  command -v fuser >/dev/null 2>&1 || return 0
+  if ! fuser -n tcp "${port}" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Clearing existing policy service on tcp port ${port}." >&2
+  fuser -TERM -k -n tcp "${port}" >/dev/null 2>&1 || true
+  for _ in {1..10}; do
+    fuser -n tcp "${port}" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  fuser -KILL -k -n tcp "${port}" >/dev/null 2>&1 || true
+}
 
 policy_path=""; metadata_port=8081; requested_fps=""
 server_ip="${DEPLOYMENT_SERVER_IP:-192.168.50.13}"
@@ -78,6 +99,12 @@ validate_port "${metadata_port}" || die "invalid metadata port: ${metadata_port}
    "${metadata_port}" != "${camera_cache_port}" && "${metadata_port}" != "${policy_port}" && \
    "${metadata_port}" != "${hand_telemetry_port}" ]] || die "deployment ports must be distinct"
 
+# A previous policy process commonly survives an interrupted deployment. Clear
+# only the configured policy port before starting any ROS or policy children.
+if [[ "${print_config}" -eq 0 ]]; then
+  clear_port "${policy_port}"
+fi
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
 policy_path="$(cd -- "${policy_path}" 2>/dev/null && pwd)" || die "policy path not found: ${policy_path}"
@@ -114,6 +141,15 @@ if [[ "${print_config}" -eq 1 ]]; then
     "${camera_left}" "${camera_front}" "${camera_right}" "${server_ip}" "${metadata_port}"
   exit 0
 fi
+# Fail before starting ROS processes when a previous deployment (or another
+# service) still owns one of the server-side TCP ports.
+check_port_available "${publish_port}" "observation"
+check_port_available "${command_port}" "command"
+check_port_available "${camera_cache_port}" "camera cache"
+check_port_available "${policy_port}" "policy"
+check_port_available "${metadata_port}" "metadata"
+check_port_available "${hand_telemetry_port}" "hand telemetry"
+
 # shellcheck source=scripts/conda_env.sh
 source "${script_dir}/conda_env.sh"
 if [[ -n "${ros_distro}" ]]; then

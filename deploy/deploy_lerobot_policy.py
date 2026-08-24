@@ -922,7 +922,12 @@ def serve_deployment_policy_server(
         def log_message(self, format, *args):
             return
 
-    metadata_server = ThreadingHTTPServer((cfg.host, metadata_port), MetadataHandler)
+    class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+        # Permit immediate restart after a controlled shutdown while still
+        # allowing bind() to fail when another live process owns the port.
+        allow_reuse_address = True
+
+    metadata_server = ReusableThreadingHTTPServer((cfg.host, metadata_port), MetadataHandler)
     metadata_thread = threading.Thread(target=metadata_server.serve_forever, daemon=True)
     metadata_thread.start()
 

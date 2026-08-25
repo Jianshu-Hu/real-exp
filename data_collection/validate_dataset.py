@@ -452,6 +452,92 @@ def check_state_action_semantics(
     return issues, metrics
 
 
+def check_ee_state_action_semantics(
+    rows: list[dict[str, Any]],
+    trajectory_config: dict[str, Any],
+    tolerance: float,
+) -> tuple[list[str], dict[str, Any]]:
+    """Validate persisted EE observations/actions alongside the primary vectors."""
+    arms = list(trajectory_config["arms"])
+    pose_dim = 6 * len(arms)
+    state_action_mode = str(trajectory_config.get("state_action_mode", "joint")).strip().lower()
+    issues: list[str] = []
+    metrics = {
+        "ee_state_missing_frames": [],
+        "ee_action_missing_frames": [],
+        "ee_layout_invalid_frames": [],
+        "ee_state_mismatch_frames": [],
+        "ee_action_mismatch_frames": [],
+        "max_ee_state_error": 0.0,
+        "max_ee_action_error": 0.0,
+    }
+    for row in sorted(rows, key=lambda item: int(item["frame_index"])):
+        frame_index = int(row["frame_index"])
+        ee_state = flatten_numeric(row.get("observation.ee_pose"))
+        ee_action = flatten_numeric(row.get("action.delta_ee_pose"))
+        if len(ee_state) != pose_dim or has_non_finite(ee_state):
+            metrics["ee_state_missing_frames"].append(frame_index)
+        if len(ee_action) != pose_dim or has_non_finite(ee_action):
+            metrics["ee_action_missing_frames"].append(frame_index)
+        if (
+            len(ee_state) != pose_dim
+            or has_non_finite(ee_state)
+            or len(ee_action) != pose_dim
+            or has_non_finite(ee_action)
+        ):
+            continue
+
+        state = flatten_numeric(row.get("observation.state"))
+        action = flatten_numeric(row.get("action"))
+        if state_action_mode == "end_effector" and len(state) >= pose_dim:
+            try:
+                state_layout, _ = trajectory_vector_layout(trajectory_config, len(state))
+                action_layout, _ = trajectory_vector_layout(trajectory_config, len(action))
+            except ValueError:
+                metrics["ee_layout_invalid_frames"].append(frame_index)
+                continue
+            state_pose = np.concatenate([np.asarray(state[state_layout[side]]) for side in arms])
+            action_pose = np.concatenate([np.asarray(action[action_layout[side]]) for side in arms])
+            state_error = float(np.max(np.abs(np.asarray(ee_state) - state_pose)))
+            metrics["max_ee_state_error"] = max(metrics["max_ee_state_error"], state_error)
+            if state_error > tolerance:
+                metrics["ee_state_mismatch_frames"].append(frame_index)
+            if len(action) >= pose_dim:
+                action_error = float(np.max(np.abs(np.asarray(ee_action) - action_pose)))
+                metrics["max_ee_action_error"] = max(metrics["max_ee_action_error"], action_error)
+                if action_error > tolerance:
+                    metrics["ee_action_mismatch_frames"].append(frame_index)
+
+    if metrics["ee_state_missing_frames"]:
+        issues.append(
+            "missing or non-finite observation.ee_pose at frames "
+            f"{metrics['ee_state_missing_frames'][:10]}"
+        )
+    if metrics["ee_action_missing_frames"]:
+        issues.append(
+            "missing or non-finite action.delta_ee_pose at frames "
+            f"{metrics['ee_action_missing_frames'][:10]}"
+        )
+    if metrics["ee_layout_invalid_frames"]:
+        issues.append(
+            "observation.state/action layout is invalid for EE validation at frames "
+            f"{metrics['ee_layout_invalid_frames'][:10]}"
+        )
+    if metrics["ee_state_mismatch_frames"]:
+        issues.append(
+            "observation.ee_pose disagrees with observation.state at frames "
+            f"{metrics['ee_state_mismatch_frames'][:10]} (max error "
+            f"{metrics['max_ee_state_error']:.6g})"
+        )
+    if metrics["ee_action_mismatch_frames"]:
+        issues.append(
+            "action.delta_ee_pose disagrees with action at frames "
+            f"{metrics['ee_action_mismatch_frames'][:10]} (max error "
+            f"{metrics['max_ee_action_error']:.6g})"
+        )
+    return issues, metrics
+
+
 def format_sampled_state_warning(
     arm_name: str,
     counts: TrajectoryViolationCounts,
@@ -866,6 +952,17 @@ def validate_dataset(
 
     issues: list[str] = []
     warning_issues: list[str] = [processing_warning] if processing_warning else []
+    expected_ee_dim = 6 * len(trajectory_config["arms"])
+    ee_state_dim = get_feature_dim(info, "observation.ee_pose")
+    ee_action_dim = get_feature_dim(info, "action.delta_ee_pose")
+    if ee_state_dim != expected_ee_dim:
+        issues.append(
+            f"observation.ee_pose feature dimension {ee_state_dim!r} != expected {expected_ee_dim}"
+        )
+    if ee_action_dim != expected_ee_dim:
+        issues.append(
+            f"action.delta_ee_pose feature dimension {ee_action_dim!r} != expected {expected_ee_dim}"
+        )
 
     episode_indices = [int(row["episode_index"]) for row in episodes]
     data_episode_indices = sorted(data_by_episode)
@@ -902,6 +999,11 @@ def validate_dataset(
     total_gripper_outlier_frames = 0
     gripper_checks_enabled = False
     total_non_finite_frames = 0
+    total_ee_state_missing_frames = 0
+    total_ee_action_missing_frames = 0
+    total_ee_layout_invalid_frames = 0
+    total_ee_state_mismatch_frames = 0
+    total_ee_action_mismatch_frames = 0
     total_state_safety_violation_steps = 0
     total_state_motion_warning_steps = 0
     total_action_safety_violation_steps = 0
@@ -1003,6 +1105,18 @@ def validate_dataset(
         )
         episode_issues.extend(semantic_issues)
 
+        ee_issues, ee_metrics = check_ee_state_action_semantics(
+            rows,
+            trajectory_config,
+            tolerance=delta_action_tolerance,
+        )
+        episode_issues.extend(ee_issues)
+        total_ee_state_missing_frames += len(ee_metrics["ee_state_missing_frames"])
+        total_ee_action_missing_frames += len(ee_metrics["ee_action_missing_frames"])
+        total_ee_layout_invalid_frames += len(ee_metrics["ee_layout_invalid_frames"])
+        total_ee_state_mismatch_frames += len(ee_metrics["ee_state_mismatch_frames"])
+        total_ee_action_mismatch_frames += len(ee_metrics["ee_action_mismatch_frames"])
+
         max_left_arm_delta = max(max_left_arm_delta, float(semantic_metrics["max_left_arm_delta"]))
         max_right_arm_delta = max(max_right_arm_delta, float(semantic_metrics["max_right_arm_delta"]))
         max_delta_action_error = max(max_delta_action_error, float(semantic_metrics["delta_action_max_error"]))
@@ -1064,6 +1178,15 @@ def validate_dataset(
     else:
         print("  gripper range check: skipped (trajectory has no gripper)")
     print(f"  non-finite state/action frames: {total_non_finite_frames}")
+    if str(trajectory_config.get("state_action_mode", "joint")) == "end_effector":
+        print(
+            "  EE state/action fields: "
+            f"missing_state={total_ee_state_missing_frames}, "
+            f"missing_action={total_ee_action_missing_frames}, "
+            f"invalid_layout={total_ee_layout_invalid_frames}, "
+            f"state_mismatch={total_ee_state_mismatch_frames}, "
+            f"action_mismatch={total_ee_action_mismatch_frames}"
+        )
     if arm_action_representation == "delta_joint_position":
         print(f"  delta-action tolerance: {delta_action_tolerance:.6g}")
         print(f"  max delta-action error: {max_delta_action_error:.6g}")

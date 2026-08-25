@@ -382,6 +382,29 @@ def trim_initial_static_segments(args: argparse.Namespace) -> int:
                     file_index=file_index,
                 )
                 destination_video.parent.mkdir(parents=True, exist_ok=True)
+
+                # Preserve video files that do not contain an actual trim. Besides
+                # being substantially faster, this avoids generational quality loss
+                # and does not make unrelated source-video damage a prerequisite for
+                # trimming episodes stored in another file.
+                if not any(trim_plan[index].trim_frames for index in episode_ids):
+                    shutil.copy2(source_video, destination_video)
+                    for index in sorted(episode_ids):
+                        episode = source_meta.episodes[index]
+                        video_metadata[index].update(
+                            {
+                                f"videos/{video_key}/chunk_index": chunk,
+                                f"videos/{video_key}/file_index": file_index,
+                                f"videos/{video_key}/from_timestamp": episode[
+                                    f"videos/{video_key}/from_timestamp"
+                                ],
+                                f"videos/{video_key}/to_timestamp": episode[
+                                    f"videos/{video_key}/to_timestamp"
+                                ],
+                            }
+                        )
+                    continue
+
                 ranges: list[tuple[int, int]] = []
                 cumulative = 0.0
                 for index in sorted(episode_ids):

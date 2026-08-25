@@ -71,6 +71,8 @@ class EpisodeData:
     })
     ee_poses: np.ndarray | None = None
     delta_ee_poses: np.ndarray | None = None
+    joint_states: np.ndarray | None = None
+    target_joints: np.ndarray | None = None
     replay_mode: str | None = None
 
 
@@ -331,17 +333,20 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
     ee_mode = str(trajectory_config.get("state_action_mode", "joint")).strip().lower() == "end_effector"
     available_columns = set(pq.read_schema(parquet_files[0]).names)
     ee_columns_available = {"observation.ee_pose", "action.delta_ee_pose"}.issubset(available_columns)
+    joint_columns_available = {"observation.joint_state", "action.target_joint"}.issubset(available_columns)
     if ee_mode and not ee_columns_available:
         raise ValueError(
             "End-effector replay requires observation.ee_pose and action.delta_ee_pose dataset fields."
         )
 
-    rows: list[tuple[int, float, list[float], list[float], list[float] | None, list[float] | None]] = []
+    rows: list[tuple[int, float, list[float], list[float], list[float] | None, list[float] | None, list[float] | None, list[float] | None]] = []
     available_episodes: set[int] = set()
     for parquet_file in parquet_files:
         columns = ["episode_index", "frame_index", "timestamp", "observation.state", "action"]
         if ee_columns_available:
             columns.extend(["observation.ee_pose", "action.delta_ee_pose"])
+        if joint_columns_available:
+            columns.extend(["observation.joint_state", "action.target_joint"])
         table = pq.read_table(parquet_file, columns=columns)
         data = table.to_pydict()
         values = [
@@ -350,14 +355,20 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
         ]
         if ee_columns_available:
             values.extend([data["observation.ee_pose"], data["action.delta_ee_pose"]])
+        if joint_columns_available:
+            values.extend([data["observation.joint_state"], data["action.target_joint"]])
         for row_values in zip(*values, strict=True):
             row_episode, frame_index, timestamp, state, action = row_values[:5]
-            ee_pose = row_values[5] if ee_columns_available else None
-            delta_ee_pose = row_values[6] if ee_columns_available else None
+            cursor = 5
+            ee_pose = row_values[cursor] if ee_columns_available else None
+            delta_ee_pose = row_values[cursor + 1] if ee_columns_available else None
+            cursor += 2 if ee_columns_available else 0
+            joint_state = row_values[cursor] if joint_columns_available else None
+            target_joint = row_values[cursor + 1] if joint_columns_available else None
             available_episodes.add(int(row_episode))
             if int(row_episode) != episode_index:
                 continue
-            rows.append((int(frame_index), float(timestamp), state, action, ee_pose, delta_ee_pose))
+            rows.append((int(frame_index), float(timestamp), state, action, ee_pose, delta_ee_pose, joint_state, target_joint))
 
     if not rows:
         raise ValueError(f"Episode {episode_index} not found. Available episodes: {sorted(available_episodes)}")
@@ -395,6 +406,24 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
     else:
         ee_poses = None
         delta_ee_poses = None
+    if joint_columns_available:
+        expected_joint_dim = 7 * len(trajectory_config["arms"])
+        if trajectory_config["end_effector"] == "gripper":
+            expected_joint_dim += len(trajectory_config["arms"])
+        elif trajectory_config["end_effector"] == "hand":
+            expected_joint_dim += 20 * len(trajectory_config["arms"])
+        joint_states = np.asarray([row[6] for row in rows], dtype=float)
+        target_joints = np.asarray([row[7] for row in rows], dtype=float)
+        if (
+            joint_states.shape != (len(rows), expected_joint_dim)
+            or target_joints.shape != (len(rows), expected_joint_dim)
+            or not np.all(np.isfinite(joint_states))
+            or not np.all(np.isfinite(target_joints))
+        ):
+            raise ValueError("Replay requires finite joint state/target fields with the expected layout.")
+    else:
+        joint_states = None
+        target_joints = None
 
     return EpisodeData(
         states=states,
@@ -405,6 +434,8 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
         action_config=action_config,
         ee_poses=ee_poses,
         delta_ee_poses=delta_ee_poses,
+        joint_states=joint_states,
+        target_joints=target_joints,
         trajectory_config=trajectory_config,
     )
 
@@ -413,10 +444,9 @@ def resolve_replay_mode(data: EpisodeData, requested_mode: str | None) -> str:
     dataset_mode = str(data.trajectory_config.get("state_action_mode", "joint")).strip().lower()
     default_mode = "ee" if dataset_mode == "end_effector" else "joint"
     replay_mode = default_mode if requested_mode is None else requested_mode
-    if replay_mode == "joint" and dataset_mode != "joint":
+    if replay_mode == "joint" and data.joint_states is None:
         raise ValueError(
-            "--replay-mode joint requires a joint-mode dataset because dedicated joint "
-            "state/action fields are not stored separately."
+            "--replay-mode joint requires observation.joint_state and action.target_joint fields."
         )
     if replay_mode == "ee" and (data.ee_poses is None or data.delta_ee_poses is None):
         raise ValueError(
@@ -444,6 +474,8 @@ def select_frame_range(data: EpisodeData, start_frame: int, end_frame: int | Non
         action_config=data.action_config,
         ee_poses=None if data.ee_poses is None else data.ee_poses[indices],
         delta_ee_poses=None if data.delta_ee_poses is None else data.delta_ee_poses[indices],
+        joint_states=None if data.joint_states is None else data.joint_states[indices],
+        target_joints=None if data.target_joints is None else data.target_joints[indices],
         trajectory_config=data.trajectory_config,
         replay_mode=data.replay_mode,
     )
@@ -454,6 +486,7 @@ def split_targets(data: EpisodeData, *, source_kind: str = "action") -> dict[str
         raise ValueError(f"Unsupported target source {source_kind!r}; expected state or action.")
     source = data.states if source_kind == "state" else data.actions
     ee_source = data.ee_poses if source_kind == "state" else data.delta_ee_poses
+    joint_source = data.joint_states if source_kind == "state" else data.target_joints
     arm_mode = str(data.trajectory_config["arm_mode"])
     end_effector = str(data.trajectory_config["end_effector"])
     dataset_mode = str(data.trajectory_config.get("state_action_mode", "joint"))
@@ -461,10 +494,13 @@ def split_targets(data: EpisodeData, *, source_kind: str = "action") -> dict[str
     replay_mode = data.replay_mode or ("ee" if dataset_mode == "end_effector" else "joint")
     result: dict[str, np.ndarray] = {}
     offset = 0
+    joint_offset = 0
     ee_offset = 0
     arms = ["left", "right"] if arm_mode == "duo" else [arm_mode]
     for side in arms:
         stored_arm_values = source[:, offset : offset + stored_arm_size]
+        if replay_mode == "joint" and joint_source is not None:
+            stored_arm_values = np.asarray(joint_source[:, joint_offset : joint_offset + 7], dtype=float)
         if replay_mode == "ee":
             if ee_source is None:
                 raise ValueError(
@@ -479,11 +515,23 @@ def split_targets(data: EpisodeData, *, source_kind: str = "action") -> dict[str
             result[f"{side}_delta_ee_pose"] = arm_values
         offset += stored_arm_size
         if end_effector == "gripper":
-            result[f"{side}_gripper_raw"] = source[:, offset]
+            result[f"{side}_gripper_raw"] = (
+                joint_source[:, joint_offset + 7]
+                if replay_mode == "joint" and joint_source is not None
+                else source[:, offset]
+            )
             offset += 1
+            joint_offset += 8
         elif end_effector == "hand":
-            result[f"{side}_hand"] = source[:, offset : offset + 20]
+            result[f"{side}_hand"] = (
+                joint_source[:, joint_offset + 7 : joint_offset + 27]
+                if replay_mode == "joint" and joint_source is not None
+                else source[:, offset : offset + 20]
+            )
             offset += 20
+            joint_offset += 27
+        else:
+            joint_offset += 7
     if offset != source.shape[1]:
         raise ValueError(
             f"Trajectory layout {end_effector}/{arm_mode} consumes {offset} values, "
@@ -527,6 +575,8 @@ def print_dry_run_summary(
         states=data.states, actions=data.states, frame_indices=data.frame_indices,
         timestamps=data.timestamps, fps=data.fps, action_config=data.action_config,
         trajectory_config=data.trajectory_config,
+        ee_poses=data.ee_poses, delta_ee_poses=data.delta_ee_poses,
+        joint_states=data.joint_states, target_joints=data.target_joints,
     )
     state_data.replay_mode = replay_mode
     initial_states = split_targets(state_data, source_kind="state")
@@ -957,6 +1007,8 @@ def move_hands_to_initial_state(
         fps=data.fps,
         action_config=data.action_config,
         trajectory_config=data.trajectory_config,
+        ee_poses=data.ee_poses, delta_ee_poses=data.delta_ee_poses,
+        joint_states=data.joint_states, target_joints=data.target_joints,
     )
     state_data.replay_mode = data.replay_mode
     initial_states = split_targets(state_data, source_kind="state")
@@ -1093,6 +1145,8 @@ def move_arms_to_initial_state(
         states=data.states, actions=data.states, frame_indices=data.frame_indices,
         timestamps=data.timestamps, fps=data.fps, action_config=data.action_config,
         trajectory_config=data.trajectory_config,
+        ee_poses=data.ee_poses, delta_ee_poses=data.delta_ee_poses,
+        joint_states=data.joint_states, target_joints=data.target_joints,
     )
     replay_mode = data.replay_mode or resolve_replay_mode(data, None)
     state_data.replay_mode = replay_mode

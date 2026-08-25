@@ -51,6 +51,12 @@ from utils.trajectory_metadata import (
     validate_action_trajectory_contract,
 )
 from utils.deployment_metadata import write_checkpoint_deployment_metadata
+from utils.mode_aware_dataset import (
+    adapt_dataset_for_mode,
+    mode_action_config,
+    mode_trajectory_config,
+    normalize_training_mode,
+)
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
@@ -432,13 +438,24 @@ def require_state_action_mode_dataset(dataset_root: Path, requested_mode: str | 
     if not trajectory_path.exists():
         raise FileNotFoundError(f"Missing trajectory metadata: {trajectory_path}")
     trajectory_config = json.loads(trajectory_path.read_text())
-    mode = str(trajectory_config.get("state_action_mode", "joint")).strip().lower()
-    if requested_mode is not None and mode != requested_mode:
-        raise ValueError(
-            f"Requested --state-action-mode={requested_mode!r}, but dataset declares {mode!r}."
-        )
     validate_action_trajectory_contract(action_config, trajectory_config)
-    return trajectory_config
+    info = json.loads((dataset_root / "meta" / "info.json").read_text())
+    source_mode = normalize_training_mode(
+        trajectory_config.get("state_action_mode", "joint"), "joint"
+    )
+    mode = normalize_training_mode(requested_mode, source_mode)
+    if mode == source_mode:
+        return trajectory_config
+    selected_key = "observation.ee_pose" if mode == "end_effector" else "observation.joint_state"
+    selected_action_key = "action.delta_ee_pose" if mode == "end_effector" else "action.target_joint"
+    selected_state_dim = int(info["features"][selected_key]["shape"][0])
+    selected_action_dim = int(info["features"][selected_action_key]["shape"][0])
+    return mode_trajectory_config(
+        trajectory_config,
+        mode,
+        state_dim=selected_state_dim,
+        action_dim=selected_action_dim,
+    )
 
 
 def require_absolute_joint_action_dataset(dataset_root: Path) -> None:
@@ -585,17 +602,20 @@ def main() -> None:
     if not dataset_info_path.exists():
         raise FileNotFoundError(f"Missing dataset metadata: {dataset_info_path}")
 
-    action_config = load_action_config(dataset_root)
+    source_action_config = load_action_config(dataset_root)
+    source_trajectory_config = require_dataset_trajectory_config(dataset_root)
     trajectory_config = require_state_action_mode_dataset(dataset_root, args.state_action_mode)
-    trajectory_config = require_dataset_trajectory_config(dataset_root)
-    validate_action_trajectory_contract(action_config, trajectory_config)
+    selected_mode = normalize_training_mode(
+        trajectory_config.get("state_action_mode"),
+        str(source_trajectory_config.get("state_action_mode", "joint")),
+    )
+    action_config = mode_action_config(source_action_config, selected_mode, trajectory_config)
     ensure_dataset_stats(args.dataset_repo_id, dataset_root)
 
-    dataset_info = json.loads(dataset_info_path.read_text())
-    total_episodes = int(dataset_info["total_episodes"])
+    source_dataset_info = json.loads(dataset_info_path.read_text())
+    total_episodes = int(source_dataset_info["total_episodes"])
     train_episodes, val_episodes = resolve_episode_split(args, total_episodes)
     resize_pad_config = resolve_resize_pad_config(args)
-    apply_resize_pad_to_feature_specs(dataset_info["features"], resize_pad_config)
 
     if not train_episodes:
         raise ValueError("Training split is empty.")
@@ -676,8 +696,9 @@ def main() -> None:
             f"{describe_trajectory_layout(trajectory_config)}"
         )
 
-    train_dataset = make_dataset(cfg)
+    train_dataset = adapt_dataset_for_mode(make_dataset(cfg), selected_mode)
     apply_dataset_image_transform(train_dataset, resize_pad_config)
+    dataset_info = json.loads(json.dumps(train_dataset.meta.info))
     val_dataset = None
     if val_episodes:
         val_cfg = TrainPipelineConfig(
@@ -699,7 +720,7 @@ def main() -> None:
             save_freq=save_freq,
             wandb=wandb_cfg,
         )
-        val_dataset = make_dataset(val_cfg)
+        val_dataset = adapt_dataset_for_mode(make_dataset(val_cfg), selected_mode)
         apply_dataset_image_transform(val_dataset, resize_pad_config)
 
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta, rename_map=cfg.rename_map)

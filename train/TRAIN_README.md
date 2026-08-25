@@ -55,7 +55,13 @@ It also requires `meta/real_exp_trajectory_config.json`. This metadata is the
 authoritative vector layout: it records `arm_mode` (`left`, `right`, or `duo`),
 the end-effector type (`arm`, `gripper`, or `hand`), active arms, and the state
 and action dimensions. The trainer validates it against `meta/info.json` and
-the action metadata before creating a policy. Every saved `pretrained_model`
+the action metadata before creating a policy. A dataset containing the neutral
+joint and EE fields can be trained in either mode with `--state-action-mode joint` or
+`--state-action-mode end_effector`; the trainer selects the corresponding
+primary fields (`observation.state`/`action` or `observation.ee_pose`/
+`action.delta_ee_pose`; joint mode uses the neutral
+`observation.joint_state`/`action.target_joint` fields) without rewriting the
+parquet data. Every saved `pretrained_model`
 also receives the action, trajectory, and complete dataset feature metadata plus
 a validated deployment manifest. A checkpoint therefore remains self-describing
 when moved to another machine. Deployment reads this embedded metadata from the

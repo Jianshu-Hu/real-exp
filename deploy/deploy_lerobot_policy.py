@@ -979,8 +979,37 @@ def inspect_policy(policy_path: Path, dataset_root: Path | None = None) -> None:
         source_trajectory = require_dataset_trajectory_config(dataset_root)
         validate_action_trajectory_contract(source_action, source_trajectory, source=str(dataset_root / "meta"))
         if trajectory_contract_mismatches(source_trajectory, trajectory_cfg):
-            raise ValueError("Dataset and checkpoint trajectory contracts disagree.")
-        dataset_info = source_info
+            compatible_fields = ("arm_mode", "arms", "end_effector", "include_gripper", "include_hand")
+            hardware_mismatches = [
+                field for field in compatible_fields
+                if source_trajectory.get(field) != trajectory_cfg.get(field)
+            ]
+            if hardware_mismatches:
+                raise ValueError(
+                    "Dataset and checkpoint hardware trajectory contracts disagree: "
+                    + ", ".join(hardware_mismatches)
+                )
+            selected_state_key = (
+                "observation.ee_pose"
+                if trajectory_cfg.get("state_action_mode") == "end_effector"
+                else "observation.state"
+            )
+            selected_action_key = (
+                "action.delta_ee_pose"
+                if trajectory_cfg.get("state_action_mode") == "end_effector"
+                else "action"
+            )
+            for key in (selected_state_key, selected_action_key):
+                if key not in source_info.get("features", {}):
+                    raise ValueError(
+                        f"Dataset does not contain the checkpoint-selected feature {key!r}."
+                    )
+            dataset_info = dict(source_info)
+            dataset_info["features"] = dict(source_info["features"])
+            dataset_info["features"]["observation.state"] = source_info["features"][selected_state_key]
+            dataset_info["features"]["action"] = source_info["features"][selected_action_key]
+        else:
+            dataset_info = source_info
 
     policy_type = infer_policy_type(policy_cfg)
     max_actions_per_chunk = infer_actions_per_chunk(policy_type, policy_cfg)

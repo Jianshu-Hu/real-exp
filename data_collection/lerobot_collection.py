@@ -112,8 +112,12 @@ def bridge_packet_readiness(packet: Any) -> tuple[bool, str]:
     try:
         state = np.asarray(packet["state"], dtype=np.float32)
         action = np.asarray(packet["action"], dtype=np.float32)
+        joint_state = np.asarray(packet["joint_state"], dtype=np.float32)
+        target_joint = np.asarray(packet["target_joint"], dtype=np.float32)
         robot_state_dim = int(packet["robot_state_dim"])
         action_dim = int(packet["action_dim"])
+        joint_state_dim = int(packet["joint_state_dim"])
+        target_joint_dim = int(packet["target_joint_dim"])
         camera_names = list(packet["camera_names"])
         cameras = packet["cameras"]
         state_action_mode = str(packet.get("state_action_mode", "joint")).strip().lower()
@@ -124,6 +128,26 @@ def bridge_packet_readiness(packet: Any) -> tuple[bool, str]:
         return False, f"bridge state has shape {state.shape}, expected ({robot_state_dim},)"
     if action.ndim != 1 or action.size != action_dim:
         return False, f"bridge action has shape {action.shape}, expected ({action_dim},)"
+    if joint_state.ndim != 1 or joint_state.size != joint_state_dim:
+        return False, f"bridge joint_state has shape {joint_state.shape}, expected ({joint_state_dim},)"
+    if target_joint.ndim != 1 or target_joint.size != target_joint_dim:
+        return False, f"bridge target_joint has shape {target_joint.shape}, expected ({target_joint_dim},)"
+    try:
+        trajectory_for_dims = trajectory_config_from_packet(packet)
+        expected_joint_dim = 7 * len(trajectory_for_dims["arms"])
+        if trajectory_for_dims["end_effector"] == "gripper":
+            expected_joint_dim += len(trajectory_for_dims["arms"])
+        elif trajectory_for_dims["end_effector"] == "hand":
+            expected_joint_dim += 20 * len(trajectory_for_dims["arms"])
+    except (KeyError, TypeError, ValueError) as exc:
+        return False, f"bridge joint metadata is invalid ({exc})"
+    if joint_state_dim != expected_joint_dim or target_joint_dim != expected_joint_dim:
+        return False, (
+            f"bridge joint dimensions {joint_state_dim}/{target_joint_dim} "
+            f"do not match expected {expected_joint_dim}"
+        )
+    if not np.all(np.isfinite(joint_state)) or not np.all(np.isfinite(target_joint)):
+        return False, "bridge joint_state/target_joint contains non-finite values"
     if not isinstance(cameras, dict):
         return False, "bridge packet cameras field is not a dictionary"
 
@@ -287,6 +311,17 @@ def build_features(first_packet: dict[str, Any]) -> tuple[dict[str, dict[str, An
         },
     }
     pose_dim = 6 * len(trajectory_config["arms"])
+    joint_dim = 7 * len(trajectory_config["arms"])
+    if trajectory_config["end_effector"] == "gripper":
+        joint_dim += len(trajectory_config["arms"])
+    elif trajectory_config["end_effector"] == "hand":
+        joint_dim += 20 * len(trajectory_config["arms"])
+    features["observation.joint_state"] = {
+        "dtype": "float32", "shape": (joint_dim,), "names": ["joint_state"]
+    }
+    features["action.target_joint"] = {
+        "dtype": "float32", "shape": (joint_dim,), "names": ["target_joint"]
+    }
     features["observation.ee_pose"] = {
         "dtype": "float32", "shape": (pose_dim,), "names": ["ee_pose"]
     }
@@ -403,6 +438,8 @@ def packet_to_frame(packet: dict[str, Any], camera_names: list[str], task_name: 
     }
     frame["observation.ee_pose"] = np.asarray(packet["ee_pose"], dtype=np.float32)
     frame["action.delta_ee_pose"] = np.asarray(packet["delta_ee_pose"], dtype=np.float32)
+    frame["observation.joint_state"] = np.asarray(packet["joint_state"], dtype=np.float32)
+    frame["action.target_joint"] = np.asarray(packet["target_joint"], dtype=np.float32)
     for camera_name in camera_names:
         rgb = np.asarray(packet["cameras"][camera_name]["rgb"], dtype=np.uint8)
         frame[f"observation.images.{camera_name}"] = np.transpose(rgb, (2, 0, 1))
@@ -469,6 +506,8 @@ def packet_pair_to_frame(
         np.asarray(next_packet["target_ee_pose"], dtype=np.float32)
         - np.asarray(current_packet["ee_pose"], dtype=np.float32)
     )
+    frame["observation.joint_state"] = np.asarray(current_packet["joint_state"], dtype=np.float32)
+    frame["action.target_joint"] = np.asarray(next_packet["target_joint"], dtype=np.float32)
     for camera_name in camera_names:
         rgb = np.asarray(current_packet["cameras"][camera_name]["rgb"], dtype=np.uint8)
         frame[f"observation.images.{camera_name}"] = np.transpose(rgb, (2, 0, 1))

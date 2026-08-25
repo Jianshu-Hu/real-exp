@@ -111,15 +111,16 @@ policy_path="$(cd -- "${policy_path}" 2>/dev/null && pwd)" || die "policy path n
 trajectory_output="$(PYTHONPATH="${repository_root}" python3 "${repository_root}/utils/deployment_metadata.py" --checkpoint "${policy_path}" --deployment-lines)" \
   || die "could not resolve deployment metadata from ${policy_path}"
 mapfile -t trajectory_lines <<<"${trajectory_output}"
-(( ${#trajectory_lines[@]} == 8 )) || die "deployment metadata resolver returned an unexpected number of fields"
+(( ${#trajectory_lines[@]} == 9 )) || die "deployment metadata resolver returned an unexpected number of fields"
 arm_mode="${trajectory_lines[0]}"; end_effector="${trajectory_lines[1]}"; fps="${trajectory_lines[2]}"
-state_dim="${trajectory_lines[3]}"; action_dim="${trajectory_lines[4]}"; camera_names="${trajectory_lines[5]}"
-policy_type="${trajectory_lines[6]}"; actions_per_chunk="${trajectory_lines[7]}"
+state_dim="${trajectory_lines[3]}"; action_dim="${trajectory_lines[4]}"; state_action_mode="${trajectory_lines[5]}"; camera_names="${trajectory_lines[6]}"
+policy_type="${trajectory_lines[7]}"; actions_per_chunk="${trajectory_lines[8]}"
 if [[ -n "${requested_fps}" && "${requested_fps}" != "${fps}" ]]; then
   die "--fps=${requested_fps} does not match checkpoint metadata fps=${fps}"
 fi
 case "${arm_mode}" in left|right|duo) ;; *) die "unsupported metadata arm mode: ${arm_mode}" ;; esac
 case "${end_effector}" in arm|gripper|hand) ;; *) die "unsupported metadata end effector: ${end_effector}" ;; esac
+case "${state_action_mode}" in joint|end_effector) ;; *) die "unsupported metadata state/action mode: ${state_action_mode}" ;; esac
 [[ "${state_dim}" =~ ^[0-9]+$ && "${action_dim}" =~ ^[0-9]+$ ]] || die "metadata dimensions must be integers"
 [[ "${fps}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "metadata fps must be numeric"
 include_right_arm=false; [[ "${arm_mode}" == "duo" ]] && include_right_arm=true
@@ -135,8 +136,8 @@ if [[ "${camera_names}" != "" ]]; then
   done
 fi
 if [[ "${print_config}" -eq 1 ]]; then
-  printf 'policy_path=%s\narm_mode=%s\nend_effector=%s\nfps=%s\nstate_dim=%s\naction_dim=%s\ncameras=%s\npolicy_type=%s\nactions_per_chunk=%s\ninclude_right_arm=%s\ninclude_gripper=%s\ninclude_hand=%s\ncamera_1_enabled=%s\ncamera_2_enabled=%s\ncamera_3_enabled=%s\nserver_ip=%s\nmetadata_port=%s\n' \
-    "${policy_path}" "${arm_mode}" "${end_effector}" "${fps}" "${state_dim}" "${action_dim}" \
+  printf 'policy_path=%s\narm_mode=%s\nend_effector=%s\nfps=%s\nstate_dim=%s\naction_dim=%s\nstate_action_mode=%s\ncameras=%s\npolicy_type=%s\nactions_per_chunk=%s\ninclude_right_arm=%s\ninclude_gripper=%s\ninclude_hand=%s\ncamera_1_enabled=%s\ncamera_2_enabled=%s\ncamera_3_enabled=%s\nserver_ip=%s\nmetadata_port=%s\n' \
+    "${policy_path}" "${arm_mode}" "${end_effector}" "${fps}" "${state_dim}" "${action_dim}" "${state_action_mode}" \
     "${camera_names}" "${policy_type}" "${actions_per_chunk}" "${include_right_arm}" "${include_gripper}" "${include_hand}" \
     "${camera_left}" "${camera_front}" "${camera_right}" "${server_ip}" "${metadata_port}"
   exit 0
@@ -208,6 +209,7 @@ if ! python3 "${repository_root}/deploy/build_deployment_bridge_config.py" \
   --command-host "${server_ip}" --command-port "${command_port}" \
   --camera-cache-host 127.0.0.1 --camera-cache-port "${camera_cache_port}" \
   --include-right-arm "${include_right_arm}" --arm-mode "${arm_mode}" \
+  --state-action-mode "${state_action_mode}" \
   --include-gripper "${include_gripper}" --include-hand "${include_hand}" \
   --hand-telemetry-host "${server_ip}" --hand-telemetry-port "${hand_telemetry_port}" \
   --camera-1-enabled "${camera_left}" --camera-2-enabled "${camera_front}" \
@@ -232,7 +234,7 @@ shutdown() {
 }
 trap shutdown EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 
-echo "Deployment contract: ${end_effector}/${arm_mode}, state/action=${state_dim}/${action_dim}, cameras=${camera_names}, fps=${fps}"
+echo "Deployment contract: ${end_effector}/${arm_mode}, mode=${state_action_mode}, state/action=${state_dim}/${action_dim}, cameras=${camera_names}, fps=${fps}"
 echo "Deployment server: observation tcp://${server_ip}:${publish_port}, command tcp://${server_ip}:${command_port}, hand telemetry tcp://${server_ip}:${hand_telemetry_port}, camera cache tcp://127.0.0.1:${camera_cache_port}, gRPC :${policy_port}"
 start_process "RealSense camera publisher" ros2 launch franka_realsense_camera_publisher cameras.launch.py
 start_process "Deployment observation bridge" ros2 launch franka_lerobot_data_bridge bridge.launch.py \

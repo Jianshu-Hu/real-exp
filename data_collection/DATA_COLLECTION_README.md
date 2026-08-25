@@ -331,10 +331,13 @@ control host; it has no camera USB devices in this layout. The server bridge
 still subscribes to `/left/...` and `/right/...` robot/action topics over ROS 2
 and to `/cameras/...` image topics locally.
 
-The dataset currently records:
+The dataset records all representation-neutral robot fields on every frame:
 
-- `observation.state`: actual robot joint positions, plus gripper width if enabled
-- `action`: absolute arm joint targets for the next sample, plus gripper command if enabled
+- `observation.joint_state`: measured robot joints, plus gripper/hand state when enabled
+- `action.target_joint`: accepted/commanded joint targets, plus gripper/hand targets when enabled
+- `observation.ee_pose`: measured end-effector pose (`x,y,z,roll,pitch,yaw` per arm)
+- `action.delta_ee_pose`: target EE pose minus measured EE pose
+- `observation.state` and `action`: the bridge's selected compatibility/training view
 - `observation.images.<camera_name>`: enabled RGB video streams (`cam_left`, `cam_front`, and `cam_right` for duo; `cam_left` and `cam_front` for single-arm collection)
 
 The bridge expects:
@@ -349,9 +352,8 @@ The bridge expects:
 By default the bridge publishes current measured robot joint states as `observation.state` and uses the robot-accepted target topic (`/left|right/gello/accepted_joint_states`) as the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
 
 The bridge also subscribes to each arm's `franka_robot_state_broadcaster/robot_state`
-topic. Every recorded frame contains `observation.ee_pose` and
-`action.delta_ee_pose` (per-arm `x,y,z,roll,pitch,yaw` values), regardless of the
-selected training representation. Set the bridge YAML parameter
+topic. Every recorded frame contains all four robot representations regardless of
+the selected training view. Set the bridge YAML parameter
 `state_action_mode: end_effector` to make the policy-facing vectors use
 `observation.state = current end-effector pose` and
 `action = target pose - current pose`; the default `joint` mode keeps

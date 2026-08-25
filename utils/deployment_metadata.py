@@ -290,6 +290,7 @@ def deployment_lines(contract: dict[str, Any]) -> list[str]:
         f"{contract['fps']:g}",
         str(trajectory["robot_state_dim"]),
         str(trajectory["action_dim"]),
+        trajectory["state_action_mode"],
         ",".join(deployment_camera_names(contract)),
         contract["policy_type"],
         str(contract["actions_per_chunk"]),

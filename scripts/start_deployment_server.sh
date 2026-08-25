@@ -182,7 +182,7 @@ export ROS_LOCALHOST_ONLY=0
 export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 command -v setsid >/dev/null || die "setsid is required"
 command -v ros2 >/dev/null || die "ros2 is unavailable after sourcing ROS"
-for required_package in franka_realsense_camera_publisher franka_lerobot_data_bridge; do
+for required_package in franka_realsense_camera_publisher franka_lerobot_data_bridge franka_msgs; do
   ros2 pkg prefix "${required_package}" >/dev/null 2>&1 || die \
     "required ROS package is unavailable after sourcing overlays: ${required_package}"
 done

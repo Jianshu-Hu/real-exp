@@ -147,6 +147,8 @@ command -v timeout >/dev/null 2>&1 || die "required command not found: timeout"
 command -v pkill >/dev/null 2>&1 || die "required command not found: pkill"
 command -v ps >/dev/null 2>&1 || die "required command not found: ps"
 command -v ros2 >/dev/null 2>&1 || die "ros2 is unavailable after sourcing ROS ${ros_distro}"
+ros2 pkg prefix franka_msgs >/dev/null 2>&1 || die \
+  "required ROS package is unavailable after sourcing overlays: franka_msgs (source/build the Franka ROS 2 workspace)"
 
 ros_python="/usr/bin/python3"
 [[ -x "${ros_python}" ]] || die "ROS Python interpreter is missing: ${ros_python}"

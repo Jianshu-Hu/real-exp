@@ -7,30 +7,81 @@ from typing import Any
 
 import numpy as np
 
+TARGET_EE_SOURCE_PAIRED_JOINT_FK = "paired_target_joint_fk_v1"
+
+
+def _rpy_rotation_matrix(rpy: Any) -> np.ndarray:
+    """Return the URDF fixed-axis roll/pitch/yaw rotation matrix."""
+    roll, pitch, yaw = np.asarray(rpy, dtype=float)
+    sr, cr = np.sin(roll), np.cos(roll)
+    sp, cp = np.sin(pitch), np.cos(pitch)
+    sy, cy = np.sin(yaw), np.cos(yaw)
+    return np.asarray(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ],
+        dtype=float,
+    )
+
+
+def _transform(xyz: Any, rpy: Any = (0.0, 0.0, 0.0)) -> np.ndarray:
+    result = np.eye(4, dtype=float)
+    result[:3, :3] = _rpy_rotation_matrix(rpy)
+    result[:3, 3] = np.asarray(xyz, dtype=float)
+    return result
+
+
+def _rotation_about_z(angle: float) -> np.ndarray:
+    sine, cosine = np.sin(angle), np.cos(angle)
+    result = np.eye(4, dtype=float)
+    result[:2, :2] = ((cosine, -sine), (sine, cosine))
+    return result
+
+
+# Joint origins from franka_description's robots/fr3/fr3.urdf.xacro.  Keeping
+# this small serial chain locally lets the ROS bridge compute target EE poses on
+# data-server hosts whose system Python does not provide Pinocchio.
+_FR3_JOINT_ORIGINS = (
+    _transform((0.0, 0.0, 0.333)),
+    _transform((0.0, 0.0, 0.0), (-np.pi / 2.0, 0.0, 0.0)),
+    _transform((0.0, -0.316, 0.0), (np.pi / 2.0, 0.0, 0.0)),
+    _transform((0.0825, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0)),
+    _transform((-0.0825, 0.384, 0.0), (-np.pi / 2.0, 0.0, 0.0)),
+    _transform((0.0, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0)),
+    _transform((0.088, 0.0, 0.0), (np.pi / 2.0, 0.0, 0.0)),
+)
+_FR3_LINK7_TO_FLANGE = _transform((0.0, 0.0, 0.107))
+
 
 def pose_vector_to_matrix(values: Any) -> np.ndarray:
     """Convert x/y/z/roll/pitch/yaw to a homogeneous transform."""
-    from scipy.spatial.transform import Rotation
-
     vector = np.asarray(values, dtype=float)
     if vector.shape != (6,) or not np.all(np.isfinite(vector)):
         raise ValueError(f"Pose vector must contain six finite values, got {vector.shape}.")
     transform = np.eye(4, dtype=float)
     transform[:3, 3] = vector[:3]
-    transform[:3, :3] = Rotation.from_euler("xyz", vector[3:]).as_matrix()
+    transform[:3, :3] = _rpy_rotation_matrix(vector[3:])
     return transform
 
 
 def matrix_to_pose_vector(matrix: Any) -> np.ndarray:
     """Convert a homogeneous transform to x/y/z/roll/pitch/yaw."""
-    from scipy.spatial.transform import Rotation
-
     transform = np.asarray(matrix, dtype=float)
     if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
         raise ValueError("Pose matrix must be a finite 4x4 transform.")
-    return np.concatenate(
-        (transform[:3, 3], Rotation.from_matrix(transform[:3, :3]).as_euler("xyz"))
-    )
+    rotation = transform[:3, :3]
+    pitch = float(np.arcsin(np.clip(-rotation[2, 0], -1.0, 1.0)))
+    if abs(np.cos(pitch)) > 1e-8:
+        roll = float(np.arctan2(rotation[2, 1], rotation[2, 2]))
+        yaw = float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+    else:
+        # At gimbal lock, choose roll=0 and preserve the represented rotation
+        # through yaw, matching the bridge's existing transform conversion.
+        roll = 0.0
+        yaw = float(np.arctan2(-rotation[0, 1], rotation[1, 1]))
+    return np.concatenate((transform[:3, 3], (roll, pitch, yaw)))
 
 
 def wrapped_pose_delta(current: Any, target: Any) -> np.ndarray:
@@ -46,17 +97,12 @@ def wrapped_pose_delta(current: Any, target: Any) -> np.ndarray:
 
 def pose_error(actual: Any, expected: Any) -> tuple[float, float]:
     """Return translation distance and rotation distance between transforms."""
-    from scipy.spatial.transform import Rotation
-
     actual_matrix = np.asarray(actual, dtype=float)
     expected_matrix = np.asarray(expected, dtype=float)
     position_error = float(np.linalg.norm(actual_matrix[:3, 3] - expected_matrix[:3, 3]))
+    relative_rotation = expected_matrix[:3, :3].T @ actual_matrix[:3, :3]
     orientation_error = float(
-        np.linalg.norm(
-            Rotation.from_matrix(
-                expected_matrix[:3, :3].T @ actual_matrix[:3, :3]
-            ).as_rotvec()
-        )
+        np.arccos(np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0))
     )
     return position_error, orientation_error
 
@@ -93,18 +139,38 @@ def build_fr3_model() -> tuple[Any, int]:
 
 
 class Fr3ForwardKinematics:
-    """Reusable FK evaluator that avoids allocating Pinocchio data per frame."""
+    """Reusable FR3 FK evaluator with Pinocchio and dependency-free NumPy backends."""
 
-    def __init__(self) -> None:
-        self.model, self.frame_id = build_fr3_model()
-        self.data = self.model.createData()
+    def __init__(self, *, backend: str = "auto") -> None:
+        if backend not in {"auto", "pinocchio", "numpy"}:
+            raise ValueError(f"Unsupported FR3 FK backend: {backend!r}.")
+        self.backend = backend
+        self.model = None
+        self.frame_id = None
+        self.data = None
+        if backend != "numpy":
+            try:
+                self.model, self.frame_id = build_fr3_model()
+            except ModuleNotFoundError:
+                if backend == "pinocchio":
+                    raise
+                self.backend = "numpy"
+            else:
+                self.data = self.model.createData()
+                self.backend = "pinocchio"
 
     def flange_pose(self, q: Any) -> np.ndarray:
-        import pinocchio as pin
-
         joints = np.asarray(q, dtype=float)
         if joints.shape != (7,) or not np.all(np.isfinite(joints)):
             raise ValueError(f"FR3 joints must contain seven finite values, got {joints.shape}.")
+        if self.backend == "numpy":
+            result = np.eye(4, dtype=float)
+            for origin, joint_position in zip(_FR3_JOINT_ORIGINS, joints, strict=True):
+                result = result @ origin @ _rotation_about_z(float(joint_position))
+            return result @ _FR3_LINK7_TO_FLANGE
+
+        import pinocchio as pin
+
         pin.forwardKinematics(self.model, self.data, joints)
         pin.updateFramePlacements(self.model, self.data)
         return np.asarray(self.data.oMf[self.frame_id].homogeneous, dtype=float)

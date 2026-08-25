@@ -23,7 +23,12 @@ if str(LOCAL_LEROBOT_SRC) not in sys.path:
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from utils.dataset_stats import ensure_dataset_stats, normalize_episode_metadata
-from utils.fr3_kinematics import pose_error, pose_vector_to_matrix, wrapped_pose_delta
+from utils.fr3_kinematics import (
+    TARGET_EE_SOURCE_PAIRED_JOINT_FK,
+    pose_error,
+    pose_vector_to_matrix,
+    wrapped_pose_delta,
+)
 from utils.trajectory_metadata import (
     TRAJECTORY_CONFIG_PATH,
     trajectory_config_from_packet,
@@ -109,6 +114,14 @@ def bridge_packet_readiness(packet: Any) -> tuple[bool, str]:
     """
     if not isinstance(packet, dict):
         return False, "received a non-dictionary bridge packet"
+
+    target_ee_source = packet.get("target_ee_source")
+    if target_ee_source != TARGET_EE_SOURCE_PAIRED_JOINT_FK:
+        return False, (
+            "bridge does not declare paired target-joint FK for EE targets "
+            f"(received target_ee_source={target_ee_source!r}); rebuild and restart "
+            "franka_lerobot_data_bridge before recording"
+        )
 
     try:
         state = np.asarray(packet["state"], dtype=np.float32)

@@ -156,12 +156,25 @@ ros_python="/usr/bin/python3"
 missing_ros_modules="$(${ros_python} - <<'PY'
 import importlib.util
 
-modules = ("controller_manager_msgs", "pyrealsense2", "rclpy", "zmq")
+modules = ("controller_manager_msgs", "numpy", "pyrealsense2", "rclpy", "zmq")
 print(" ".join(module for module in modules if importlib.util.find_spec(module) is None))
 PY
 )"
 [[ -z "${missing_ros_modules}" ]] || die \
   "missing ROS Python modules for ${ros_python}: ${missing_ros_modules}"
+
+if ! "${ros_python}" - "${repository_root}" <<'PY'
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from utils.fr3_kinematics import Fr3ForwardKinematics
+
+kinematics = Fr3ForwardKinematics()
+print(f"Ready: FR3 target-pose FK backend is {kinematics.backend}")
+PY
+then
+  die "FR3 target-pose FK preflight failed in ${ros_python}; update the repository and restart"
+fi
 
 # The bridge package calls the left-arm configuration "example_single.yaml"
 # for historical compatibility; keep the command-line mode names independent

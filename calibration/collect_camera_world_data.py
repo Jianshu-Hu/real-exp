@@ -23,6 +23,19 @@ from typing import Any
 import numpy as np
 
 
+# The tag center is the world origin. Columns are the AprilTag +x, +y, +z
+# axes expressed in the world frame: right, backward, down respectively.
+WORLD_T_TAG = np.asarray(
+    [
+        [0.0, -1.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -98,7 +111,12 @@ def main() -> int:
             "firmware": str(profile.get_device().get_info(rs.camera_info.firmware_version)),
         },
         "stream": {"color": [args.width, args.height, args.fps], "depth": [args.width, args.height, args.fps]},
-        "tag_pose_definition": "AprilTag detection and W_T_T are handled by a separate calibration step.",
+        "coordinate_frames": {
+            "world": "+x forward, +y left, +z up",
+            "apriltag": "+x right, +y backward, +z down",
+        },
+        "tag_pose_definition": "Tag center coincides with the world origin; world_T_tag maps the AprilTag axes into the world axes.",
+        "world_T_tag": WORLD_T_TAG,
         "color_intrinsics": _intrinsics(color_profile),
         "depth_intrinsics": _intrinsics(depth_profile),
         "saved_depth_frame": "depth_aligned_to_color",

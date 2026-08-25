@@ -27,10 +27,11 @@ Because depth is aligned to color, the saved depth pixels use the recorded
 `depth_intrinsics` and `depth_to_color` are retained for auditing.
 
 AprilTag detection, tag-corner extraction, and the final `W_T_C` computation are
-performed by a separate calibration script. The tabletop Tag is physically
-fixed as the world frame: its center is the origin, `+x` points forward, `+y`
-points left, and `+z` points upward. The collector intentionally does not
-depend on OpenCV and does not estimate transforms.
+performed by a separate calibration script. The tabletop Tag center is the
+world origin, but their axes differ. World axes are `+x` forward, `+y` left,
+`+z` up; Tag axes are `+x` right, `+y` backward, `+z` down. The collector stores
+the resulting fixed `world_T_tag` transform in `metadata.json`. It intentionally
+does not depend on OpenCV and does not estimate camera transforms.
 
 Run the separate processing step after installing OpenCV contrib and SciPy:
 
@@ -43,8 +44,9 @@ python calibration/calibrate_camera_to_world.py \
 ```
 
 This writes `camera_to_world.json` containing per-frame detections and the
-aggregated `world_T_camera` estimate. The processing script assumes the fixed
-Tag/world convention above and does not expose a world-tag-pose argument.
+aggregated `world_T_camera` estimate. The processing script reads `world_T_tag`
+from the capture metadata. For older captures without that field, it uses the
+fixed Tag/world convention above.
 
 ## Eye-to-hand data collection across two hosts
 
@@ -85,11 +87,12 @@ The collector intentionally does not detect AprilTags or solve any transforms.
 
 ### AprilTag frame orientation
 
-Tag orientation is part of the calibration contract. For the tabletop Tag, the
-physical mounting must define the world frame exactly: Tag center = world
-origin, Tag `+x` = world forward, Tag `+y` = world left, and Tag `+z` = world
-up. A rotated, flipped, or mirrored tabletop Tag changes the resulting
-`world_T_camera` frame even if PnP reports a small reprojection error.
+Tag orientation is part of the calibration contract. For the tabletop Tag, its
+center is the world origin. Viewed on the table, Tag `+x` points right, Tag `+y`
+points backward, and Tag `+z` points down. These map to world `-y`, `-x`, and
+`-z`, respectively. Rotating, flipping, or mirroring the tabletop Tag changes
+the resulting `world_T_camera` frame even if PnP reports a small reprojection
+error.
 
 For the end-effector Tag, its absolute orientation does not need to match the
 robot axes because the hand-eye solve estimates the fixed `ee_T_tag` transform.

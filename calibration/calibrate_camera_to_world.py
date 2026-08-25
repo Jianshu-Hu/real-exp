@@ -11,6 +11,34 @@ from typing import Any
 import numpy as np
 
 
+DEFAULT_WORLD_T_TAG = np.asarray(
+    [
+        [0.0, -1.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
+
+def world_t_tag_from_metadata(metadata: dict[str, Any]) -> np.ndarray:
+    """Return the fixed tabletop Tag pose, including legacy-data fallback."""
+    transform = np.asarray(
+        metadata.get("world_T_tag", DEFAULT_WORLD_T_TAG), dtype=np.float64
+    )
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError("metadata world_T_tag must be a finite 4x4 matrix")
+    if not np.allclose(transform[3], [0.0, 0.0, 0.0, 1.0]):
+        raise ValueError("metadata world_T_tag must be a homogeneous transform")
+    rotation = transform[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6) or not np.isclose(
+        np.linalg.det(rotation), 1.0, atol=1e-6
+    ):
+        raise ValueError("metadata world_T_tag rotation must be right-handed and orthonormal")
+    return transform
+
+
 def invert(transform: np.ndarray) -> np.ndarray:
     result = np.eye(4, dtype=np.float64)
     result[:3, :3] = transform[:3, :3].T
@@ -76,9 +104,8 @@ def main() -> int:
         [[-half, half, 0.0], [half, half, 0.0], [half, -half, 0.0], [-half, -half, 0.0]],
         dtype=np.float64,
     )
-    # The physical tabletop tag is installed as the world frame: its center is
-    # W's origin, +x points forward, +y points left, and +z points upward.
-    world_t_tag = np.eye(4, dtype=np.float64)
+    # The centers coincide, but the physical Tag and world axes differ.
+    world_t_tag = world_t_tag_from_metadata(metadata)
     records: list[dict[str, Any]] = []
     for frame in metadata.get("frames", []):
         image = np.load(args.input / frame["rgb_file"])

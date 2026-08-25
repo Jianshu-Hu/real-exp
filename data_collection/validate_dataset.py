@@ -20,8 +20,11 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+if str(LOCAL_LEROBOT_SRC) not in sys.path:
+    sys.path.insert(0, str(LOCAL_LEROBOT_SRC))
 
 from utils.trajectory_metadata import (  # noqa: E402
     require_dataset_trajectory_config,
@@ -110,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-video-frames",
         action="store_true",
-        help="Skip full MP4 decode, frame count, resolution, and FPS checks.",
+        help="Skip full MP4 decode, physical frame checks, and TorchCodec random-access checks.",
     )
     parser.add_argument(
         "--verbose",
@@ -1100,6 +1103,59 @@ def check_physical_video_frames(
     return issues
 
 
+def check_torchcodec_random_access(
+    dataset_root: Path,
+    info: dict[str, Any],
+    episodes: list[dict[str, Any]],
+    video_keys: list[str],
+) -> list[str]:
+    """Verify the random MP4 access pattern used by LeRobot's default decoder."""
+    try:
+        from lerobot.datasets.video_utils import decode_video_frames
+    except ModuleNotFoundError as exc:
+        return [f"TorchCodec random-access checks require the lerobot environment: {exc}"]
+
+    video_path_template = info.get("video_path")
+    if not video_path_template:
+        return ["dataset info.json does not define video_path"]
+
+    fps = float(info["fps"])
+    issues: list[str] = []
+    for video_key in video_keys:
+        expected_by_file: dict[tuple[int, int], int] = {}
+        for episode in episodes:
+            file_key = (
+                int(episode[f"videos/{video_key}/chunk_index"]),
+                int(episode[f"videos/{video_key}/file_index"]),
+            )
+            expected_by_file[file_key] = expected_by_file.get(file_key, 0) + int(episode["length"])
+
+        for (chunk_index, file_index), frame_count in sorted(expected_by_file.items()):
+            if frame_count <= 0:
+                issues.append(f"{video_key} file {chunk_index}/{file_index}: no frames to seek")
+                continue
+            video_path = dataset_root / video_path_template.format(
+                video_key=video_key,
+                chunk_index=chunk_index,
+                file_index=file_index,
+            )
+            frame_indices = sorted({0, frame_count // 2, frame_count - 1})
+            timestamps = [frame_index / fps for frame_index in frame_indices]
+            try:
+                frames = decode_video_frames(
+                    video_path, timestamps, tolerance_s=1e-3, backend="torchcodec"
+                )
+                if len(frames) != len(timestamps):
+                    raise RuntimeError(
+                        f"returned {len(frames)} frames for {len(timestamps)} requested timestamps"
+                    )
+            except Exception as exc:
+                issues.append(
+                    f"{video_key} file {chunk_index}/{file_index}: TorchCodec random seek failed: {exc}"
+                )
+    return issues
+
+
 def validate_dataset(
     dataset_root: Path,
     skip_video_frames: bool,
@@ -1542,6 +1598,14 @@ def validate_dataset(
             for issue in physical_video_issues:
                 prefix = "  warning:" if issue.startswith("physical video quality checks skipped") else "  issue:"
                 print(f"{prefix} {issue}")
+        print("\nTorchCodec random-access checks")
+        torchcodec_issues = check_torchcodec_random_access(dataset_root, info, episodes, video_keys)
+        issues.extend(torchcodec_issues)
+        if not torchcodec_issues:
+            print("  ok")
+        else:
+            for issue in torchcodec_issues:
+                print(f"  issue: {issue}")
     elif skip_video_frames:
         print("\nPhysical video checks skipped by --skip-video-frames")
 

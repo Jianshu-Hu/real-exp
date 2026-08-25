@@ -115,6 +115,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader worker count.")
     parser.add_argument(
+        "--video-backend",
+        choices=("torchcodec", "pyav"),
+        default=None,
+        help=(
+            "Video decoder backend. Defaults to LeRobot's automatic selection; use pyav "
+            "when TorchCodec cannot decode the dataset's videos reliably."
+        ),
+    )
+    parser.add_argument(
         "--save-freq",
         type=int,
         default=None,
@@ -421,8 +430,12 @@ def make_local_dataset_cfg(
     repo_id: str,
     root: Path,
     episodes: list[int],
+    video_backend: str | None = None,
 ) -> DatasetConfig:
-    return DatasetConfig(repo_id=repo_id, root=str(root), episodes=episodes)
+    config = DatasetConfig(repo_id=repo_id, root=str(root), episodes=episodes)
+    if video_backend is not None:
+        config.video_backend = video_backend
+    return config
 
 
 def require_state_action_mode_dataset(dataset_root: Path, requested_mode: str | None = None) -> dict[str, Any]:
@@ -635,6 +648,7 @@ def main() -> None:
         args.dataset_repo_id,
         dataset_root,
         train_episodes,
+        video_backend=args.video_backend,
     )
 
     cfg = TrainPipelineConfig(
@@ -706,6 +720,7 @@ def main() -> None:
                 args.dataset_repo_id,
                 dataset_root,
                 val_episodes,
+                video_backend=args.video_backend,
             ),
             policy=policy_cfg,
             output_dir=output_dir,

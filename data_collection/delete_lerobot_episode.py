@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import shutil
@@ -21,6 +22,7 @@ from utils.dataset_stats import ensure_dataset_stats
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 TRAJECTORY_CONFIG_PATH = Path("meta/real_exp_trajectory_config.json")
+VIDEO_CODEC = "h264"
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,6 +115,16 @@ def load_action_config(dataset_root: Path) -> dict | None:
 
     with action_config_path.open() as f:
         return json.load(f)
+
+
+def h264_video_features(features: dict) -> dict:
+    """Return feature metadata that matches videos rewritten during deletion."""
+    result = copy.deepcopy(features)
+    for feature in result.values():
+        if feature.get("dtype") == "video":
+            feature.setdefault("info", {})["video.codec"] = VIDEO_CODEC
+            feature["info"]["video.pix_fmt"] = "yuv420p"
+    return result
 
 
 def parse_episode_selection(text: str, source: str) -> list[int]:
@@ -309,7 +321,7 @@ def copy_and_reindex_videos_parallel(
     keep_episodes_from_video_with_av,
     load_episodes,
     video_workers: int | None,
-    vcodec: str = "libsvtav1",
+    vcodec: str = VIDEO_CODEC,
     pix_fmt: str = "yuv420p",
 ) -> dict[int, dict]:
     if source_dataset.meta.episodes is None:
@@ -547,7 +559,7 @@ def delete_episodes_local(
     new_meta = LeRobotDatasetMetadata.create(
         repo_id=repo_id,
         fps=source_meta.fps,
-        features=source_meta.features,
+        features=h264_video_features(source_meta.features),
         robot_type=source_meta.robot_type,
         root=output_root,
         use_videos=len(source_meta.video_keys) > 0,
@@ -565,6 +577,7 @@ def delete_episodes_local(
             keep_episodes_from_video_with_av=keep_episodes_from_video_with_av,
             load_episodes=load_episodes,
             video_workers=video_workers,
+            vcodec=VIDEO_CODEC,
         )
 
     data_metadata = copy_and_reindex_data(source_dataset, new_meta, episode_mapping)

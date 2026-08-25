@@ -127,6 +127,37 @@ class ModeAwareDataset(torch.utils.data.Dataset):
         self.meta.stats["action"] = copy.deepcopy(self.meta.stats[action_key])
         self._state_key = state_key
         self._action_key = action_key
+        self._configure_selected_action_window()
+
+    def _configure_selected_action_window(self) -> None:
+        """Give the selected action feature the policy's canonical action offsets."""
+        if self._action_key == "action":
+            return
+
+        delta_timestamps = getattr(self.dataset, "delta_timestamps", None)
+        if delta_timestamps is None:
+            return
+
+        action_offsets = delta_timestamps.get("action")
+        if action_offsets is None:
+            return
+
+        # LeRobot only gives the canonical action feature a temporal window when
+        # constructing the dataset. The mode-specific action fields must use the
+        # same offsets so policy training receives [time, action_dim] samples.
+        updated_timestamps = dict(delta_timestamps)
+        updated_timestamps[self._action_key] = list(action_offsets)
+        self.dataset.delta_timestamps = updated_timestamps
+
+        # LeRobot eagerly creates and loads its reader for local datasets. Update
+        # its already-built index map in place so episode filtering and the
+        # reader's relative-index mapping remain intact.
+        reader = getattr(self.dataset, "reader", None)
+        reader_delta_indices = getattr(reader, "delta_indices", None)
+        if reader_delta_indices is not None and "action" in reader_delta_indices:
+            reader_delta_indices = dict(reader_delta_indices)
+            reader_delta_indices[self._action_key] = list(reader_delta_indices["action"])
+            reader.delta_indices = reader_delta_indices
 
     def __len__(self) -> int:
         return len(self.dataset)

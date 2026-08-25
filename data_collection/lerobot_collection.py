@@ -39,6 +39,7 @@ LEROBOT_INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 SYSTEM_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
 DEFAULT_BRIDGE_READY_TIMEOUT_SEC = 2.0
+DEFAULT_VIDEO_CODEC = "h264"
 
 
 def clamp_gripper_values(values: np.ndarray) -> np.ndarray:
@@ -87,6 +88,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=15,
         help="Expected recording rate. This should match the ROS 2 bridge sample rate.",
+    )
+    parser.add_argument(
+        "--video-codec",
+        choices=("h264",),
+        default=DEFAULT_VIDEO_CODEC,
+        help=(
+            "Video codec used for recorded MP4 files. H.264 is the supported default "
+            "for reliable TorchCodec random access."
+        ),
     )
     parser.add_argument(
         "--task",
@@ -403,7 +413,7 @@ def derive_compatible_dataset_root(dataset_root: Path, suffix_parts: list[str]) 
 
 
 def make_dataset(
-    first_packet: dict[str, Any], repo_id: str, fps: int, dataset_root: Path
+    first_packet: dict[str, Any], repo_id: str, fps: int, dataset_root: Path, video_codec: str
 ) -> tuple[LeRobotDataset, list[str], bool]:
     features, camera_names = build_features(first_packet)
     action_config = action_config_from_packet(first_packet)
@@ -412,6 +422,7 @@ def make_dataset(
         dataset = LeRobotDataset.resume(
             repo_id=repo_id,
             root=dataset_root,
+            vcodec=video_codec,
         )
         existing_action_config = load_action_config(dataset_root)
         trajectory_config_path = dataset_root / TRAJECTORY_CONFIG_PATH
@@ -458,6 +469,7 @@ def make_dataset(
         features=features,
         use_videos=True,
         root=dataset_root,
+        vcodec=video_codec,
     )
     write_action_config(dataset_root, action_config)
     write_trajectory_config(dataset_root, trajectory_config)
@@ -678,12 +690,14 @@ def main() -> None:
                     repo_id=args.repo_id,
                     fps=args.fps,
                     dataset_root=dataset_root,
+                    video_codec=args.video_codec,
                 )
                 if task_name is None:
                     task_name = str(packet.get("task", "franka_gello_teleop"))
 
                 print(f"LeRobot dataset {'resumed' if resumed_dataset else 'initialized'} with:")
                 print(f"  root: {dataset.root}")
+                print(f"  video codec: {args.video_codec}")
                 print(f"  robot state dim: {packet['robot_state_dim']}")
                 print(f"  action dim: {packet['action_dim']}")
                 print(

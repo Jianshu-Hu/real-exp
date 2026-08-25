@@ -391,6 +391,11 @@ between `0` and `1` and clamps only out-of-range gripper values at serialization
 This normalized command is distinct from the physical gripper widths used by
 `reset_pylibfranka.py`.
 
+The recorder writes H.264/yuv420p video by default (`--video-codec h264`). This
+is deliberate: the training pipeline uses TorchCodec's random frame access, and
+H.264 is the project-supported codec for reliable random seeking. Dataset
+trimming and episode deletion also re-encode edited video as H.264.
+
 The control-host supervisor supports the same four arm/gripper combinations as
 the teleoperation script:
 
@@ -467,7 +472,8 @@ The validator checks:
 - approximate measured-state motion from 15 Hz position finite differences
 - accepted-waypoint slew as a command-distribution diagnostic
 - video timestamp ranges against episode lengths
-- physical MP4 frame counts when OpenCV is available
+- strict MP4 decode, frame counts, resolution, and FPS
+- TorchCodec random seeking at the first, middle, and final frame of every MP4
 
 For `absolute_joint_position` datasets, consecutive actions are accepted 15 Hz
 waypoints, not samples of the constrained controller reference. Their finite
@@ -489,6 +495,28 @@ python3 data_collection/validate_dataset.py \
   --dataset-root data/pick_and_place_test \
   --skip-video-frames
 ```
+
+Run validation from the `lerobot` Conda environment. The standard video checks
+require TorchCodec; do not use `--skip-video-frames` as a pre-training check.
+
+## Repairing Older AV1 Data
+
+Some older AV1 recordings can pass a full sequential FFmpeg decode but fail
+when TorchCodec seeks to a later frame during training. Re-encode such a dataset
+to H.264 with a retained original backup:
+
+```bash
+conda activate lerobot
+python data_collection/reencode_dataset_videos.py \
+  --dataset-root data/pick_and_place_test
+python data_collection/validate_dataset.py \
+  --dataset-root data/pick_and_place_test
+```
+
+The command moves the original dataset to
+`data/pick_and_place_test_av1_backup`, writes the H.264 replacement at the
+original path, and restores the original automatically if conversion or the
+TorchCodec preflight fails.
 
 ## Episode Deletion
 

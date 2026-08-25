@@ -146,6 +146,32 @@ bash scripts/replay.sh \
   --episode 0
 ```
 
+Select the stored arm representation with `--replay-mode joint` or
+`--replay-mode ee`. The replay supervisor passes this option to
+`replay_lerobot_episode.py`:
+
+```bash
+# Replay the stored joint targets directly.
+bash scripts/replay.sh \
+  --dataset-root data/test-pick-and-place-new \
+  --episode 0 \
+  --replay-mode joint
+
+# Apply the stored delta EE poses to the live EE poses, solve IK for the
+# resulting targets, and send the solved target joint angles to the robots.
+bash scripts/replay.sh \
+  --dataset-root data/test-pick-and-place-new \
+  --episode 0 \
+  --replay-mode ee
+```
+
+Joint replay reads `observation.joint_state` and `action.target_joint`. EE
+replay reads `observation.ee_pose` and `action.delta_ee_pose`. When
+`--replay-mode` is omitted, replay defaults to the dataset's compatibility
+`state_action_mode`. A requested mode fails validation if its required fields
+are absent, while a dataset containing both representations can be replayed in
+either mode.
+
 Explicit settings are useful as a hardware safety check:
 
 ```bash

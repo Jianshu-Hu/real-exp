@@ -23,6 +23,7 @@ if str(LOCAL_LEROBOT_SRC) not in sys.path:
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from utils.dataset_stats import ensure_dataset_stats, normalize_episode_metadata
+from utils.fr3_kinematics import pose_error, pose_vector_to_matrix, wrapped_pose_delta
 from utils.trajectory_metadata import (
     TRAJECTORY_CONFIG_PATH,
     trajectory_config_from_packet,
@@ -159,16 +160,33 @@ def bridge_packet_readiness(packet: Any) -> tuple[bool, str]:
         shape = camera["shape"]
         if rgb.ndim != 3 or tuple(rgb.shape) != tuple(shape) or rgb.shape[-1] != 3:
             return False, f"bridge camera {camera_name!r} has invalid RGB shape {rgb.shape}"
-    if state_action_mode == "end_effector":
-        try:
-            expected = 6 * len(trajectory_config_from_packet(packet)["arms"])
-        except (KeyError, TypeError, ValueError) as exc:
-            return False, f"bridge end-effector metadata is invalid ({exc})"
-        for key in ("ee_pose", "target_ee_pose", "delta_ee_pose"):
-            values = np.asarray(packet.get(key, []), dtype=np.float32)
-            if values.shape != (expected,) or not np.all(np.isfinite(values)):
-                return False, f"bridge {key} has shape {values.shape}, expected ({expected},)"
-    elif state_action_mode != "joint":
+    try:
+        arms = trajectory_config_from_packet(packet)["arms"]
+        expected = 6 * len(arms)
+    except (KeyError, TypeError, ValueError) as exc:
+        return False, f"bridge end-effector metadata is invalid ({exc})"
+    ee_values: dict[str, np.ndarray] = {}
+    for key in ("ee_pose", "target_ee_pose", "delta_ee_pose"):
+        values = np.asarray(packet.get(key, []), dtype=np.float32)
+        if values.shape != (expected,) or not np.all(np.isfinite(values)):
+            return False, f"bridge {key} has shape {values.shape}, expected ({expected},)"
+        ee_values[key] = values
+    for arm_index, arm_name in enumerate(arms):
+        pose_slice = slice(arm_index * 6, arm_index * 6 + 6)
+        reconstructed = (
+            ee_values["ee_pose"][pose_slice]
+            + ee_values["delta_ee_pose"][pose_slice]
+        )
+        position_error, orientation_error = pose_error(
+            pose_vector_to_matrix(reconstructed),
+            pose_vector_to_matrix(ee_values["target_ee_pose"][pose_slice]),
+        )
+        if position_error > 1e-5 or orientation_error > 1e-5:
+            return False, (
+                f"bridge {arm_name} EE target/delta disagree "
+                f"({position_error:.6g} m, {orientation_error:.6g} rad)"
+            )
+    if state_action_mode not in {"joint", "end_effector"}:
         return False, f"unsupported state_action_mode={state_action_mode!r}"
 
     try:
@@ -328,6 +346,9 @@ def build_features(first_packet: dict[str, Any]) -> tuple[dict[str, dict[str, An
     features["action.delta_ee_pose"] = {
         "dtype": "float32", "shape": (pose_dim,), "names": ["delta_ee_pose"]
     }
+    features["action.target_ee_pose"] = {
+        "dtype": "float32", "shape": (pose_dim,), "names": ["target_ee_pose"]
+    }
 
     for camera_name in camera_names:
         camera = first_packet["cameras"][camera_name]
@@ -438,6 +459,7 @@ def packet_to_frame(packet: dict[str, Any], camera_names: list[str], task_name: 
     }
     frame["observation.ee_pose"] = np.asarray(packet["ee_pose"], dtype=np.float32)
     frame["action.delta_ee_pose"] = np.asarray(packet["delta_ee_pose"], dtype=np.float32)
+    frame["action.target_ee_pose"] = np.asarray(packet["target_ee_pose"], dtype=np.float32)
     frame["observation.joint_state"] = np.asarray(packet["joint_state"], dtype=np.float32)
     frame["action.target_joint"] = np.asarray(packet["target_joint"], dtype=np.float32)
     for camera_name in camera_names:
@@ -460,7 +482,12 @@ def compute_recorded_action(
         next_target_pose = np.asarray(next_packet["target_ee_pose"], dtype=np.float32)
         if current_pose.shape != next_target_pose.shape:
             raise ValueError("End-effector pose and target pose dimensions do not match.")
-        recorded_action = (next_target_pose - current_pose).astype(np.float32)
+        recorded_action = np.concatenate(
+            [
+                wrapped_pose_delta(current_pose[offset : offset + 6], next_target_pose[offset : offset + 6])
+                for offset in range(0, len(current_pose), 6)
+            ]
+        ).astype(np.float32)
         if trajectory_config["end_effector"] == "gripper":
             for index, _ in enumerate(trajectory_config["arms"]):
                 offset = index * 7
@@ -502,10 +529,15 @@ def packet_pair_to_frame(
         "task": task_name,
     }
     frame["observation.ee_pose"] = np.asarray(current_packet["ee_pose"], dtype=np.float32)
-    frame["action.delta_ee_pose"] = (
-        np.asarray(next_packet["target_ee_pose"], dtype=np.float32)
-        - np.asarray(current_packet["ee_pose"], dtype=np.float32)
-    )
+    current_ee_pose = np.asarray(current_packet["ee_pose"], dtype=np.float32)
+    target_ee_pose = np.asarray(next_packet["target_ee_pose"], dtype=np.float32)
+    frame["action.delta_ee_pose"] = np.concatenate(
+        [
+            wrapped_pose_delta(current_ee_pose[offset : offset + 6], target_ee_pose[offset : offset + 6])
+            for offset in range(0, len(current_ee_pose), 6)
+        ]
+    ).astype(np.float32)
+    frame["action.target_ee_pose"] = target_ee_pose
     frame["observation.joint_state"] = np.asarray(current_packet["joint_state"], dtype=np.float32)
     frame["action.target_joint"] = np.asarray(next_packet["target_joint"], dtype=np.float32)
     for camera_name in camera_names:

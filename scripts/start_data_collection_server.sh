@@ -102,6 +102,7 @@ done
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
+export PYTHONPATH="${repository_root}${PYTHONPATH:+:${PYTHONPATH}}"
 # shellcheck source=scripts/conda_env.sh
 source "${script_dir}/conda_env.sh"
 

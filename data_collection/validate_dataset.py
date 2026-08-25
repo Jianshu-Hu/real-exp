@@ -36,6 +36,10 @@ from utils.limit import (  # noqa: E402
 INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 PROCESSED_FLAG = "processed"
+EE_FK_POSITION_TOLERANCE_M = 0.01
+EE_FK_ORIENTATION_TOLERANCE_RAD = 0.03
+EE_DELTA_POSITION_TOLERANCE_M = 1e-5
+EE_DELTA_ORIENTATION_TOLERANCE_RAD = 1e-5
 
 
 def trajectory_vector_layout(
@@ -538,6 +542,142 @@ def check_ee_state_action_semantics(
     return issues, metrics
 
 
+def check_ee_joint_kinematic_consistency(
+    rows: list[dict[str, Any]],
+    trajectory_config: dict[str, Any],
+    kinematics: Any,
+) -> tuple[list[str], dict[str, Any]]:
+    """Cross-check both EE representations against the recorded joint fields."""
+    from utils.fr3_kinematics import (
+        infer_flange_to_ee,
+        pose_error,
+        pose_vector_to_matrix,
+    )
+
+    arms = list(trajectory_config["arms"])
+    end_effector = str(trajectory_config["end_effector"])
+    joint_stride = 7 + (1 if end_effector == "gripper" else 20 if end_effector == "hand" else 0)
+    ordered_rows = sorted(rows, key=lambda item: int(item["frame_index"]))
+    metrics: dict[str, Any] = {
+        "target_ee_missing_frames": [],
+        "ee_delta_mismatch_frames": [],
+        "ee_state_fk_mismatch_frames": [],
+        "ee_target_fk_mismatch_frames": [],
+        "max_ee_delta_position_error_m": 0.0,
+        "max_ee_delta_orientation_error_rad": 0.0,
+        "max_ee_state_fk_position_error_m": 0.0,
+        "max_ee_state_fk_orientation_error_rad": 0.0,
+        "max_ee_target_fk_position_error_m": 0.0,
+        "max_ee_target_fk_orientation_error_rad": 0.0,
+    }
+    valid_rows: list[tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    expected_pose_dim = 6 * len(arms)
+    expected_joint_dim = joint_stride * len(arms)
+    for row in ordered_rows:
+        frame = int(row["frame_index"])
+        observed_ee = np.asarray(flatten_numeric(row.get("observation.ee_pose")), dtype=float)
+        delta_ee = np.asarray(flatten_numeric(row.get("action.delta_ee_pose")), dtype=float)
+        target_ee = np.asarray(flatten_numeric(row.get("action.target_ee_pose")), dtype=float)
+        observed_joint = np.asarray(flatten_numeric(row.get("observation.joint_state")), dtype=float)
+        target_joint = np.asarray(flatten_numeric(row.get("action.target_joint")), dtype=float)
+        if target_ee.shape != (expected_pose_dim,) or not np.all(np.isfinite(target_ee)):
+            metrics["target_ee_missing_frames"].append(frame)
+            continue
+        if (
+            observed_ee.shape != (expected_pose_dim,)
+            or delta_ee.shape != (expected_pose_dim,)
+            or observed_joint.shape != (expected_joint_dim,)
+            or target_joint.shape != (expected_joint_dim,)
+            or not all(
+                np.all(np.isfinite(values))
+                for values in (observed_ee, delta_ee, observed_joint, target_joint)
+            )
+        ):
+            continue
+        valid_rows.append((row, observed_ee, delta_ee, target_ee, observed_joint, target_joint))
+
+    if not valid_rows:
+        issues = []
+        if metrics["target_ee_missing_frames"]:
+            issues.append(
+                "missing or non-finite action.target_ee_pose at frames "
+                f"{metrics['target_ee_missing_frames'][:10]}"
+            )
+        return issues, metrics
+
+    for arm_index, arm_name in enumerate(arms):
+        pose_slice = slice(arm_index * 6, arm_index * 6 + 6)
+        joint_offset = arm_index * joint_stride
+        joint_slice = slice(joint_offset, joint_offset + 7)
+        flange_to_ee = infer_flange_to_ee(
+            kinematics,
+            np.asarray([item[4][joint_slice] for item in valid_rows]),
+            np.asarray([item[1][pose_slice] for item in valid_rows]),
+        )
+        for row, observed_ee, delta_ee, target_ee, observed_joint, target_joint in valid_rows:
+            frame = int(row["frame_index"])
+            observed_matrix = pose_vector_to_matrix(observed_ee[pose_slice])
+            target_matrix = pose_vector_to_matrix(target_ee[pose_slice])
+            reconstructed_matrix = pose_vector_to_matrix(
+                observed_ee[pose_slice] + delta_ee[pose_slice]
+            )
+            delta_position, delta_orientation = pose_error(
+                reconstructed_matrix, target_matrix
+            )
+            state_position, state_orientation = pose_error(
+                kinematics.end_effector_pose(observed_joint[joint_slice], flange_to_ee),
+                observed_matrix,
+            )
+            target_position, target_orientation = pose_error(
+                kinematics.end_effector_pose(target_joint[joint_slice], flange_to_ee),
+                target_matrix,
+            )
+            metrics["max_ee_delta_position_error_m"] = max(
+                metrics["max_ee_delta_position_error_m"], delta_position
+            )
+            metrics["max_ee_delta_orientation_error_rad"] = max(
+                metrics["max_ee_delta_orientation_error_rad"], delta_orientation
+            )
+            metrics["max_ee_state_fk_position_error_m"] = max(
+                metrics["max_ee_state_fk_position_error_m"], state_position
+            )
+            metrics["max_ee_state_fk_orientation_error_rad"] = max(
+                metrics["max_ee_state_fk_orientation_error_rad"], state_orientation
+            )
+            metrics["max_ee_target_fk_position_error_m"] = max(
+                metrics["max_ee_target_fk_position_error_m"], target_position
+            )
+            metrics["max_ee_target_fk_orientation_error_rad"] = max(
+                metrics["max_ee_target_fk_orientation_error_rad"], target_orientation
+            )
+            if (
+                delta_position > EE_DELTA_POSITION_TOLERANCE_M
+                or delta_orientation > EE_DELTA_ORIENTATION_TOLERANCE_RAD
+            ):
+                metrics["ee_delta_mismatch_frames"].append((frame, arm_name))
+            if (
+                state_position > EE_FK_POSITION_TOLERANCE_M
+                or state_orientation > EE_FK_ORIENTATION_TOLERANCE_RAD
+            ):
+                metrics["ee_state_fk_mismatch_frames"].append((frame, arm_name))
+            if (
+                target_position > EE_FK_POSITION_TOLERANCE_M
+                or target_orientation > EE_FK_ORIENTATION_TOLERANCE_RAD
+            ):
+                metrics["ee_target_fk_mismatch_frames"].append((frame, arm_name))
+
+    issues: list[str] = []
+    for key, label in (
+        ("target_ee_missing_frames", "missing or non-finite action.target_ee_pose"),
+        ("ee_delta_mismatch_frames", "EE delta does not reconstruct action.target_ee_pose"),
+        ("ee_state_fk_mismatch_frames", "FK(observation.joint_state) disagrees with observation.ee_pose"),
+        ("ee_target_fk_mismatch_frames", "FK(action.target_joint) disagrees with action.target_ee_pose"),
+    ):
+        if metrics[key]:
+            issues.append(f"{label} at frames {metrics[key][:10]}")
+    return issues, metrics
+
+
 def check_joint_state_action_fields(
     rows: list[dict[str, Any]], trajectory_config: dict[str, Any]
 ) -> tuple[list[str], dict[str, Any]]:
@@ -1018,6 +1158,7 @@ def validate_dataset(
         expected_joint_dim += 20 * len(trajectory_config["arms"])
     ee_state_dim = get_feature_dim(info, "observation.ee_pose")
     ee_action_dim = get_feature_dim(info, "action.delta_ee_pose")
+    ee_target_dim = get_feature_dim(info, "action.target_ee_pose")
     joint_state_dim = get_feature_dim(info, "observation.joint_state")
     joint_action_dim = get_feature_dim(info, "action.target_joint")
     if ee_state_dim != expected_ee_dim:
@@ -1027,6 +1168,10 @@ def validate_dataset(
     if ee_action_dim != expected_ee_dim:
         issues.append(
             f"action.delta_ee_pose feature dimension {ee_action_dim!r} != expected {expected_ee_dim}"
+        )
+    if ee_target_dim != expected_ee_dim:
+        issues.append(
+            f"action.target_ee_pose feature dimension {ee_target_dim!r} != expected {expected_ee_dim}"
         )
     if joint_state_dim != expected_joint_dim:
         issues.append(
@@ -1077,6 +1222,16 @@ def validate_dataset(
     total_ee_layout_invalid_frames = 0
     total_ee_state_mismatch_frames = 0
     total_ee_action_mismatch_frames = 0
+    total_ee_target_missing_frames = 0
+    total_ee_delta_kinematic_mismatch_frames = 0
+    total_ee_state_fk_mismatch_frames = 0
+    total_ee_target_fk_mismatch_frames = 0
+    max_ee_delta_position_error_m = 0.0
+    max_ee_delta_orientation_error_rad = 0.0
+    max_ee_state_fk_position_error_m = 0.0
+    max_ee_state_fk_orientation_error_rad = 0.0
+    max_ee_target_fk_position_error_m = 0.0
+    max_ee_target_fk_orientation_error_rad = 0.0
     total_joint_state_missing_frames = 0
     total_joint_action_missing_frames = 0
     total_joint_state_mismatch_frames = 0
@@ -1085,6 +1240,17 @@ def validate_dataset(
     total_state_motion_warning_steps = 0
     total_action_safety_violation_steps = 0
     total_action_waypoint_slew_steps = 0
+
+    try:
+        from utils.fr3_kinematics import Fr3ForwardKinematics
+
+        ee_kinematics = Fr3ForwardKinematics()
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "FR3 kinematic validation requires pinocchio, xacro, ament_index_python, "
+            "and franka_description. Run the validator with /usr/bin/python3 after "
+            "sourcing the ROS workspace."
+        ) from exc
 
     if verbose:
         print("\nEpisodes")
@@ -1193,6 +1359,46 @@ def validate_dataset(
         total_ee_layout_invalid_frames += len(ee_metrics["ee_layout_invalid_frames"])
         total_ee_state_mismatch_frames += len(ee_metrics["ee_state_mismatch_frames"])
         total_ee_action_mismatch_frames += len(ee_metrics["ee_action_mismatch_frames"])
+        kinematic_issues, kinematic_metrics = check_ee_joint_kinematic_consistency(
+            rows,
+            trajectory_config,
+            ee_kinematics,
+        )
+        episode_issues.extend(kinematic_issues)
+        total_ee_target_missing_frames += len(kinematic_metrics["target_ee_missing_frames"])
+        total_ee_delta_kinematic_mismatch_frames += len(
+            kinematic_metrics["ee_delta_mismatch_frames"]
+        )
+        total_ee_state_fk_mismatch_frames += len(
+            kinematic_metrics["ee_state_fk_mismatch_frames"]
+        )
+        total_ee_target_fk_mismatch_frames += len(
+            kinematic_metrics["ee_target_fk_mismatch_frames"]
+        )
+        max_ee_delta_position_error_m = max(
+            max_ee_delta_position_error_m,
+            float(kinematic_metrics["max_ee_delta_position_error_m"]),
+        )
+        max_ee_delta_orientation_error_rad = max(
+            max_ee_delta_orientation_error_rad,
+            float(kinematic_metrics["max_ee_delta_orientation_error_rad"]),
+        )
+        max_ee_state_fk_position_error_m = max(
+            max_ee_state_fk_position_error_m,
+            float(kinematic_metrics["max_ee_state_fk_position_error_m"]),
+        )
+        max_ee_state_fk_orientation_error_rad = max(
+            max_ee_state_fk_orientation_error_rad,
+            float(kinematic_metrics["max_ee_state_fk_orientation_error_rad"]),
+        )
+        max_ee_target_fk_position_error_m = max(
+            max_ee_target_fk_position_error_m,
+            float(kinematic_metrics["max_ee_target_fk_position_error_m"]),
+        )
+        max_ee_target_fk_orientation_error_rad = max(
+            max_ee_target_fk_orientation_error_rad,
+            float(kinematic_metrics["max_ee_target_fk_orientation_error_rad"]),
+        )
         joint_issues, joint_metrics = check_joint_state_action_fields(rows, trajectory_config)
         episode_issues.extend(joint_issues)
         total_joint_state_missing_frames += len(joint_metrics["joint_state_missing_frames"])
@@ -1270,6 +1476,22 @@ def validate_dataset(
             f"state_mismatch={total_ee_state_mismatch_frames}, "
             f"action_mismatch={total_ee_action_mismatch_frames}"
         )
+    print(
+        "  EE cross-representation fields: "
+        f"missing_target={total_ee_target_missing_frames}, "
+        f"delta_mismatch={total_ee_delta_kinematic_mismatch_frames}, "
+        f"state_fk_mismatch={total_ee_state_fk_mismatch_frames}, "
+        f"target_fk_mismatch={total_ee_target_fk_mismatch_frames}"
+    )
+    print(
+        "  EE max errors: "
+        f"delta={max_ee_delta_position_error_m:.6g} m/"
+        f"{max_ee_delta_orientation_error_rad:.6g} rad, "
+        f"state_fk={max_ee_state_fk_position_error_m:.6g} m/"
+        f"{max_ee_state_fk_orientation_error_rad:.6g} rad, "
+        f"target_fk={max_ee_target_fk_position_error_m:.6g} m/"
+        f"{max_ee_target_fk_orientation_error_rad:.6g} rad"
+    )
     print(
         "  joint state/action fields: "
         f"missing_state={total_joint_state_missing_frames}, "

@@ -236,6 +236,9 @@ def trajectory_contract_mismatches(
         "include_hand",
         "robot_state_dim",
         "action_dim",
+        "state_action_mode",
+        "state_representation",
+        "action_representation",
     )
     return [
         f"{field}: dataset={expected[field]!r}, checkpoint={actual[field]!r}"
@@ -1015,10 +1018,10 @@ def inspect_policy(policy_path: Path, dataset_root: Path | None = None) -> None:
             f"arm={arm_action_representation}, "
             f"gripper={action_cfg.get('gripper_action_representation')}"
         )
-        if arm_action_representation != "absolute_joint_position":
+        if arm_action_representation not in {"absolute_joint_position", "delta_end_effector_pose"}:
             print(
-                "warning: current deployment expects arm=absolute_joint_position; "
-                "old delta_joint_position policies should be retrained on a new dataset."
+                "warning: unsupported arm action representation; expected "
+                "absolute_joint_position or delta_end_effector_pose."
             )
 
     print()

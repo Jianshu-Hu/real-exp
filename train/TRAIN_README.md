@@ -46,7 +46,8 @@ local/pick_and_place_test
 You can override both with CLI flags if needed.
 
 The training entry point requires `meta/real_exp_action_config.json` with
-`arm_action_representation=absolute_joint_position`. Current collection also
+`arm_action_representation=absolute_joint_position` for joint-mode datasets, or
+`delta_end_effector_pose` for end-effector-mode datasets. Current collection also
 uses `gripper_action_representation=absolute_width`, which preserves continuous
 normalized gripper targets in `[0, 1]`.
 

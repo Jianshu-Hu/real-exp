@@ -396,10 +396,9 @@ class FrankaPolicyExecutor:
             source=metadata_url,
         )
         self.dataset_action_dim = int(self.trajectory_config["action_dim"])
-        if self._arm_action_representation() != "absolute_joint_position":
+        if self._arm_action_representation() not in {"absolute_joint_position", "delta_end_effector_pose"}:
             raise ValueError(
-                "Deployment expects absolute_joint_position arm actions. "
-                "Record and train a new absolute-target dataset before executing this policy."
+                "Deployment expects absolute_joint_position or delta_end_effector_pose arm actions."
             )
 
         grpc, services_pb2, services_pb2_grpc, grpc_channel_options, send_bytes_in_chunks = import_grpc_runtime()
@@ -448,6 +447,18 @@ class FrankaPolicyExecutor:
         return {
             side: np.asarray(split[f"{side}_arm"], dtype=float).tolist()
             for side in self.trajectory_config["arms"]
+        }
+
+    def _ee_targets_from_action(self, split: dict[str, Any], current_packet: dict[str, Any]) -> dict[str, list[float]]:
+        current = np.asarray(current_packet.get("ee_pose", []), dtype=float)
+        if current.shape != (6 * len(self.trajectory_config["arms"]),):
+            raise ValueError("Live bridge did not provide the EE pose required by an EE-action checkpoint.")
+        return {
+            side: (
+                current[index * 6 : index * 6 + 6]
+                + np.asarray(split[f"{side}_delta_ee_pose"], dtype=float)
+            ).tolist()
+            for index, side in enumerate(self.trajectory_config["arms"])
         }
 
     def _queue_snapshot(self) -> dict[str, Any]:
@@ -1159,12 +1170,14 @@ class FrankaPolicyExecutor:
             except zmq.Again:
                 return packet, dropped
 
-    def _command_payload_from_action(self, action: TimedAction) -> dict[str, Any]:
+    def _command_payload_from_action(self, action: TimedAction, current_packet: dict[str, Any]) -> dict[str, Any]:
         split = split_action(np.asarray(action.get_action(), dtype=float), self.trajectory_config)
-        joint_targets = self._joint_targets_from_action(split)
+        joint_targets = self._joint_targets_from_action(split) if self._arm_action_representation() == "absolute_joint_position" else {}
+        ee_targets = self._ee_targets_from_action(split, current_packet) if self._arm_action_representation() == "delta_end_effector_pose" else {}
         payload: dict[str, Any] = {
             "timestamp": time.time(),
             **{f"{side}_joint_target": target for side, target in joint_targets.items()},
+            **{f"{side}_ee_pose_target": target for side, target in ee_targets.items()},
         }
         if self.trajectory_config["end_effector"] == "gripper":
             for side in self.trajectory_config["arms"]:
@@ -1337,7 +1350,7 @@ class FrankaPolicyExecutor:
 
                 action, queue_before_pop, queue_after_pop = self.maybe_pop_action()
                 if action is not None:
-                    payload = self._command_payload_from_action(action)
+                    payload = self._command_payload_from_action(action, current_packet)
                     if self.args.execute:
                         self._send_bridge_command(payload)
                     self._log_action_executed(

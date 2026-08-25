@@ -11,7 +11,9 @@ TRAJECTORY_CONFIG_PATH = Path("meta/real_exp_trajectory_config.json")
 TRAJECTORY_CONFIG_SCHEMA_VERSION = 1
 END_EFFECTOR_MODES = {"arm", "gripper", "hand"}
 ARM_MODES = {"duo", "left", "right"}
+STATE_ACTION_MODES = {"joint", "end_effector"}
 ARM_JOINT_DIM = 7
+EE_POSE_DIM = 6
 HAND_JOINT_DIM = 20
 
 
@@ -40,6 +42,24 @@ def trajectory_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"The bridge packet declares arm_mode={arm_mode} but includes a right arm.")
 
     end_effector = "hand" if include_hand else "gripper" if include_gripper else "arm"
+    state_action_mode = str(packet.get("state_action_mode", "joint")).strip().lower()
+    if state_action_mode in {"ee", "pose", "end_effector_pose", "end-effector"}:
+        state_action_mode = "end_effector"
+    if state_action_mode not in STATE_ACTION_MODES:
+        raise ValueError(
+            f"Unsupported state_action_mode {state_action_mode!r}; expected joint or end_effector."
+        )
+    block_dim = ARM_JOINT_DIM if state_action_mode == "joint" else EE_POSE_DIM
+    if include_gripper:
+        block_dim += 1
+    elif include_hand:
+        block_dim += HAND_JOINT_DIM
+    expected_dim = block_dim * (2 if arm_mode == "duo" else 1)
+    if int(packet["robot_state_dim"]) != expected_dim or int(packet["action_dim"]) != expected_dim:
+        raise ValueError(
+            f"Bridge packet state/action dimensions {packet['robot_state_dim']}/{packet['action_dim']} "
+            f"do not match {state_action_mode} trajectory layout ({expected_dim}/{expected_dim})."
+        )
     return {
         "schema_version": TRAJECTORY_CONFIG_SCHEMA_VERSION,
         "end_effector": end_effector,
@@ -49,6 +69,9 @@ def trajectory_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "include_hand": include_hand,
         "robot_state_dim": int(packet["robot_state_dim"]),
         "action_dim": int(packet["action_dim"]),
+        "state_action_mode": state_action_mode,
+        "state_representation": "joint" if state_action_mode == "joint" else "end_effector_pose",
+        "action_representation": "target_joint" if state_action_mode == "joint" else "delta_end_effector_pose",
     }
 
 
@@ -107,7 +130,21 @@ def validate_trajectory_config(
             f"include_gripper={include_gripper}, include_hand={include_hand}."
         )
 
-    block_dim = ARM_JOINT_DIM
+    state_action_mode = str(config.get("state_action_mode", "joint")).strip().lower()
+    if state_action_mode in {"ee", "pose", "end_effector_pose", "end-effector"}:
+        state_action_mode = "end_effector"
+    if state_action_mode not in STATE_ACTION_MODES:
+        raise ValueError(
+            f"{source} has unsupported state_action_mode={state_action_mode!r}; "
+            "expected joint or end_effector."
+        )
+    expected_state_representation = "joint" if state_action_mode == "joint" else "end_effector_pose"
+    expected_action_representation = "target_joint" if state_action_mode == "joint" else "delta_end_effector_pose"
+    if config.get("state_representation", expected_state_representation) != expected_state_representation:
+        raise ValueError(f"{source} state_representation is inconsistent with state_action_mode.")
+    if config.get("action_representation", expected_action_representation) != expected_action_representation:
+        raise ValueError(f"{source} action_representation is inconsistent with state_action_mode.")
+    block_dim = ARM_JOINT_DIM if state_action_mode == "joint" else EE_POSE_DIM
     if end_effector == "gripper":
         block_dim += 1
     elif end_effector == "hand":
@@ -135,6 +172,9 @@ def validate_trajectory_config(
         "include_hand": include_hand,
         "robot_state_dim": int(state_dim),
         "action_dim": int(action_dim),
+        "state_action_mode": state_action_mode,
+        "state_representation": expected_state_representation,
+        "action_representation": expected_action_representation,
     }
 
 
@@ -151,21 +191,26 @@ def validate_action_trajectory_contract(
         "include_gripper": bool(trajectory_config["include_gripper"]),
         "include_hand": bool(trajectory_config["include_hand"]),
         "include_right_arm": trajectory_config["arm_mode"] == "duo",
+        "state_action_mode": trajectory_config.get("state_action_mode", "joint"),
+        "state_representation": trajectory_config.get("state_representation", "joint"),
+        "action_representation": trajectory_config.get("action_representation", "target_joint"),
     }
     mismatches = [
-        f"{key}: action metadata={action_config.get(key)!r}, trajectory metadata={value!r}"
+        f"{key}: action metadata={action_config.get(key, value)!r}, trajectory metadata={value!r}"
         for key, value in expected.items()
-        if action_config.get(key) != value
+        if action_config.get(key, value) != value
     ]
     if mismatches:
         raise ValueError(f"{source} contracts disagree: " + "; ".join(mismatches))
 
-    arm_representation = str(
-        action_config.get("arm_action_representation", "")
-    ).strip().lower()
-    if arm_representation != "absolute_joint_position":
+    arm_representation = str(action_config.get("arm_action_representation", "")).strip().lower()
+    state_action_mode = str(trajectory_config.get("state_action_mode", "joint")).strip().lower()
+    expected_arm_representation = (
+        "absolute_joint_position" if state_action_mode == "joint" else "delta_end_effector_pose"
+    )
+    if arm_representation != expected_arm_representation:
         raise ValueError(
-            f"{source} requires arm_action_representation='absolute_joint_position'; "
+            f"{source} requires arm_action_representation={expected_arm_representation!r}; "
             f"got {arm_representation!r}."
         )
     end_effector = trajectory_config["end_effector"]
@@ -218,8 +263,9 @@ def require_dataset_trajectory_config(dataset_root: Path) -> dict[str, Any]:
 def describe_trajectory_layout(config: dict[str, Any]) -> str:
     parts: list[str] = []
     end_effector = str(config["end_effector"])
+    arm_label = "Arm(7)" if config.get("state_action_mode", "joint") == "joint" else "EE Pose(6)"
     for side in config["arms"]:
-        parts.append(f"{side.title()} Arm(7)")
+        parts.append(f"{side.title()} {arm_label}")
         if end_effector == "gripper":
             parts.append(f"{side.title()} Gripper(1)")
         elif end_effector == "hand":
@@ -241,16 +287,28 @@ def split_trajectory_vector(
         )
     result: dict[str, Any] = {
         "left_arm": None,
+        "left_ee_pose": None,
+        "left_delta_ee_pose": None,
         "left_gripper": None,
         "left_hand": None,
         "right_arm": None,
+        "right_ee_pose": None,
+        "right_delta_ee_pose": None,
         "right_gripper": None,
         "right_hand": None,
     }
     offset = 0
+    state_action_mode = str(config.get("state_action_mode", "joint")).strip().lower()
     for side in config["arms"]:
-        result[f"{side}_arm"] = array[offset : offset + ARM_JOINT_DIM]
-        offset += ARM_JOINT_DIM
+        if state_action_mode == "joint":
+            result[f"{side}_arm"] = array[offset : offset + ARM_JOINT_DIM]
+            offset += ARM_JOINT_DIM
+        else:
+            pose = array[offset : offset + EE_POSE_DIM]
+            result[f"{side}_arm"] = pose
+            result[f"{side}_ee_pose"] = pose
+            result[f"{side}_delta_ee_pose"] = pose
+            offset += EE_POSE_DIM
         if config["end_effector"] == "gripper":
             result[f"{side}_gripper"] = float(array[offset])
             offset += 1
@@ -273,6 +331,9 @@ def validate_live_packet(config: dict[str, Any], packet: dict[str, Any]) -> None
         "include_hand",
         "robot_state_dim",
         "action_dim",
+        "state_action_mode",
+        "state_representation",
+        "action_representation",
     )
     mismatches = [
         f"{field}: dataset={config.get(field)!r}, live={packet_config.get(field)!r}"
@@ -283,6 +344,17 @@ def validate_live_packet(config: dict[str, Any], packet: dict[str, Any]) -> None
         raise ValueError(
             "Live deployment bridge does not match trajectory metadata: " + "; ".join(mismatches)
         )
+    if config.get("state_action_mode", "joint") == "end_effector":
+        import numpy as np
+
+        expected_pose_dim = 6 * len(config["arms"])
+        for key in ("ee_pose", "target_ee_pose", "delta_ee_pose"):
+            values = np.asarray(packet.get(key, []), dtype=float)
+            if values.shape != (expected_pose_dim,) or not np.all(np.isfinite(values)):
+                raise ValueError(
+                    f"Live deployment bridge {key} has shape {values.shape}; "
+                    f"expected a finite {expected_pose_dim}-value vector."
+                )
 
 
 def main() -> None:

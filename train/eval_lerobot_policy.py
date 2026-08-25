@@ -31,7 +31,7 @@ try:
         build_dataloader,
         ensure_runtime_env,
         evaluate_validation_loss,
-        require_absolute_joint_action_dataset,
+        require_state_action_mode_dataset,
     )
 except ImportError:
     from train_lerobot_policy import (
@@ -40,7 +40,7 @@ except ImportError:
         build_dataloader,
         ensure_runtime_env,
         evaluate_validation_loss,
-        require_absolute_joint_action_dataset,
+        require_state_action_mode_dataset,
     )
 
 
@@ -247,7 +247,7 @@ def evaluate_checkpoint(
     dataset_repo_id = args.dataset_repo_id or str(train_config["dataset"]["repo_id"])
     val_episodes = infer_validation_episodes(train_config, dataset_root, args.val_episodes)
 
-    require_absolute_joint_action_dataset(dataset_root)
+    require_state_action_mode_dataset(dataset_root)
 
     policy_config = load_json(checkpoint_dir / "config.json")
     policy_type = str(policy_config["type"])

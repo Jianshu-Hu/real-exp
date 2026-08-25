@@ -88,6 +88,15 @@ def parse_args() -> argparse.Namespace:
         help="Imitation-learning policy family to train.",
     )
     parser.add_argument(
+        "--state-action-mode",
+        choices=("joint", "end_effector"),
+        default=None,
+        help=(
+            "State/action representation to train. Defaults to the dataset contract: "
+            "joint state + target joint action or end-effector pose state + delta pose action."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -410,22 +419,31 @@ def make_local_dataset_cfg(
     return DatasetConfig(repo_id=repo_id, root=str(root), episodes=episodes)
 
 
-def require_absolute_joint_action_dataset(dataset_root: Path) -> None:
+def require_state_action_mode_dataset(dataset_root: Path, requested_mode: str | None = None) -> dict[str, Any]:
     action_config_path = dataset_root / ACTION_CONFIG_REL_PATH
     if not action_config_path.exists():
         raise FileNotFoundError(
             f"Missing action metadata: {action_config_path}. "
-            "Record a new dataset with the current absolute_joint_position collector."
+            "Record a dataset with the current representation-aware collector."
         )
 
     action_config = json.loads(action_config_path.read_text())
-    arm_representation = str(action_config.get("arm_action_representation", "")).strip().lower()
-    if arm_representation != "absolute_joint_position":
+    trajectory_path = dataset_root / TRAJECTORY_CONFIG_PATH
+    if not trajectory_path.exists():
+        raise FileNotFoundError(f"Missing trajectory metadata: {trajectory_path}")
+    trajectory_config = json.loads(trajectory_path.read_text())
+    mode = str(trajectory_config.get("state_action_mode", "joint")).strip().lower()
+    if requested_mode is not None and mode != requested_mode:
         raise ValueError(
-            f"Dataset arm_action_representation is '{arm_representation}'. "
-            "Training now expects absolute_joint_position actions. "
-            "Record a new dataset or convert the old delta-action dataset first."
+            f"Requested --state-action-mode={requested_mode!r}, but dataset declares {mode!r}."
         )
+    validate_action_trajectory_contract(action_config, trajectory_config)
+    return trajectory_config
+
+
+def require_absolute_joint_action_dataset(dataset_root: Path) -> None:
+    """Backward-compatible validator for callers that explicitly require joint mode."""
+    require_state_action_mode_dataset(dataset_root, "joint")
 
 
 def load_action_config(dataset_root: Path) -> dict[str, Any]:
@@ -567,8 +585,8 @@ def main() -> None:
     if not dataset_info_path.exists():
         raise FileNotFoundError(f"Missing dataset metadata: {dataset_info_path}")
 
-    require_absolute_joint_action_dataset(dataset_root)
     action_config = load_action_config(dataset_root)
+    trajectory_config = require_state_action_mode_dataset(dataset_root, args.state_action_mode)
     trajectory_config = require_dataset_trajectory_config(dataset_root)
     validate_action_trajectory_contract(action_config, trajectory_config)
     ensure_dataset_stats(args.dataset_repo_id, dataset_root)

@@ -348,6 +348,15 @@ The bridge expects:
 
 By default the bridge publishes current measured robot joint states as `observation.state` and uses the robot-accepted target topic (`/left|right/gello/accepted_joint_states`) as the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
 
+The bridge also subscribes to each arm's `franka_robot_state_broadcaster/robot_state`
+topic. Every recorded frame contains `observation.ee_pose` and
+`action.delta_ee_pose` (per-arm `x,y,z,roll,pitch,yaw` values), regardless of the
+selected training representation. Set the bridge YAML parameter
+`state_action_mode: end_effector` to make the policy-facing vectors use
+`observation.state = current end-effector pose` and
+`action = target pose - current pose`; the default `joint` mode keeps
+`observation.state = measured joints` and `action = absolute target joints`.
+
 New datasets use continuous normalized gripper commands with
 `gripper_action_representation=absolute_width`. The recorder preserves values
 between `0` and `1` and clamps only out-of-range gripper values at serialization.

@@ -67,7 +67,9 @@ def trajectory_vector_layout(
             f"unsupported end-effector mode {end_effector!r}; expected arm, gripper, or hand"
         )
 
-    block_size = 7 + end_effector_size
+    is_ee = str(trajectory_config.get("state_action_mode", "joint")).strip().lower() == "end_effector"
+    arm_value_size = 6 if is_ee else 7
+    block_size = arm_value_size + end_effector_size
     expected_size = block_size * len(arms)
     if vector_size != expected_size:
         raise ValueError(
@@ -76,7 +78,7 @@ def trajectory_vector_layout(
         )
 
     arm_layout = {
-        arm: slice(block_index * block_size, block_index * block_size + 7)
+        arm: slice(block_index * block_size, block_index * block_size + arm_value_size)
         for block_index, arm in enumerate(arms)
     }
     gripper_indices = (
@@ -376,7 +378,7 @@ def check_state_action_semantics(
             metric_name = f"max_{arm_name}_arm_delta"
             metrics[metric_name] = max(metrics[metric_name], arm_max)
             if (
-                arm_action_representation == "delta_joint_position"
+                arm_action_representation in {"delta_joint_position", "delta_end_effector_pose"}
                 and arm_max > action_outlier_threshold
             ):
                 action_outlier[f"{arm_name}_max"] = arm_max
@@ -444,7 +446,7 @@ def check_state_action_semantics(
                 f"delta-action check failed on {metrics['delta_action_bad_frames']} frame(s); "
                 f"max error {metrics['delta_action_max_error']:.6g} > tolerance {delta_action_tolerance}"
             )
-    elif arm_action_representation != "absolute_joint_position":
+    elif arm_action_representation not in {"absolute_joint_position", "delta_end_effector_pose"}:
         issues.append(f"unsupported arm action representation '{arm_action_representation}'")
 
     return issues, metrics
@@ -563,6 +565,17 @@ def check_joint_safety_constraints(
     warnings: list[str] = []
     metrics = empty_metrics.copy()
 
+    if trajectory_config is not None and str(trajectory_config.get("state_action_mode", "joint")).strip().lower() == "end_effector":
+        non_finite = [
+            int(row["frame_index"])
+            for row in sorted_rows
+            if has_non_finite(flatten_numeric(row.get("observation.state")))
+            or has_non_finite(flatten_numeric(row.get("action")))
+        ]
+        if non_finite:
+            return [f"non-finite end-effector state/action values at frames {non_finite[:10]}"], warnings, metrics
+        return issues, warnings, metrics
+
     if not states or any(len(state) != len(states[0]) for state in states):
         return [
             "joint safety check skipped because state vector lengths are inconsistent"
@@ -629,9 +642,9 @@ def check_joint_safety_constraints(
             )
 
         action_trajectory = action_array[:, action_layout[arm_name]]
-        if arm_action_representation == "delta_joint_position":
+        if arm_action_representation in {"delta_joint_position", "delta_end_effector_pose"}:
             action_trajectory = state_trajectory + action_trajectory
-        elif arm_action_representation != "absolute_joint_position":
+        elif arm_action_representation not in {"absolute_joint_position", "delta_end_effector_pose"}:
             issues.append(
                 f"joint action safety check does not support representation "
                 f"'{arm_action_representation}'"

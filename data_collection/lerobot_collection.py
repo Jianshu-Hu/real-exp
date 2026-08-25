@@ -116,6 +116,7 @@ def bridge_packet_readiness(packet: Any) -> tuple[bool, str]:
         action_dim = int(packet["action_dim"])
         camera_names = list(packet["camera_names"])
         cameras = packet["cameras"]
+        state_action_mode = str(packet.get("state_action_mode", "joint")).strip().lower()
     except (KeyError, TypeError, ValueError) as exc:
         return False, f"bridge packet is missing required fields ({exc})"
 
@@ -134,6 +135,17 @@ def bridge_packet_readiness(packet: Any) -> tuple[bool, str]:
         shape = camera["shape"]
         if rgb.ndim != 3 or tuple(rgb.shape) != tuple(shape) or rgb.shape[-1] != 3:
             return False, f"bridge camera {camera_name!r} has invalid RGB shape {rgb.shape}"
+    if state_action_mode == "end_effector":
+        try:
+            expected = 6 * len(trajectory_config_from_packet(packet)["arms"])
+        except (KeyError, TypeError, ValueError) as exc:
+            return False, f"bridge end-effector metadata is invalid ({exc})"
+        for key in ("ee_pose", "target_ee_pose", "delta_ee_pose"):
+            values = np.asarray(packet.get(key, []), dtype=np.float32)
+            if values.shape != (expected,) or not np.all(np.isfinite(values)):
+                return False, f"bridge {key} has shape {values.shape}, expected ({expected},)"
+    elif state_action_mode != "joint":
+        return False, f"unsupported state_action_mode={state_action_mode!r}"
 
     try:
         action_config_from_packet(packet)
@@ -187,14 +199,18 @@ def is_lerobot_dataset_root(root: Path) -> bool:
 
 def action_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
     packet_arm_representation = str(packet.get("arm_action_representation", "absolute_joint_position")).strip().lower()
-    if packet_arm_representation != "absolute_joint_position":
+    state_action_mode = trajectory_config_from_packet(packet)["state_action_mode"]
+    expected_arm_representation = (
+        "absolute_joint_position" if state_action_mode == "joint" else "delta_end_effector_pose"
+    )
+    if packet_arm_representation != expected_arm_representation:
         raise ValueError(
             f"ROS 2 bridge published arm_action_representation={packet_arm_representation!r}. "
-            "Data collection now requires absolute_joint_position arm actions."
+            f"Expected {expected_arm_representation!r} for state_action_mode={state_action_mode!r}."
         )
-    arm_action_representation = "absolute_joint_position"
+    arm_action_representation = expected_arm_representation
     gripper_action_representation = str(packet.get("gripper_action_representation", "absolute_width"))
-    arm_action_definition = "q_target[t+1]"
+    arm_action_definition = "q_target[t+1]" if state_action_mode == "joint" else "ee_target[t+1]-ee_current[t]"
     gripper_action_definition = {
         "absolute_width": "open_width_percent",
         "binary_open_close": "latched_binary_command (0=close, 1=open)",
@@ -212,6 +228,9 @@ def action_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "include_gripper": bool(packet.get("include_gripper", True)),
         "include_hand": bool(packet.get("include_hand", False)),
         "action_dim": int(packet["action_dim"]),
+        "state_action_mode": trajectory_config_from_packet(packet)["state_action_mode"],
+        "state_representation": trajectory_config_from_packet(packet)["state_representation"],
+        "action_representation": trajectory_config_from_packet(packet)["action_representation"],
     }
 
 
@@ -246,11 +265,15 @@ def assumed_legacy_action_config(packet: dict[str, Any]) -> dict[str, Any]:
         "include_gripper": bool(packet.get("include_gripper", True)),
         "include_hand": bool(packet.get("include_hand", False)),
         "action_dim": int(packet["action_dim"]),
+        "state_action_mode": "joint",
+        "state_representation": "joint",
+        "action_representation": "target_joint",
     }
 
 
 def build_features(first_packet: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], list[str]]:
     camera_names: list[str] = list(first_packet["camera_names"])
+    trajectory_config = trajectory_config_from_packet(first_packet)
     features: dict[str, dict[str, Any]] = {
         "observation.state": {
             "dtype": "float32",
@@ -262,6 +285,13 @@ def build_features(first_packet: dict[str, Any]) -> tuple[dict[str, dict[str, An
             "shape": (int(first_packet["action_dim"]),),
             "names": ["action"],
         },
+    }
+    pose_dim = 6 * len(trajectory_config["arms"])
+    features["observation.ee_pose"] = {
+        "dtype": "float32", "shape": (pose_dim,), "names": ["ee_pose"]
+    }
+    features["action.delta_ee_pose"] = {
+        "dtype": "float32", "shape": (pose_dim,), "names": ["delta_ee_pose"]
     }
 
     for camera_name in camera_names:
@@ -371,6 +401,8 @@ def packet_to_frame(packet: dict[str, Any], camera_names: list[str], task_name: 
         "action": clamp_gripper_values(np.asarray(packet["action"], dtype=np.float32)),
         "task": task_name,
     }
+    frame["observation.ee_pose"] = np.asarray(packet["ee_pose"], dtype=np.float32)
+    frame["action.delta_ee_pose"] = np.asarray(packet["delta_ee_pose"], dtype=np.float32)
     for camera_name in camera_names:
         rgb = np.asarray(packet["cameras"][camera_name]["rgb"], dtype=np.uint8)
         frame[f"observation.images.{camera_name}"] = np.transpose(rgb, (2, 0, 1))
@@ -386,6 +418,24 @@ def compute_recorded_action(
     action_dim = int(current_packet["action_dim"])
 
     trajectory_config = trajectory_config_from_packet(current_packet)
+    if trajectory_config["state_action_mode"] == "end_effector":
+        current_pose = np.asarray(current_packet["ee_pose"], dtype=np.float32)
+        next_target_pose = np.asarray(next_packet["target_ee_pose"], dtype=np.float32)
+        if current_pose.shape != next_target_pose.shape:
+            raise ValueError("End-effector pose and target pose dimensions do not match.")
+        recorded_action = (next_target_pose - current_pose).astype(np.float32)
+        if trajectory_config["end_effector"] == "gripper":
+            for index, _ in enumerate(trajectory_config["arms"]):
+                offset = index * 7
+                recorded_action = np.insert(recorded_action, offset + 6, float(next_action[offset + 6]))
+        elif trajectory_config["end_effector"] == "hand":
+            values: list[float] = []
+            for index, _ in enumerate(trajectory_config["arms"]):
+                pose_offset = index * 6
+                values.extend(recorded_action[pose_offset : pose_offset + 6])
+                values.extend(next_action[index * 26 + 6 : index * 26 + 26])
+            recorded_action = np.asarray(values, dtype=np.float32)
+        return recorded_action
     end_effector = trajectory_config["end_effector"]
     arms = trajectory_config["arms"]
     block_size = 7 + (1 if end_effector == "gripper" else 20 if end_effector == "hand" else 0)
@@ -414,6 +464,11 @@ def packet_pair_to_frame(
         "action": clamp_gripper_values(compute_recorded_action(current_packet, next_packet)),
         "task": task_name,
     }
+    frame["observation.ee_pose"] = np.asarray(current_packet["ee_pose"], dtype=np.float32)
+    frame["action.delta_ee_pose"] = (
+        np.asarray(next_packet["target_ee_pose"], dtype=np.float32)
+        - np.asarray(current_packet["ee_pose"], dtype=np.float32)
+    )
     for camera_name in camera_names:
         rgb = np.asarray(current_packet["cameras"][camera_name]["rgb"], dtype=np.uint8)
         frame[f"observation.images.{camera_name}"] = np.transpose(rgb, (2, 0, 1))

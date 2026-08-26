@@ -33,6 +33,14 @@ world origin, but their axes differ. World axes are `+x` forward, `+y` left,
 the resulting fixed `world_T_tag` transform in `metadata.json`. It intentionally
 does not depend on OpenCV and does not estimate camera transforms.
 
+The stored Tag axes describe the physical printed marker: `+x` points toward
+the marker's right edge, `+y` toward its bottom edge, and `+z` into the paper.
+For the installed marker, OpenCV's decoded corner order makes the
+`SOLVEPNP_IPPE_SQUARE` frame point `+x` toward the physical marker's left edge,
+`+y` toward its bottom edge, and `+z` out of the paper. The processing script
+therefore applies the required fixed 180 degree rotation about physical Tag
+`+y` before composing the PnP pose with `world_T_tag`.
+
 Run the separate processing step after installing OpenCV contrib and SciPy:
 
 ```bash
@@ -133,11 +141,52 @@ only the nominal CAD transform; verify it against the physical mount and the
 real FR3 `fr3_link8`/flange/controller EE frame. The end-effector AprilTag
 hand-eye calibration remains the source of truth for the installed transform.
 
-Process the captured eye-to-hand samples offline with:
+## Selecting samples from a LeRobot recording
+
+Recordings made by `scripts/start_data_collection_client.sh` and
+`scripts/start_data_collection_server.sh` store synchronized robot poses in
+Parquet and `cam_front` images in a video. Use the interactive selector to
+choose exactly 20 frames and convert them to the `sample_######` format expected
+by `calibrate_camera_to_robot_base.py`.
+
+The selector contains the D435 Color 640x480 intrinsics from
+`D435内参表.txt`, including its five Inverse Brown Conrady coefficients. It
+checks that the `cam_front` video is exactly 640x480 before exporting.
+
+Run the selector once for each arm:
+
+```bash
+python calibration/select_camera_calibration_samples.py \
+  --input calibration/runs/left_arm_camera_calibration \
+  --output calibration/runs/left_arm_camera_calibration_samples
+
+python calibration/select_camera_calibration_samples.py \
+  --input calibration/runs/right_arm_camera_calibration \
+  --output calibration/runs/right_arm_camera_calibration_samples
+```
+
+The selector additionally requires `pyarrow`, Pillow, Tkinter, and the
+`ffmpeg`/`ffprobe` executables. These are only needed to read the LeRobot
+Parquet/video recording and display the selection interface; the calibration
+solver's dependencies remain unchanged.
+
+Use the timeline or arrow keys to locate a pose, then click **Add frame** (or
+press Space). The interface enables **Export samples** after exactly 20 distinct
+frames have been selected. Each exported `sample.json` records the source
+episode, frame index, timestamp, built-in camera intrinsics, and the synchronized
+`B_T_E` converted from `observation.ee_pose`.
+
+After selection, run the existing calibration solver manually:
 
 ```bash
 python calibration/calibrate_camera_to_robot_base.py \
-  --input calibration/runs/eye_to_hand_camera \
+  --input calibration/runs/left_arm_camera_calibration_samples \
+  --tag-size-m 0.080 \
+  --tag-family tag36h11 \
+  --tag-id 0
+
+python calibration/calibrate_camera_to_robot_base.py \
+  --input calibration/runs/right_arm_camera_calibration_samples \
   --tag-size-m 0.080 \
   --tag-family tag36h11 \
   --tag-id 0
@@ -185,4 +234,5 @@ The input formats differ:
   an RGB `.npy` file.
 - `calibrate_camera_to_robot_base.py` reads the current eye-to-hand format:
   `sample_######/sample.json` plus `sample_######/rgb.npy`, including the
-  measured `B_T_E` matrix in each sample.
+  measured `B_T_E` matrix in each sample. The interactive selector above
+  converts LeRobot recordings into this format.

@@ -21,6 +21,20 @@ DEFAULT_WORLD_T_TAG = np.asarray(
     dtype=np.float64,
 )
 
+# For the installed marker, the ArUco corner order makes IPPE_SQUARE +x point
+# toward the physical marker's left edge, +y toward its bottom edge, and +z out
+# of the paper.  The physical frame uses +x right, +y bottom, and +z into the
+# paper, so the two frames differ by 180 degrees about physical +y.
+PHYSICAL_TAG_T_PNP_TAG = np.asarray(
+    [
+        [-1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
 
 def world_t_tag_from_metadata(metadata: dict[str, Any]) -> np.ndarray:
     """Return the fixed tabletop Tag pose, including legacy-data fallback."""
@@ -104,8 +118,10 @@ def main() -> int:
         [[-half, half, 0.0], [half, half, 0.0], [half, -half, 0.0], [-half, -half, 0.0]],
         dtype=np.float64,
     )
-    # The centers coincide, but the physical Tag and world axes differ.
+    # Metadata describes the physical printed Tag frame, while solvePnP below
+    # returns the IPPE Tag frame dictated by object_points.
     world_t_tag = world_t_tag_from_metadata(metadata)
+    world_t_pnp_tag = world_t_tag @ PHYSICAL_TAG_T_PNP_TAG
     records: list[dict[str, Any]] = []
     for frame in metadata.get("frames", []):
         image = np.load(args.input / frame["rgb_file"])
@@ -119,7 +135,7 @@ def main() -> int:
         camera_t_tag = np.eye(4, dtype=np.float64)
         camera_t_tag[:3, :3] = rotation
         camera_t_tag[:3, 3] = tvec.reshape(3)
-        world_t_camera = world_t_tag @ invert(camera_t_tag)
+        world_t_camera = world_t_pnp_tag @ invert(camera_t_tag)
         projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, distortion)
         reprojection_px = float(np.sqrt(np.mean(np.sum((projected.reshape(4, 2) - corners) ** 2, axis=1))))
         records.append({"index": frame["index"], "world_T_camera": matrix_to_list(world_t_camera), "camera_T_tag": matrix_to_list(camera_t_tag), "reprojection_rmse_px": reprojection_px})
@@ -133,7 +149,19 @@ def main() -> int:
     estimate = np.eye(4, dtype=np.float64)
     estimate[:3, :3] = mean_rotation.as_matrix()
     estimate[:3, 3] = median_translation
-    result = {"format": "real_exp_camera_to_world_v1", "input": str(args.input), "tag": {"family": args.tag_family, "id": args.tag_id, "size_m": args.tag_size_m}, "world_T_tag": matrix_to_list(world_t_tag), "world_T_camera": matrix_to_list(estimate), "valid_detections": len(records), "reprojection_rmse_px_median": float(np.median([r["reprojection_rmse_px"] for r in records])), "frames": records}
+    result = {
+        "format": "real_exp_camera_to_world_v1",
+        "input": str(args.input),
+        "tag": {"family": args.tag_family, "id": args.tag_id, "size_m": args.tag_size_m},
+        "world_T_tag": matrix_to_list(world_t_tag),
+        "physical_tag_T_pnp_tag": matrix_to_list(PHYSICAL_TAG_T_PNP_TAG),
+        "world_T_camera": matrix_to_list(estimate),
+        "valid_detections": len(records),
+        "reprojection_rmse_px_median": float(
+            np.median([record["reprojection_rmse_px"] for record in records])
+        ),
+        "frames": records,
+    }
     output = args.output or (args.input / "camera_to_world.json")
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(f"saved {output} from {len(records)} detections; median reprojection RMSE={result['reprojection_rmse_px_median']:.3f}px")

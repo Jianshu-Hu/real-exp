@@ -56,28 +56,30 @@ wait_for_phase() {
   fi
 }
 
-# Launch diffusion and ACT together for target-joint state/actions.
+# Schema-v2 changes the joint action from absolute target to chunk-anchored
+# delta, so the old joint checkpoints are intentionally preserved but are not
+# reused. Each phase starts its two policy families concurrently; the EE phase
+# starts only after both joint jobs have completed successfully.
 start_training \
   joint_diffusion \
-  outputs/test-ee-pick-and-place-final_joint_diffusion \
+  outputs/test-ee-pick-and-place-final_v2_joint_diffusion \
   --policy-type diffusion \
   --state-action-mode joint
 start_training \
   joint_act \
-  outputs/test-ee-pick-and-place-final_joint_act \
+  outputs/test-ee-pick-and-place-final_v2_joint_act \
   --policy-type act \
   --state-action-mode joint
 wait_for_phase joint
 
-# Start the EE jobs only after both joint-mode jobs complete successfully.
 start_training \
   ee_diffusion \
-  outputs/test-ee-pick-and-place-final_ee_diffusion \
+  outputs/test-ee-pick-and-place-final_v2_ee_diffusion \
   --policy-type diffusion \
   --state-action-mode end_effector
 start_training \
   ee_act \
-  outputs/test-ee-pick-and-place-final_ee_act \
+  outputs/test-ee-pick-and-place-final_v2_ee_act \
   --policy-type act \
   --state-action-mode end_effector
 wait_for_phase end_effector

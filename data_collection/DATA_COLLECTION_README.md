@@ -361,8 +361,10 @@ The dataset records all representation-neutral robot fields on every frame:
 
 - `observation.joint_state`: measured robot joints, plus gripper/hand state when enabled
 - `action.target_joint`: accepted/commanded joint targets, plus gripper/hand targets when enabled
-- `observation.ee_pose`: measured end-effector pose (`x,y,z,roll,pitch,yaw` per arm)
-- `action.delta_ee_pose`: target EE pose minus measured EE pose
+- `observation.ee_pose`: measured end-effector pose as position plus continuous 6D rotation (9 values per arm)
+- `action.target_ee_pose`: absolute target EE pose in the same 9D representation
+- `action.delta_ee_pose`: base-frame translation plus spatial rotation-vector delta (6 values per arm)
+- `action.delta_joint`: target joint minus measured joint (7 values per arm)
 - `observation.state` and `action`: the bridge's selected compatibility/training view
 - `observation.images.<camera_name>`: enabled RGB video streams (`cam_left`, `cam_front`, and `cam_right` for duo; `cam_left` and `cam_front` for single-arm collection)
 
@@ -375,15 +377,14 @@ The bridge expects:
 - Gripper commands on a topic like `/left/gripper/gripper_client/target_gripper_width_percent`
 - RGB image topics for each camera enabled by the selected bridge configuration
 
-By default the bridge publishes current measured robot joint states as `observation.state` and uses the robot-accepted target topic (`/left|right/gello/accepted_joint_states`) as the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
+By default the bridge publishes current measured robot joint states as `observation.state` and records both neutral absolute targets and schema-v2 deltas. Joint-mode policy actions are chunk-anchored joint deltas; EE-mode policy actions are chunk-anchored position plus spatial rotation-vector deltas. The neutral absolute fields remain the replay, validation, and training source of truth.
 
 The bridge also subscribes to each arm's `franka_robot_state_broadcaster/robot_state`
-topic. Every recorded frame contains all four robot representations regardless of
-the selected training view. Set the bridge YAML parameter
-`state_action_mode: end_effector` to make the policy-facing vectors use
-`observation.state = current end-effector pose` and
-`action = target pose - current pose`; the default `joint` mode keeps
-`observation.state = measured joints` and `action = absolute target joints`.
+topic. Every recorded frame contains all neutral fields regardless of the
+selected training view. Set `state_action_mode: end_effector` to expose 9D EE
+state and 6D spatial-rotation-vector action; `joint` exposes measured joints
+and joint deltas. Grippers remain current normalized width in state and target
+width in action, while hands remain current/target joint angles.
 
 New datasets use continuous normalized gripper commands with
 `gripper_action_representation=absolute_width`. The recorder preserves values

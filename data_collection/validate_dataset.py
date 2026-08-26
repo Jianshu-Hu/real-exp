@@ -27,6 +27,9 @@ if str(LOCAL_LEROBOT_SRC) not in sys.path:
     sys.path.insert(0, str(LOCAL_LEROBOT_SRC))
 
 from utils.trajectory_metadata import (  # noqa: E402
+    ARM_JOINT_DIM,
+    EE_ACTION_DIM,
+    EE_STATE_DIM,
     require_dataset_trajectory_config,
     validate_action_trajectory_contract,
 )
@@ -48,6 +51,8 @@ EE_DELTA_ORIENTATION_TOLERANCE_RAD = 1e-5
 def trajectory_vector_layout(
     trajectory_config: dict[str, Any],
     vector_size: int,
+    *,
+    kind: str = "action",
 ) -> tuple[dict[str, slice], tuple[int, ...]]:
     """Return arm slices and gripper indices from trajectory metadata.
 
@@ -74,8 +79,15 @@ def trajectory_vector_layout(
             f"unsupported end-effector mode {end_effector!r}; expected arm, gripper, or hand"
         )
 
+    if kind not in {"state", "action"}:
+        raise ValueError(f"unsupported trajectory vector kind {kind!r}")
     is_ee = str(trajectory_config.get("state_action_mode", "joint")).strip().lower() == "end_effector"
-    arm_value_size = 6 if is_ee else 7
+    schema_version = int(trajectory_config.get("schema_version", 1))
+    arm_value_size = (
+        (EE_STATE_DIM if kind == "state" and schema_version >= 2 else EE_ACTION_DIM)
+        if is_ee
+        else ARM_JOINT_DIM
+    )
     block_size = arm_value_size + end_effector_size
     expected_size = block_size * len(arms)
     if vector_size != expected_size:
@@ -89,7 +101,7 @@ def trajectory_vector_layout(
         for block_index, arm in enumerate(arms)
     }
     gripper_indices = (
-        tuple(block_index * block_size + 7 for block_index in range(len(arms)))
+        tuple(block_index * block_size + arm_value_size for block_index in range(len(arms)))
         if end_effector == "gripper"
         else ()
     )
@@ -101,6 +113,15 @@ def legacy_vector_layout(vector_size: int) -> tuple[dict[str, slice], tuple[int,
     arm_layout = dict(arm_joint_slices(vector_size))
     gripper_indices = {8: (7,), 16: (7, 15)}.get(vector_size, ())
     return arm_layout, gripper_indices
+
+
+def joint_vector_layout(
+    trajectory_config: dict[str, Any], vector_size: int
+) -> tuple[dict[str, slice], tuple[int, ...]]:
+    """Return the layout of representation-neutral joint state/target fields."""
+    config = dict(trajectory_config)
+    config["state_action_mode"] = "joint"
+    return trajectory_vector_layout(config, vector_size, kind="state")
 
 
 def parse_args() -> argparse.Namespace:
@@ -337,10 +358,10 @@ def check_state_action_semantics(
                 )
             else:
                 state_layout, state_gripper_indices = trajectory_vector_layout(
-                    trajectory_config, len(first_state)
+                    trajectory_config, len(first_state), kind="state"
                 )
                 action_layout, action_gripper_indices = trajectory_vector_layout(
-                    trajectory_config, len(first_action)
+                    trajectory_config, len(first_action), kind="action"
                 )
         except ValueError as exc:
             issues.append(f"semantic layout check failed: {exc}")
@@ -385,7 +406,11 @@ def check_state_action_semantics(
             metric_name = f"max_{arm_name}_arm_delta"
             metrics[metric_name] = max(metrics[metric_name], arm_max)
             if (
-                arm_action_representation in {"delta_joint_position", "delta_end_effector_pose"}
+                arm_action_representation in {
+                    "delta_joint_position",
+                    "delta_end_effector_pose",
+                    "delta_end_effector_position_rotation_vector",
+                }
                 and arm_max > action_outlier_threshold
             ):
                 action_outlier[f"{arm_name}_max"] = arm_max
@@ -406,54 +431,15 @@ def check_state_action_semantics(
             + (" ..." if len(unique_frames) > 10 else "")
         )
 
-    if metrics["arm_action_outlier_frames"]:
-        sample = metrics["arm_action_outlier_frames"][:5]
-        issues.append(
-            f"{len(metrics['arm_action_outlier_frames'])} arm action outlier frame(s) above "
-            f"{action_outlier_threshold}: {sample}"
-        )
-
-    if arm_action_representation == "delta_joint_position" and len(sorted_rows) >= 2:
-        for idx in range(len(sorted_rows) - 1):
-            state = states[idx]
-            next_state = states[idx + 1]
-            action = actions[idx]
-            frame_index = frame_indices[idx]
-
-            shared_arms = [arm for arm in state_layout if arm in action_layout]
-            if not shared_arms:
-                continue
-
-            errors: list[float] = []
-            for arm_name in shared_arms:
-                state_slice = state_layout[arm_name]
-                action_slice = action_layout[arm_name]
-                if (
-                    state_slice.stop is None
-                    or action_slice.stop is None
-                    or state_slice.stop > len(state)
-                    or state_slice.stop > len(next_state)
-                    or action_slice.stop > len(action)
-                ):
-                    continue
-                expected = np.asarray(next_state[state_slice]) - np.asarray(
-                    state[state_slice]
-                )
-                actual = np.asarray(action[action_slice])
-                errors.extend(np.abs(actual - expected).tolist())
-            frame_error = max(errors, default=0.0)
-            metrics["delta_action_max_error"] = max(
-                metrics["delta_action_max_error"], frame_error
-            )
-            if frame_error > delta_action_tolerance:
-                metrics["delta_action_bad_frames"] += 1
-
-        if metrics["delta_action_bad_frames"]:
-            issues.append(
-                f"delta-action check failed on {metrics['delta_action_bad_frames']} frame(s); "
-                f"max error {metrics['delta_action_max_error']:.6g} > tolerance {delta_action_tolerance}"
-            )
-    elif arm_action_representation not in {"absolute_joint_position", "delta_end_effector_pose"}:
+    # Delta correctness is checked against representation-neutral absolute
+    # targets below. A large target-minus-measured value is useful telemetry,
+    # but is not by itself schema corruption and therefore remains diagnostic.
+    if arm_action_representation not in {
+        "absolute_joint_position",
+        "delta_joint_position",
+        "delta_end_effector_pose",
+        "delta_end_effector_position_rotation_vector",
+    }:
         issues.append(f"unsupported arm action representation '{arm_action_representation}'")
 
     return issues, metrics
@@ -466,7 +452,8 @@ def check_ee_state_action_semantics(
 ) -> tuple[list[str], dict[str, Any]]:
     """Validate persisted EE observations/actions alongside the primary vectors."""
     arms = list(trajectory_config["arms"])
-    pose_dim = 6 * len(arms)
+    state_pose_dim = EE_STATE_DIM * len(arms)
+    action_pose_dim = EE_ACTION_DIM * len(arms)
     state_action_mode = str(trajectory_config.get("state_action_mode", "joint")).strip().lower()
     issues: list[str] = []
     metrics = {
@@ -482,24 +469,28 @@ def check_ee_state_action_semantics(
         frame_index = int(row["frame_index"])
         ee_state = flatten_numeric(row.get("observation.ee_pose"))
         ee_action = flatten_numeric(row.get("action.delta_ee_pose"))
-        if len(ee_state) != pose_dim or has_non_finite(ee_state):
+        if len(ee_state) != state_pose_dim or has_non_finite(ee_state):
             metrics["ee_state_missing_frames"].append(frame_index)
-        if len(ee_action) != pose_dim or has_non_finite(ee_action):
+        if len(ee_action) != action_pose_dim or has_non_finite(ee_action):
             metrics["ee_action_missing_frames"].append(frame_index)
         if (
-            len(ee_state) != pose_dim
+            len(ee_state) != state_pose_dim
             or has_non_finite(ee_state)
-            or len(ee_action) != pose_dim
+            or len(ee_action) != action_pose_dim
             or has_non_finite(ee_action)
         ):
             continue
 
         state = flatten_numeric(row.get("observation.state"))
         action = flatten_numeric(row.get("action"))
-        if state_action_mode == "end_effector" and len(state) >= pose_dim:
+        if state_action_mode == "end_effector":
             try:
-                state_layout, _ = trajectory_vector_layout(trajectory_config, len(state))
-                action_layout, _ = trajectory_vector_layout(trajectory_config, len(action))
+                state_layout, _ = trajectory_vector_layout(
+                    trajectory_config, len(state), kind="state"
+                )
+                action_layout, _ = trajectory_vector_layout(
+                    trajectory_config, len(action), kind="action"
+                )
             except ValueError:
                 metrics["ee_layout_invalid_frames"].append(frame_index)
                 continue
@@ -509,11 +500,10 @@ def check_ee_state_action_semantics(
             metrics["max_ee_state_error"] = max(metrics["max_ee_state_error"], state_error)
             if state_error > tolerance:
                 metrics["ee_state_mismatch_frames"].append(frame_index)
-            if len(action) >= pose_dim:
-                action_error = float(np.max(np.abs(np.asarray(ee_action) - action_pose)))
-                metrics["max_ee_action_error"] = max(metrics["max_ee_action_error"], action_error)
-                if action_error > tolerance:
-                    metrics["ee_action_mismatch_frames"].append(frame_index)
+            action_error = float(np.max(np.abs(np.asarray(ee_action) - action_pose)))
+            metrics["max_ee_action_error"] = max(metrics["max_ee_action_error"], action_error)
+            if action_error > tolerance:
+                metrics["ee_action_mismatch_frames"].append(frame_index)
 
     if metrics["ee_state_missing_frames"]:
         issues.append(
@@ -552,9 +542,11 @@ def check_ee_joint_kinematic_consistency(
 ) -> tuple[list[str], dict[str, Any]]:
     """Cross-check both EE representations against the recorded joint fields."""
     from utils.fr3_kinematics import (
+        apply_ee_delta,
+        ee_state_to_matrix,
         infer_flange_to_ee,
-        pose_error,
         pose_vector_to_matrix,
+        pose_error,
     )
 
     arms = list(trajectory_config["arms"])
@@ -573,8 +565,10 @@ def check_ee_joint_kinematic_consistency(
         "max_ee_target_fk_position_error_m": 0.0,
         "max_ee_target_fk_orientation_error_rad": 0.0,
     }
-    valid_rows: list[tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-    expected_pose_dim = 6 * len(arms)
+    valid_rows: list[tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    legacy_pose = int(trajectory_config.get("schema_version", 1)) == 1
+    expected_state_pose_dim = (6 if legacy_pose else EE_STATE_DIM) * len(arms)
+    expected_action_pose_dim = 6 * len(arms)
     expected_joint_dim = joint_stride * len(arms)
     for row in ordered_rows:
         frame = int(row["frame_index"])
@@ -583,12 +577,12 @@ def check_ee_joint_kinematic_consistency(
         target_ee = np.asarray(flatten_numeric(row.get("action.target_ee_pose")), dtype=float)
         observed_joint = np.asarray(flatten_numeric(row.get("observation.joint_state")), dtype=float)
         target_joint = np.asarray(flatten_numeric(row.get("action.target_joint")), dtype=float)
-        if target_ee.shape != (expected_pose_dim,) or not np.all(np.isfinite(target_ee)):
+        if target_ee.shape != (expected_state_pose_dim,) or not np.all(np.isfinite(target_ee)):
             metrics["target_ee_missing_frames"].append(frame)
             continue
         if (
-            observed_ee.shape != (expected_pose_dim,)
-            or delta_ee.shape != (expected_pose_dim,)
+            observed_ee.shape != (expected_state_pose_dim,)
+            or delta_ee.shape != (expected_action_pose_dim,)
             or observed_joint.shape != (expected_joint_dim,)
             or target_joint.shape != (expected_joint_dim,)
             or not all(
@@ -609,21 +603,30 @@ def check_ee_joint_kinematic_consistency(
         return issues, metrics
 
     for arm_index, arm_name in enumerate(arms):
-        pose_slice = slice(arm_index * 6, arm_index * 6 + 6)
+        state_width = 6 if legacy_pose else EE_STATE_DIM
+        state_pose_slice = slice(arm_index * state_width, arm_index * state_width + state_width)
+        action_pose_slice = slice(
+            arm_index * EE_ACTION_DIM, arm_index * EE_ACTION_DIM + EE_ACTION_DIM
+        )
         joint_offset = arm_index * joint_stride
         joint_slice = slice(joint_offset, joint_offset + 7)
         flange_to_ee = infer_flange_to_ee(
             kinematics,
             np.asarray([item[4][joint_slice] for item in valid_rows]),
-            np.asarray([item[1][pose_slice] for item in valid_rows]),
+            np.asarray([item[1][state_pose_slice] for item in valid_rows]),
         )
         for row, observed_ee, delta_ee, target_ee, observed_joint, target_joint in valid_rows:
             frame = int(row["frame_index"])
-            observed_matrix = pose_vector_to_matrix(observed_ee[pose_slice])
-            target_matrix = pose_vector_to_matrix(target_ee[pose_slice])
-            reconstructed_matrix = pose_vector_to_matrix(
-                observed_ee[pose_slice] + delta_ee[pose_slice]
-            )
+            if legacy_pose:
+                observed_matrix = pose_vector_to_matrix(observed_ee[state_pose_slice])
+                target_matrix = pose_vector_to_matrix(target_ee[state_pose_slice])
+                reconstructed_matrix = pose_vector_to_matrix(
+                    observed_ee[state_pose_slice] + delta_ee[action_pose_slice]
+                )
+            else:
+                observed_matrix = ee_state_to_matrix(observed_ee[state_pose_slice])
+                target_matrix = ee_state_to_matrix(target_ee[state_pose_slice])
+                reconstructed_matrix = apply_ee_delta(observed_matrix, delta_ee[action_pose_slice])
             delta_position, delta_orientation = pose_error(
                 reconstructed_matrix, target_matrix
             )
@@ -694,45 +697,84 @@ def check_joint_state_action_fields(
     metrics = {
         "joint_state_missing_frames": [],
         "joint_action_missing_frames": [],
+        "joint_delta_missing_frames": [],
         "joint_state_mismatch_frames": [],
         "joint_action_mismatch_frames": [],
+        "joint_delta_mismatch_frames": [],
+        "max_joint_delta_error": 0.0,
     }
     for row in sorted(rows, key=lambda item: int(item["frame_index"])):
         frame = int(row["frame_index"])
         joint_state = flatten_numeric(row.get("observation.joint_state"))
         target_joint = flatten_numeric(row.get("action.target_joint"))
+        delta_joint = flatten_numeric(row.get("action.delta_joint"))
         if len(joint_state) != joint_dim or has_non_finite(joint_state):
             metrics["joint_state_missing_frames"].append(frame)
         if len(target_joint) != joint_dim or has_non_finite(target_joint):
             metrics["joint_action_missing_frames"].append(frame)
+        if len(delta_joint) != ARM_JOINT_DIM * len(arms) or has_non_finite(delta_joint):
+            metrics["joint_delta_missing_frames"].append(frame)
         if len(joint_state) != joint_dim or len(target_joint) != joint_dim:
             continue
+        joint_layout, _ = joint_vector_layout(trajectory_config, joint_dim)
+        expected_delta = np.concatenate(
+            [
+                np.asarray(target_joint[joint_layout[arm]], dtype=float)
+                - np.asarray(joint_state[joint_layout[arm]], dtype=float)
+                for arm in arms
+            ]
+        )
+        if len(delta_joint) == len(expected_delta):
+            delta_error = float(
+                np.max(np.abs(np.asarray(delta_joint, dtype=float) - expected_delta))
+            )
+            metrics["max_joint_delta_error"] = max(
+                metrics["max_joint_delta_error"], delta_error
+            )
+            if delta_error > 1e-6:
+                metrics["joint_delta_mismatch_frames"].append(frame)
         if str(trajectory_config.get("state_action_mode", "joint")).strip().lower() == "joint":
             state = flatten_numeric(row.get("observation.state"))
             action = flatten_numeric(row.get("action"))
             if len(state) == joint_dim and len(action) == joint_dim:
-                state_arm_values: list[float] = []
-                action_arm_values: list[float] = []
-                joint_state_arm_values: list[float] = []
-                target_joint_arm_values: list[float] = []
-                offset = 0
-                for _ in arms:
-                    state_arm_values.extend(state[offset : offset + 7])
-                    action_arm_values.extend(action[offset : offset + 7])
-                    joint_state_arm_values.extend(joint_state[offset : offset + 7])
-                    target_joint_arm_values.extend(target_joint[offset : offset + 7])
-                    offset += 7
-                    offset += 1 if trajectory_config["end_effector"] == "gripper" else 20 if trajectory_config["end_effector"] == "hand" else 0
+                primary_layout, _ = trajectory_vector_layout(
+                    trajectory_config, joint_dim, kind="state"
+                )
+                state_arm_values = np.concatenate(
+                    [np.asarray(state[primary_layout[arm]]) for arm in arms]
+                )
+                action_arm_values = np.concatenate(
+                    [np.asarray(action[primary_layout[arm]]) for arm in arms]
+                )
+                joint_state_arm_values = np.concatenate(
+                    [np.asarray(joint_state[joint_layout[arm]]) for arm in arms]
+                )
                 if not np.allclose(state_arm_values, joint_state_arm_values, atol=1e-6, rtol=0.0):
                     metrics["joint_state_mismatch_frames"].append(frame)
-                if not np.allclose(action_arm_values, target_joint_arm_values, atol=1e-6, rtol=0.0):
+                if not np.allclose(action_arm_values, expected_delta, atol=1e-6, rtol=0.0):
+                    metrics["joint_action_mismatch_frames"].append(frame)
+
+                # Gripper widths and hand angles remain absolute even though
+                # the arm portion of the primary action is a delta.
+                _, primary_end_indices = trajectory_vector_layout(
+                    trajectory_config, joint_dim, kind="action"
+                )
+                _, joint_end_indices = joint_vector_layout(trajectory_config, joint_dim)
+                if primary_end_indices and not np.allclose(
+                    np.asarray(action)[list(primary_end_indices)],
+                    np.asarray(target_joint)[list(joint_end_indices)],
+                    atol=1e-6,
+                    rtol=0.0,
+                ):
                     metrics["joint_action_mismatch_frames"].append(frame)
     issues: list[str] = []
     for key, label in (
         ("joint_state_missing_frames", "observation.joint_state"),
         ("joint_action_missing_frames", "action.target_joint"),
+        ("joint_delta_missing_frames", "action.delta_joint"),
         ("joint_state_mismatch_frames", "observation.joint_state disagrees with observation.state"),
-        ("joint_action_mismatch_frames", "action.target_joint disagrees with action"),
+        ("joint_action_mismatch_frames", "joint delta/absolute end-effector targets disagree with action"),
+        ("joint_delta_mismatch_frames", "action.delta_joint does not reconstruct action.target_joint"),
     ):
         if metrics[key]:
             issues.append(f"{label} at frames {metrics[key][:10]}")
@@ -842,8 +884,14 @@ def check_joint_safety_constraints(
         return [], [], empty_metrics.copy()
 
     sorted_rows = sorted(rows, key=lambda row: int(row["frame_index"]))
-    states = [flatten_numeric(row.get("observation.state")) for row in sorted_rows]
-    actions = [flatten_numeric(row.get("action")) for row in sorted_rows]
+    states = [
+        flatten_numeric(row.get("observation.joint_state", row.get("observation.state")))
+        for row in sorted_rows
+    ]
+    actions = [
+        flatten_numeric(row.get("action.target_joint", row.get("action")))
+        for row in sorted_rows
+    ]
     timestamps = np.asarray(
         [float(row["timestamp"]) for row in sorted_rows],
         dtype=np.float64,
@@ -877,12 +925,8 @@ def check_joint_safety_constraints(
             state_layout, _ = legacy_vector_layout(len(states[0]))
             action_layout, _ = legacy_vector_layout(len(actions[0]))
         else:
-            state_layout, _ = trajectory_vector_layout(
-                trajectory_config, len(states[0])
-            )
-            action_layout, _ = trajectory_vector_layout(
-                trajectory_config, len(actions[0])
-            )
+            state_layout, _ = joint_vector_layout(trajectory_config, len(states[0]))
+            action_layout, _ = joint_vector_layout(trajectory_config, len(actions[0]))
     except ValueError as exc:
         return [f"joint safety check skipped: {exc}"], warnings, metrics
 
@@ -929,9 +973,12 @@ def check_joint_safety_constraints(
             )
 
         action_trajectory = action_array[:, action_layout[arm_name]]
-        if arm_action_representation in {"delta_joint_position", "delta_end_effector_pose"}:
-            action_trajectory = state_trajectory + action_trajectory
-        elif arm_action_representation not in {"absolute_joint_position", "delta_end_effector_pose"}:
+        if arm_action_representation not in {
+            "absolute_joint_position",
+            "delta_joint_position",
+            "delta_end_effector_pose",
+            "delta_end_effector_position_rotation_vector",
+        }:
             issues.append(
                 f"joint action safety check does not support representation "
                 f"'{arm_action_representation}'"
@@ -1206,7 +1253,9 @@ def validate_dataset(
 
     issues: list[str] = []
     warning_issues: list[str] = [processing_warning] if processing_warning else []
-    expected_ee_dim = 6 * len(trajectory_config["arms"])
+    expected_ee_state_dim = EE_STATE_DIM * len(trajectory_config["arms"])
+    expected_ee_action_dim = EE_ACTION_DIM * len(trajectory_config["arms"])
+    expected_delta_joint_dim = ARM_JOINT_DIM * len(trajectory_config["arms"])
     expected_joint_dim = 7 * len(trajectory_config["arms"])
     if trajectory_config["end_effector"] == "gripper":
         expected_joint_dim += len(trajectory_config["arms"])
@@ -1217,17 +1266,22 @@ def validate_dataset(
     ee_target_dim = get_feature_dim(info, "action.target_ee_pose")
     joint_state_dim = get_feature_dim(info, "observation.joint_state")
     joint_action_dim = get_feature_dim(info, "action.target_joint")
-    if ee_state_dim != expected_ee_dim:
+    delta_joint_dim = get_feature_dim(info, "action.delta_joint")
+    if ee_state_dim != expected_ee_state_dim:
         issues.append(
-            f"observation.ee_pose feature dimension {ee_state_dim!r} != expected {expected_ee_dim}"
+            f"observation.ee_pose feature dimension {ee_state_dim!r} != expected {expected_ee_state_dim}"
         )
-    if ee_action_dim != expected_ee_dim:
+    if ee_action_dim != expected_ee_action_dim:
         issues.append(
-            f"action.delta_ee_pose feature dimension {ee_action_dim!r} != expected {expected_ee_dim}"
+            f"action.delta_ee_pose feature dimension {ee_action_dim!r} != expected {expected_ee_action_dim}"
         )
-    if ee_target_dim != expected_ee_dim:
+    if ee_target_dim != expected_ee_state_dim:
         issues.append(
-            f"action.target_ee_pose feature dimension {ee_target_dim!r} != expected {expected_ee_dim}"
+            f"action.target_ee_pose feature dimension {ee_target_dim!r} != expected {expected_ee_state_dim}"
+        )
+    if delta_joint_dim != expected_delta_joint_dim:
+        issues.append(
+            f"action.delta_joint feature dimension {delta_joint_dim!r} != expected {expected_delta_joint_dim}"
         )
     if joint_state_dim != expected_joint_dim:
         issues.append(
@@ -1290,8 +1344,11 @@ def validate_dataset(
     max_ee_target_fk_orientation_error_rad = 0.0
     total_joint_state_missing_frames = 0
     total_joint_action_missing_frames = 0
+    total_joint_delta_missing_frames = 0
     total_joint_state_mismatch_frames = 0
     total_joint_action_mismatch_frames = 0
+    total_joint_delta_mismatch_frames = 0
+    max_joint_delta_error = 0.0
     total_state_safety_violation_steps = 0
     total_state_motion_warning_steps = 0
     total_action_safety_violation_steps = 0
@@ -1459,8 +1516,13 @@ def validate_dataset(
         episode_issues.extend(joint_issues)
         total_joint_state_missing_frames += len(joint_metrics["joint_state_missing_frames"])
         total_joint_action_missing_frames += len(joint_metrics["joint_action_missing_frames"])
+        total_joint_delta_missing_frames += len(joint_metrics["joint_delta_missing_frames"])
         total_joint_state_mismatch_frames += len(joint_metrics["joint_state_mismatch_frames"])
         total_joint_action_mismatch_frames += len(joint_metrics["joint_action_mismatch_frames"])
+        total_joint_delta_mismatch_frames += len(joint_metrics["joint_delta_mismatch_frames"])
+        max_joint_delta_error = max(
+            max_joint_delta_error, float(joint_metrics["max_joint_delta_error"])
+        )
 
         max_left_arm_delta = max(max_left_arm_delta, float(semantic_metrics["max_left_arm_delta"]))
         max_right_arm_delta = max(max_right_arm_delta, float(semantic_metrics["max_right_arm_delta"]))
@@ -1552,13 +1614,16 @@ def validate_dataset(
         "  joint state/action fields: "
         f"missing_state={total_joint_state_missing_frames}, "
         f"missing_action={total_joint_action_missing_frames}, "
+        f"missing_delta={total_joint_delta_missing_frames}, "
         f"state_mismatch={total_joint_state_mismatch_frames}, "
-        f"action_mismatch={total_joint_action_mismatch_frames}"
+        f"action_mismatch={total_joint_action_mismatch_frames}, "
+        f"delta_mismatch={total_joint_delta_mismatch_frames}, "
+        f"max_delta_error={max_joint_delta_error:.6g}"
     )
     if arm_action_representation == "delta_joint_position":
         print(f"  delta-action tolerance: {delta_action_tolerance:.6g}")
-        print(f"  max delta-action error: {max_delta_action_error:.6g}")
-        print(f"  delta-action bad frames: {total_delta_action_bad_frames}")
+        print(f"  max target-reconstruction error: {max_joint_delta_error:.6g}")
+        print(f"  target-reconstruction bad frames: {total_joint_delta_mismatch_frames}")
     else:
         print("  delta-action consistency check: skipped for absolute_joint_position actions")
 

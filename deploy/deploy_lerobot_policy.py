@@ -36,12 +36,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from utils.image_preprocessing import ResizePadSquare, infer_square_resize_pad_size_from_policy_features
 from utils.trajectory_metadata import (
+    ARM_JOINT_DIM,
+    EE_ACTION_DIM,
+    EE_STATE_DIM,
     describe_trajectory_layout,
     require_dataset_trajectory_config,
     validate_action_trajectory_contract,
     validate_trajectory_config,
 )
 from utils.deployment_metadata import deployment_camera_names, load_checkpoint_deployment_contract
+from utils.fr3_kinematics import ee_state_to_matrix
 from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.transport.utils import receive_bytes_in_chunks
@@ -304,6 +308,60 @@ def raw_observation_to_observation_with_resize_pad(
         observation["task"] = raw_observation["task"]
 
     return observation
+
+
+def decode_chunk_to_absolute_targets(
+    action_chunk: torch.Tensor,
+    raw_state: Any,
+    trajectory_config: dict[str, Any],
+) -> torch.Tensor:
+    """Decode policy deltas against the exact observation that generated them.
+
+    The executor queue receives absolute targets, so overlapping chunks can be
+    aggregated without mixing deltas anchored at different observations.
+    """
+    values = np.asarray(raw_state, dtype=float)
+    config = trajectory_config
+    arms = list(config["arms"])
+    end_effector = str(config["end_effector"])
+    mode = str(config.get("state_action_mode", "joint"))
+    extra = 1 if end_effector == "gripper" else 20 if end_effector == "hand" else 0
+    rows = action_chunk.detach().cpu().numpy().reshape(-1, action_chunk.shape[-1])
+    out = []
+    if mode == "joint":
+        anchor_blocks = [
+            values[i * (ARM_JOINT_DIM + extra) : (i + 1) * (ARM_JOINT_DIM + extra)]
+            for i in range(len(arms))
+        ]
+        for row in rows:
+            parts = []
+            offset = 0
+            for anchor in anchor_blocks:
+                parts.append(anchor[:ARM_JOINT_DIM] + row[offset : offset + ARM_JOINT_DIM])
+                offset += ARM_JOINT_DIM
+                if extra:
+                    parts.append(row[offset : offset + extra])
+                    offset += extra
+            out.append(np.concatenate(parts))
+    else:
+        anchor_poses = [
+            values[i * (EE_STATE_DIM + extra) : i * (EE_STATE_DIM + extra) + EE_STATE_DIM]
+            for i in range(len(arms))
+        ]
+        for row in rows:
+            parts = []
+            offset = 0
+            for i, anchor_pose in enumerate(anchor_poses):
+                delta = row[offset : offset + EE_ACTION_DIM]
+                from utils.fr3_kinematics import apply_ee_delta, matrix_to_ee_state
+                absolute = matrix_to_ee_state(apply_ee_delta(ee_state_to_matrix(anchor_pose), delta))
+                parts.append(absolute)
+                offset += EE_ACTION_DIM
+                if extra:
+                    parts.append(row[offset : offset + extra])
+                    offset += extra
+            out.append(np.concatenate(parts))
+    return torch.as_tensor(np.asarray(out), dtype=action_chunk.dtype)
 
 
 class CameraBundleCache:
@@ -765,6 +823,13 @@ def make_deployment_policy_server(
             )
 
         def _predict_action_chunk(self, observation_t) -> list[Any]:
+            raw_generation_observation = raw_observation_to_observation_with_resize_pad(
+                observation_t.get_observation(),
+                self.lerobot_features,
+                self.policy_image_features,
+                self.image_preprocess,
+                self.rename_map,
+            )
             observation = self._prepare_policy_observation(observation_t)
             action_tensor = self._get_action_chunk(observation, observation_t)
 
@@ -776,6 +841,12 @@ def make_deployment_policy_server(
                 processed_actions.append(processed_action)
 
             action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+            if self.deployment_contract["action_config"].get("delta_alignment") == "chunk_anchor":
+                action_tensor = decode_chunk_to_absolute_targets(
+                    action_tensor,
+                    raw_generation_observation[OBS_STATE].squeeze(0),
+                    self.deployment_contract["trajectory_config"],
+                )
             action_tensor = action_tensor.detach().cpu()
 
             action_anchor_timestep = getattr(observation_t, "action_timestep", observation_t.get_timestep())
@@ -989,25 +1060,25 @@ def inspect_policy(policy_path: Path, dataset_root: Path | None = None) -> None:
                     "Dataset and checkpoint hardware trajectory contracts disagree: "
                     + ", ".join(hardware_mismatches)
                 )
-            selected_state_key = (
-                "observation.ee_pose"
-                if trajectory_cfg.get("state_action_mode") == "end_effector"
-                else "observation.state"
-            )
-            selected_action_key = (
-                "action.delta_ee_pose"
-                if trajectory_cfg.get("state_action_mode") == "end_effector"
-                else "action"
-            )
-            for key in (selected_state_key, selected_action_key):
+            selected_keys = ("observation.state", "action")
+            if trajectory_cfg.get("state_action_mode") == "end_effector":
+                # Auxiliary EE fields are arm-only. An EE checkpoint additionally
+                # consumes the gripper widths or hand joints from these fields.
+                selected_keys = (
+                    "observation.ee_pose",
+                    "action.target_ee_pose",
+                    "observation.joint_state",
+                    "action.target_joint",
+                )
+            for key in selected_keys:
                 if key not in source_info.get("features", {}):
                     raise ValueError(
                         f"Dataset does not contain the checkpoint-selected feature {key!r}."
                     )
             dataset_info = dict(source_info)
             dataset_info["features"] = dict(source_info["features"])
-            dataset_info["features"]["observation.state"] = source_info["features"][selected_state_key]
-            dataset_info["features"]["action"] = source_info["features"][selected_action_key]
+            dataset_info["features"]["observation.state"] = checkpoint_contract["features"]["observation.state"]
+            dataset_info["features"]["action"] = checkpoint_contract["features"]["action"]
         else:
             dataset_info = source_info
 
@@ -1047,10 +1118,14 @@ def inspect_policy(policy_path: Path, dataset_root: Path | None = None) -> None:
             f"arm={arm_action_representation}, "
             f"gripper={action_cfg.get('gripper_action_representation')}"
         )
-        if arm_action_representation not in {"absolute_joint_position", "delta_end_effector_pose"}:
+        if arm_action_representation not in {
+            "absolute_joint_position",
+            "delta_joint_position",
+            "delta_end_effector_pose",
+            "delta_end_effector_position_rotation_vector",
+        }:
             print(
-                "warning: unsupported arm action representation; expected "
-                "absolute_joint_position or delta_end_effector_pose."
+                "warning: unsupported arm action representation."
             )
 
     print()

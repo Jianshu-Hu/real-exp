@@ -4,14 +4,30 @@ from fractions import Fraction
 
 import av
 import numpy as np
+import pytest
 
 from data_collection.validate_dataset import (
     check_ee_joint_kinematic_consistency,
     check_joint_safety_constraints,
     check_physical_video_frames,
     check_state_action_semantics,
+    trajectory_vector_layout,
 )
 from utils.fr3_kinematics import matrix_to_pose_vector, pose_vector_to_matrix, wrapped_pose_delta
+
+
+def test_ee_duo_gripper_layout_uses_gripper_after_each_pose_block() -> None:
+    trajectory = {
+        "state_action_mode": "end_effector",
+        "end_effector": "gripper",
+        "arm_mode": "duo",
+        "arms": ["left", "right"],
+    }
+
+    layout, gripper_indices = trajectory_vector_layout(trajectory, vector_size=14)
+
+    assert layout == {"left": slice(0, 6), "right": slice(7, 13)}
+    assert gripper_indices == (6, 13)
 
 
 def test_wrapped_pose_delta_avoids_euler_boundary_jump() -> None:

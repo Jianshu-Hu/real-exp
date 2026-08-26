@@ -460,7 +460,9 @@ def require_state_action_mode_dataset(dataset_root: Path, requested_mode: str | 
     if mode == source_mode:
         return trajectory_config
     selected_key = "observation.ee_pose" if mode == "end_effector" else "observation.joint_state"
-    selected_action_key = "action.delta_ee_pose" if mode == "end_effector" else "action.target_joint"
+    # Mode-aware views derive chunk deltas from the neutral absolute targets;
+    # do not window the persisted one-step delta fields.
+    selected_action_key = "action.target_ee_pose" if mode == "end_effector" else "action.target_joint"
     selected_state_dim = int(info["features"][selected_key]["shape"][0])
     selected_action_dim = int(info["features"][selected_action_key]["shape"][0])
     return mode_trajectory_config(

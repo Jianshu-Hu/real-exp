@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 
 TARGET_EE_SOURCE_PAIRED_JOINT_FK = "paired_target_joint_fk_v1"
+EE_STATE_DIM = 9
+EE_ACTION_DIM = 6
 
 
 def _rpy_rotation_matrix(rpy: Any) -> np.ndarray:
@@ -82,6 +84,127 @@ def matrix_to_pose_vector(matrix: Any) -> np.ndarray:
         roll = 0.0
         yaw = float(np.arctan2(-rotation[0, 1], rotation[1, 1]))
     return np.concatenate((transform[:3, 3], (roll, pitch, yaw)))
+
+
+def rotation_matrix_to_6d(rotation: Any) -> np.ndarray:
+    """Return the continuous 6D rotation representation (first two columns)."""
+    matrix = np.asarray(rotation, dtype=float)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError(f"Rotation must be a finite 3x3 matrix, got {matrix.shape}.")
+    return np.concatenate((matrix[:, 0], matrix[:, 1]))
+
+
+def rotation_6d_to_matrix(values: Any) -> np.ndarray:
+    """Recover a proper rotation matrix from two predicted columns via Gram-Schmidt."""
+    vector = np.asarray(values, dtype=float)
+    if vector.shape != (6,) or not np.all(np.isfinite(vector)):
+        raise ValueError(f"6D rotation must contain six finite values, got {vector.shape}.")
+    first_norm = float(np.linalg.norm(vector[:3]))
+    if first_norm < 1e-8:
+        raise ValueError("The first 6D rotation column is degenerate.")
+    first = vector[:3] / first_norm
+    second_raw = vector[3:] - first * float(np.dot(first, vector[3:]))
+    second_norm = float(np.linalg.norm(second_raw))
+    if second_norm < 1e-8:
+        raise ValueError("The two 6D rotation columns are collinear.")
+    second = second_raw / second_norm
+    third = np.cross(first, second)
+    return np.column_stack((first, second, third))
+
+
+def matrix_to_ee_state(matrix: Any) -> np.ndarray:
+    """Convert a transform to position plus continuous 6D rotation (9 values)."""
+    transform = np.asarray(matrix, dtype=float)
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError("EE transform must be a finite 4x4 matrix.")
+    return np.concatenate((transform[:3, 3], rotation_matrix_to_6d(transform[:3, :3])))
+
+
+def ee_state_to_matrix(values: Any) -> np.ndarray:
+    """Convert position plus continuous 6D rotation to a homogeneous transform."""
+    vector = np.asarray(values, dtype=float)
+    if vector.shape != (EE_STATE_DIM,) or not np.all(np.isfinite(vector)):
+        raise ValueError(f"EE state must contain {EE_STATE_DIM} finite values, got {vector.shape}.")
+    transform = np.eye(4, dtype=float)
+    transform[:3, 3] = vector[:3]
+    transform[:3, :3] = rotation_6d_to_matrix(vector[3:])
+    return transform
+
+
+def rotation_matrix_to_rotvec(rotation: Any) -> np.ndarray:
+    """Return the principal SO(3) logarithm of a proper rotation matrix."""
+    matrix = np.asarray(rotation, dtype=float)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError(f"Rotation must be a finite 3x3 matrix, got {matrix.shape}.")
+    # Project small numerical errors back onto SO(3) before taking the logarithm.
+    u, _, vt = np.linalg.svd(matrix)
+    matrix = u @ vt
+    if np.linalg.det(matrix) < 0.0:
+        u[:, -1] *= -1.0
+        matrix = u @ vt
+    cosine = float(np.clip((np.trace(matrix) - 1.0) / 2.0, -1.0, 1.0))
+    angle = float(np.arccos(cosine))
+    vee = np.asarray(
+        (matrix[2, 1] - matrix[1, 2], matrix[0, 2] - matrix[2, 0], matrix[1, 0] - matrix[0, 1]),
+        dtype=float,
+    )
+    if angle < 1e-7:
+        return 0.5 * vee
+    if np.pi - angle < 1e-5:
+        # Near pi, the skew part vanishes. Recover a stable principal axis from R+I.
+        symmetric = (matrix + np.eye(3)) / 2.0
+        axis_index = int(np.argmax(np.diag(symmetric)))
+        axis = symmetric[:, axis_index]
+        norm = float(np.linalg.norm(axis))
+        if norm < 1e-8:
+            eigenvalues, eigenvectors = np.linalg.eigh(matrix)
+            axis = eigenvectors[:, int(np.argmin(np.abs(eigenvalues - 1.0)))]
+            norm = float(np.linalg.norm(axis))
+        axis = axis / norm
+        if float(np.dot(axis, vee)) < 0.0:
+            axis = -axis
+        return angle * axis
+    return (angle / (2.0 * np.sin(angle))) * vee
+
+
+def rotvec_to_rotation_matrix(values: Any) -> np.ndarray:
+    """Return the SO(3) exponential of a three-dimensional rotation vector."""
+    vector = np.asarray(values, dtype=float)
+    if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+        raise ValueError(f"Rotation vector must contain three finite values, got {vector.shape}.")
+    angle = float(np.linalg.norm(vector))
+    skew = np.asarray(
+        ((0.0, -vector[2], vector[1]), (vector[2], 0.0, -vector[0]), (-vector[1], vector[0], 0.0)),
+        dtype=float,
+    )
+    if angle < 1e-7:
+        return np.eye(3) + skew + 0.5 * (skew @ skew)
+    return np.eye(3) + (np.sin(angle) / angle) * skew + ((1.0 - np.cos(angle)) / angle**2) * (skew @ skew)
+
+
+def ee_delta(current: Any, target: Any) -> np.ndarray:
+    """Return base-frame translation and spatial rotation-vector delta."""
+    current_matrix = np.asarray(current, dtype=float)
+    target_matrix = np.asarray(target, dtype=float)
+    if current_matrix.shape != (4, 4) or target_matrix.shape != (4, 4):
+        raise ValueError("Current and target EE transforms must both be 4x4 matrices.")
+    translation = target_matrix[:3, 3] - current_matrix[:3, 3]
+    relative_rotation = target_matrix[:3, :3] @ current_matrix[:3, :3].T
+    return np.concatenate((translation, rotation_matrix_to_rotvec(relative_rotation)))
+
+
+def apply_ee_delta(current: Any, delta: Any) -> np.ndarray:
+    """Apply a base-frame translation/spatial-rotation delta to an EE transform."""
+    current_matrix = np.asarray(current, dtype=float)
+    delta_vector = np.asarray(delta, dtype=float)
+    if current_matrix.shape != (4, 4) or not np.all(np.isfinite(current_matrix)):
+        raise ValueError("Current EE transform must be a finite 4x4 matrix.")
+    if delta_vector.shape != (EE_ACTION_DIM,) or not np.all(np.isfinite(delta_vector)):
+        raise ValueError(f"EE delta must contain {EE_ACTION_DIM} finite values, got {delta_vector.shape}.")
+    target = np.eye(4, dtype=float)
+    target[:3, 3] = current_matrix[:3, 3] + delta_vector[:3]
+    target[:3, :3] = rotvec_to_rotation_matrix(delta_vector[3:]) @ current_matrix[:3, :3]
+    return target
 
 
 def wrapped_pose_delta(current: Any, target: Any) -> np.ndarray:
@@ -194,9 +317,13 @@ def infer_flange_to_ee(
 
     joints = np.asarray(joint_samples, dtype=float)
     poses = np.asarray(ee_pose_samples, dtype=float)
-    if joints.ndim != 2 or joints.shape[1] != 7 or poses.shape != (len(joints), 6):
+    if joints.ndim != 2 or joints.shape[1] != 7 or poses.shape not in {
+        (len(joints), 6),
+        (len(joints), EE_STATE_DIM),
+    }:
         raise ValueError(
-            f"Expected joint/pose samples shaped (N, 7)/(N, 6), got {joints.shape}/{poses.shape}."
+            "Expected joint/pose samples shaped (N, 7)/(N, 6 or 9), "
+            f"got {joints.shape}/{poses.shape}."
         )
     if not np.all(np.isfinite(joints)) or not np.all(np.isfinite(poses)):
         raise ValueError("Tool-transform inference requires finite joint and pose samples.")
@@ -207,7 +334,11 @@ def infer_flange_to_ee(
     )
     inferred = [
         np.linalg.inv(kinematics.flange_pose(joints[index]))
-        @ pose_vector_to_matrix(poses[index])
+        @ (
+            ee_state_to_matrix(poses[index])
+            if poses.shape[1] == EE_STATE_DIM
+            else pose_vector_to_matrix(poses[index])
+        )
         for index in sample_indices
     ]
     transform = np.eye(4, dtype=float)

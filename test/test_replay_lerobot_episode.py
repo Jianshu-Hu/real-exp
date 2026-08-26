@@ -18,6 +18,7 @@ from data_collection.replay_lerobot_episode import (
     parse_args,
     request_hand_status,
     ramp_initial_state_command,
+    split_targets,
     wait_for_start,
     trace_fieldnames,
 )
@@ -164,6 +165,40 @@ def make_episode_data() -> EpisodeData:
         joint_states=state.copy(),
         target_joints=state.copy(),
     )
+
+
+def test_ee_replay_uses_joint_target_widths_from_a_joint_primary_dataset() -> None:
+    primary_actions = np.arange(16, dtype=float).reshape(1, 16)
+    target_joints = np.arange(100, 116, dtype=float).reshape(1, 16)
+    target_joints[0, 7] = 0.23
+    target_joints[0, 15] = 0.87
+    data = EpisodeData(
+        states=np.zeros((1, 16), dtype=float),
+        actions=primary_actions,
+        frame_indices=np.asarray([0]),
+        timestamps=np.asarray([0.0]),
+        fps=15.0,
+        action_config={},
+        ee_poses=np.zeros((1, 12), dtype=float),
+        delta_ee_poses=np.arange(12, dtype=float).reshape(1, 12),
+        target_ee_poses=np.zeros((1, 12), dtype=float),
+        joint_states=np.zeros((1, 16), dtype=float),
+        target_joints=target_joints,
+        trajectory_config={
+            "state_action_mode": "joint",
+            "end_effector": "gripper",
+            "arm_mode": "duo",
+            "arms": ["left", "right"],
+        },
+        replay_mode="ee",
+    )
+
+    targets = split_targets(data)
+
+    np.testing.assert_array_equal(targets["left_delta_ee_pose"], np.arange(6, dtype=float).reshape(1, 6))
+    np.testing.assert_array_equal(targets["right_delta_ee_pose"], np.arange(6, 12, dtype=float).reshape(1, 6))
+    assert targets["left_gripper_raw"] == pytest.approx([0.23])
+    assert targets["right_gripper_raw"] == pytest.approx([0.87])
 
 
 def test_internal_wuji_worker_does_not_require_dataset_root() -> None:

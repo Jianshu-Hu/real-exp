@@ -32,6 +32,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils.trajectory_metadata import (
+    EE_ACTION_DIM,
+    EE_STATE_DIM,
     require_dataset_trajectory_config,
     validate_action_trajectory_contract,
     validate_setting,
@@ -311,11 +313,13 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
     arm_action_representation = str(action_config.get("arm_action_representation", "")).strip().lower()
     if arm_action_representation not in {
         "absolute_joint_position",
+        "delta_joint_position",
         "delta_end_effector_pose",
+        "delta_end_effector_position_rotation_vector",
     }:
         raise ValueError(
             "LeRobot episode replay requires arm_action_representation="
-            "absolute_joint_position or delta_end_effector_pose, got "
+            "a supported joint/EE action representation, got "
             f"{arm_action_representation!r}."
         )
     gripper_action_representation = str(
@@ -390,9 +394,9 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
     rows.sort(key=lambda item: item[0])
     states = np.asarray([row[2] for row in rows], dtype=float)
     actions = np.asarray([row[3] for row in rows], dtype=float)
-    if states.ndim != 2 or actions.ndim != 2 or states.shape[1] != actions.shape[1]:
+    if states.ndim != 2 or actions.ndim != 2:
         raise ValueError(
-            "Replay requires two-dimensional state/action arrays with matching dimensions. "
+            "Replay requires two-dimensional state/action arrays. "
             f"Got state shape {states.shape}, action shape {actions.shape}."
         )
     validate_action_trajectory_contract(
@@ -404,24 +408,26 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
             f"Trajectory metadata declares action_dim={expected_dim}, but episode data has {actions.shape[1]}."
         )
     if ee_columns_available:
-        expected_ee_dim = 6 * len(trajectory_config["arms"])
+        expected_ee_state_dim = EE_STATE_DIM * len(trajectory_config["arms"])
+        expected_ee_action_dim = EE_ACTION_DIM * len(trajectory_config["arms"])
         ee_poses = np.asarray([row[4] for row in rows], dtype=float)
         delta_ee_poses = np.asarray([row[5] for row in rows], dtype=float)
         if (
-            ee_poses.shape != (len(rows), expected_ee_dim)
-            or delta_ee_poses.shape != (len(rows), expected_ee_dim)
+            ee_poses.shape != (len(rows), expected_ee_state_dim)
+            or delta_ee_poses.shape != (len(rows), expected_ee_action_dim)
             or not np.all(np.isfinite(ee_poses))
             or not np.all(np.isfinite(delta_ee_poses))
         ):
             raise ValueError(
                 "End-effector replay requires finite EE fields with shape "
-                f"({len(rows)}, {expected_ee_dim})."
+                f"({len(rows)}, {expected_ee_state_dim}) state and "
+                f"({len(rows)}, {expected_ee_action_dim}) action."
             )
     else:
         ee_poses = None
         delta_ee_poses = None
     if target_ee_column_available:
-        expected_ee_dim = 6 * len(trajectory_config["arms"])
+        expected_ee_dim = EE_STATE_DIM * len(trajectory_config["arms"])
         target_ee_poses = np.asarray([row[6] for row in rows], dtype=float)
         if (
             target_ee_poses.shape != (len(rows), expected_ee_dim)
@@ -526,7 +532,10 @@ def split_targets(data: EpisodeData, *, source_kind: str = "action") -> dict[str
     arm_mode = str(data.trajectory_config["arm_mode"])
     end_effector = str(data.trajectory_config["end_effector"])
     dataset_mode = str(data.trajectory_config.get("state_action_mode", "joint"))
-    stored_arm_size = 6 if dataset_mode == "end_effector" else 7
+    if dataset_mode == "end_effector":
+        stored_arm_size = EE_STATE_DIM if source_kind == "state" else EE_ACTION_DIM
+    else:
+        stored_arm_size = 7
     replay_mode = data.replay_mode or ("ee" if dataset_mode == "end_effector" else "joint")
     result: dict[str, np.ndarray] = {}
     offset = 0
@@ -542,8 +551,11 @@ def split_targets(data: EpisodeData, *, source_kind: str = "action") -> dict[str
                 raise ValueError(
                     f"EE replay requires the dedicated {source_kind} EE pose field."
                 )
-            arm_values = np.asarray(ee_source[:, ee_offset : ee_offset + 6], dtype=float)
-            ee_offset += 6
+            ee_arm_size = EE_STATE_DIM if source_kind == "state" else EE_ACTION_DIM
+            arm_values = np.asarray(
+                ee_source[:, ee_offset : ee_offset + ee_arm_size], dtype=float
+            )
+            ee_offset += ee_arm_size
         else:
             arm_values = stored_arm_values
         result[f"{side}_arm"] = arm_values
@@ -553,7 +565,7 @@ def split_targets(data: EpisodeData, *, source_kind: str = "action") -> dict[str
         if end_effector == "gripper":
             result[f"{side}_gripper_raw"] = (
                 joint_source[:, joint_offset + 7]
-                if replay_mode == "joint" and joint_source is not None
+                if joint_source is not None
                 else source[:, offset]
             )
             offset += 1
@@ -561,7 +573,7 @@ def split_targets(data: EpisodeData, *, source_kind: str = "action") -> dict[str
         elif end_effector == "hand":
             result[f"{side}_hand"] = (
                 joint_source[:, joint_offset + 7 : joint_offset + 27]
-                if replay_mode == "joint" and joint_source is not None
+                if joint_source is not None
                 else source[:, offset : offset + 20]
             )
             offset += 20
@@ -883,11 +895,8 @@ def solve_delta_ee_pose_target(
     frame_id: int,
 ) -> np.ndarray:
     """Convert a recorded EE delta into the joint target sent to the robot."""
-    from data_collection.move_to_target_ee import (
-        matrix_to_pose_vector,
-        pose_vector_to_matrix,
-        solve_fr3_ik,
-    )
+    from data_collection.move_to_target_ee import solve_fr3_ik
+    from utils.fr3_kinematics import apply_ee_delta
 
     delta = np.asarray(delta_ee_pose, dtype=float)
     if delta.shape != (6,) or not np.all(np.isfinite(delta)):
@@ -895,10 +904,9 @@ def solve_delta_ee_pose_target(
     current_matrix = np.asarray(current_pose, dtype=float)
     if current_matrix.shape != (4, 4) or not np.all(np.isfinite(current_matrix)):
         raise ValueError("Current EE pose must be a finite 4x4 transform.")
-    target_vector = matrix_to_pose_vector(current_matrix) + delta
     result = solve_fr3_ik(
         np.asarray(current_q, dtype=float),
-        pose_vector_to_matrix(target_vector),
+        apply_ee_delta(current_matrix, delta),
         np.asarray(flange_to_ee, dtype=float),
         model,
         frame_id,
@@ -1362,7 +1370,12 @@ def move_arms_to_initial_state(
 
 def verify_ee_replay_targets(node: Any, data: EpisodeData) -> None:
     """Reject EE replay unless recorded joint and Cartesian targets agree."""
-    from utils.fr3_kinematics import Fr3ForwardKinematics, pose_error, pose_vector_to_matrix
+    from utils.fr3_kinematics import (
+        Fr3ForwardKinematics,
+        apply_ee_delta,
+        ee_state_to_matrix,
+        pose_error,
+    )
 
     if data.target_ee_poses is None or data.target_joints is None:
         raise RuntimeError("EE replay requires recorded target EE poses and joint targets.")
@@ -1375,7 +1388,8 @@ def verify_ee_replay_targets(node: Any, data: EpisodeData) -> None:
         if flange_to_ee is None:
             raise RuntimeError(f"{side} F_T_EE is unavailable for EE replay validation.")
         joint_offset = arm_index * stride
-        pose_offset = arm_index * 6
+        state_pose_offset = arm_index * EE_STATE_DIM
+        action_pose_offset = arm_index * EE_ACTION_DIM
         max_position_error = 0.0
         max_orientation_error = 0.0
         worst_frame = int(data.frame_indices[0])
@@ -1384,9 +1398,32 @@ def verify_ee_replay_targets(node: Any, data: EpisodeData) -> None:
                 data.target_joints[local_index, joint_offset : joint_offset + 7],
                 flange_to_ee,
             )
-            recorded_target = pose_vector_to_matrix(
-                data.target_ee_poses[local_index, pose_offset : pose_offset + 6]
+            recorded_target = ee_state_to_matrix(
+                data.target_ee_poses[
+                    local_index, state_pose_offset : state_pose_offset + EE_STATE_DIM
+                ]
             )
+            reconstructed_target = apply_ee_delta(
+                ee_state_to_matrix(
+                    data.ee_poses[
+                        local_index,
+                        state_pose_offset : state_pose_offset + EE_STATE_DIM,
+                    ]
+                ),
+                data.delta_ee_poses[
+                    local_index,
+                    action_pose_offset : action_pose_offset + EE_ACTION_DIM,
+                ],
+            )
+            delta_position_error, delta_orientation_error = pose_error(
+                reconstructed_target, recorded_target
+            )
+            if delta_position_error > 1e-5 or delta_orientation_error > 1e-5:
+                raise ValueError(
+                    f"{side} EE delta does not reconstruct its stored target at "
+                    f"frame {int(frame_index)}: errors are {delta_position_error:.6g} m "
+                    f"and {delta_orientation_error:.6g} rad."
+                )
             position_error, orientation_error = pose_error(actual_target, recorded_target)
             if position_error + orientation_error > max_position_error + max_orientation_error:
                 worst_frame = int(frame_index)

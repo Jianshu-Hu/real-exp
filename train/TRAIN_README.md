@@ -46,8 +46,8 @@ local/pick_and_place_test
 You can override both with CLI flags if needed.
 
 The training entry point requires `meta/real_exp_action_config.json` with
-`arm_action_representation=absolute_joint_position` for joint-mode datasets, or
-`delta_end_effector_pose` for end-effector-mode datasets. Current collection also
+`arm_action_representation=delta_joint_position` for joint-mode datasets, or
+`delta_end_effector_position_rotation_vector` for end-effector-mode datasets. Current collection also
 uses `gripper_action_representation=absolute_width`, which preserves continuous
 normalized gripper targets in `[0, 1]`.
 
@@ -58,10 +58,12 @@ and action dimensions. The trainer validates it against `meta/info.json` and
 the action metadata before creating a policy. A dataset containing the neutral
 joint and EE fields can be trained in either mode with `--state-action-mode joint` or
 `--state-action-mode end_effector`; the trainer selects the corresponding
-primary fields (`observation.state`/`action` or `observation.ee_pose`/
-`action.delta_ee_pose`; joint mode uses the neutral
-`observation.joint_state`/`action.target_joint` fields) without rewriting the
-parquet data. Every saved `pretrained_model`
+neutral fields and derives each action chunk from one shared anchor
+(`observation.joint_state` + `action.target_joint`, or `observation.ee_pose` +
+`action.target_ee_pose`) without rewriting the parquet data. In EE mode, it composes the arm-only EE fields with the unchanged
+end-effector fields: current normalized gripper width plus target width, or
+current hand joints plus target hand joints. Thus only the arm representation
+changes between modes. Every saved `pretrained_model`
 also receives the action, trajectory, and complete dataset feature metadata plus
 a validated deployment manifest. A checkpoint therefore remains self-describing
 when moved to another machine. Deployment reads this embedded metadata from the

@@ -143,7 +143,12 @@ class RobotHandModel:
             indices.cpu() for indices in self.chain.parents_indices
         ]
         self.chain.joint_indices = self.chain.joint_indices.cpu()
-        self.chain.joint_type_indices = self.chain.joint_type_indices.cpu()
+        # ``_fk_impl`` uses joint_type_indices as the condition of
+        # torch.where, so it must live on the same device as the transforms.
+        # (Older pytorch-kinematics releases tolerated a CPU copy here.)
+        self.chain.joint_type_indices = self.chain.joint_type_indices.to(
+            device=target_device
+        )
         self.joint_limits = RobotJointLimits(
             joint_names=self.joint_limits.joint_names,
             lower=self.joint_limits.lower.to(device=target_device, dtype=target_dtype),

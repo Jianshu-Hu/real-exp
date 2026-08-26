@@ -16,8 +16,10 @@ from grasp.common import (
     COMMAND_FORMAT,
     WUJI_RIGHT_JOINT_NAMES,
     hand_pose_to_ee_pose,
-    load_calibration_transforms,
+    invert_transform,
     matrix_to_xyz_rpy,
+    read_json,
+    read_transform,
     reorder_wuji_joints,
     transform_points,
 )
@@ -31,12 +33,53 @@ DEFAULT_MANO_ROOT = ASSETS_ROOT / "mano"
 DEFAULT_ROBODEX_ROOT = ASSETS_ROOT / "RoboDex"
 DEFAULT_MOUNT_CALIBRATION = Path(__file__).resolve().parent / "ee_to_wuji_nominal.json"
 
+# Calibrated transforms from calibration/matrix.md.  The right-arm matrix is
+# recorded as C_T_B_R (right robot base -> camera), while the command path
+# needs B_R_T_C; it is inverted when the transform bundle is built below.
+CALIBRATED_WORLD_T_CAMERA = np.asarray(
+    [
+        [0.016116505, -0.947169025, 0.320329670, -0.394891761],
+        [-0.998707711, 0.000194370, 0.050821951, -0.041552817],
+        [-0.048199240, -0.320734783, -0.945941876, 1.159142768],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+CALIBRATED_CAMERA_T_RIGHT_BASE = np.asarray(
+    [
+        [0.064235673, -0.841162479, 0.536953874, 0.249297696],
+        [-0.956780317, -0.204838067, -0.206428660, 0.513843229],
+        [0.283628637, -0.500486814, -0.817965614, 0.782537268],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
+
+def load_calibration_transforms(mount_path: Path) -> dict[str, np.ndarray]:
+    """Build the fixed camera/world/right-base transform bundle."""
+    world_t_camera = read_transform(CALIBRATED_WORLD_T_CAMERA, "world_T_camera")
+    camera_t_right_base = read_transform(
+        CALIBRATED_CAMERA_T_RIGHT_BASE, "camera_T_right_base"
+    )
+    mount_data = read_json(mount_path)
+    mount_value = mount_data.get("ee_T_hand", mount_data.get("flange_T_hand"))
+    if mount_value is None:
+        raise ValueError(f"{mount_path} must define ee_T_hand (or flange_T_hand)")
+    ee_t_hand = read_transform(mount_value, "ee_T_hand")
+    base_t_camera = invert_transform(camera_t_right_base)
+    base_t_world = base_t_camera @ invert_transform(world_t_camera)
+    return {
+        "world_T_camera": world_t_camera,
+        "base_T_camera": base_t_camera,
+        "base_T_world": read_transform(base_t_world, "base_T_world"),
+        "ee_T_hand": ee_t_hand,
+    }
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generator-checkpoint", type=Path, default=DEFAULT_GENERATOR_CHECKPOINT)
-    parser.add_argument("--camera-to-world", type=Path, required=True)
-    parser.add_argument("--camera-to-robot-base", type=Path, required=True)
     parser.add_argument(
         "--mount-calibration",
         type=Path,
@@ -78,6 +121,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contact-d-max-m", type=float, default=0.03)
     parser.add_argument("--contact-binary-threshold-m", type=float, default=0.010)
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--retarget-device",
+        default="cpu",
+        help="Device for MANO/Wuji retargeting (default: cpu).",
+    )
+    parser.add_argument(
+        "--refinement-device",
+        default="cpu",
+        help="Device for semantic contact refinement (default: cpu).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--request-timeout-s", type=float, default=300.0)
     return parser
@@ -235,10 +288,44 @@ def filter_and_sample_points(
             f"need at least {args.min_filtered_points}"
         )
     rng = np.random.default_rng(args.seed)
-    indices = rng.choice(
-        filtered.shape[0], size=args.num_points, replace=filtered.shape[0] < args.num_points
+    if filtered.shape[0] >= args.num_points:
+        indices = rng.choice(filtered.shape[0], size=args.num_points, replace=False)
+        sampled = filtered[indices]
+    else:
+        sampled = _interpolate_local_points(filtered, args.num_points, rng)
+    return valid_camera, filtered, sampled.astype(np.float32)
+
+
+def _interpolate_local_points(
+    points: np.ndarray, target_count: int, rng: np.random.Generator
+) -> np.ndarray:
+    """Fill a sparse cloud with points linearly interpolated to local neighbours."""
+    if points.shape[0] >= target_count:
+        return points
+    if points.shape[0] < 2:
+        raise ValueError("at least two points are required for point-cloud interpolation")
+
+    from scipy.spatial import cKDTree
+
+    interpolation_count = target_count - points.shape[0]
+    anchor_indices = rng.integers(points.shape[0], size=interpolation_count)
+    neighbour_count = min(8, points.shape[0])
+    _, neighbour_indices = cKDTree(points).query(
+        points[anchor_indices], k=neighbour_count
     )
-    return valid_camera, filtered, filtered[indices].astype(np.float32)
+    if neighbour_count == 2:
+        selected_neighbours = neighbour_indices[:, 1]
+    else:
+        neighbour_columns = rng.integers(1, neighbour_count, size=interpolation_count)
+        selected_neighbours = neighbour_indices[
+            np.arange(interpolation_count), neighbour_columns
+        ]
+    interpolation_weight = rng.random(interpolation_count, dtype=np.float32)[:, None]
+    interpolated = (
+        (1.0 - interpolation_weight) * points[anchor_indices]
+        + interpolation_weight * points[selected_neighbours]
+    )
+    return np.concatenate((points, interpolated), axis=0)
 
 
 def geometric_semantic_contacts(
@@ -288,6 +375,7 @@ def run_model(scene_points_world: np.ndarray, args: argparse.Namespace) -> tuple
             diffusion_steps=args.diffusion_steps,
             retarget_landmark_fit_steps=args.retarget_landmark_fit_steps,
             device=args.device,
+            retarget_device=getattr(args, "retarget_device", "cpu"),
             seed=args.seed,
         ),
     )
@@ -304,7 +392,7 @@ def run_model(scene_points_world: np.ndarray, args: argparse.Namespace) -> tuple
         config=SemanticContactRefinementConfig(
             steps=args.semantic_refine_steps,
             learning_rate=args.semantic_learning_rate,
-            device=args.device,
+            device=getattr(args, "refinement_device", "cpu"),
             record_history=True,
         ),
     )
@@ -490,9 +578,7 @@ def main() -> int:
     args = parser.parse_args()
     _validate_args(args, parser)
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    transforms = load_calibration_transforms(
-        args.camera_to_world, args.camera_to_robot_base, args.mount_calibration
-    )
+    transforms = load_calibration_transforms(args.mount_calibration)
     rgb, depth, camera = capture_rgbd(args)
     if rgb.shape[:2] != depth.shape:
         raise ValueError("RGB and aligned depth image dimensions differ")
@@ -525,8 +611,8 @@ def main() -> int:
             "generator_input_points": int(sampled_world.shape[0]),
         },
         "calibration_files": {
-            "camera_to_world": str(args.camera_to_world.resolve()),
-            "camera_to_robot_base": str(args.camera_to_robot_base.resolve()),
+            "camera_to_world": "hardcoded: calibration/matrix.md (W_T_C)",
+            "camera_to_robot_base": "hardcoded: calibration/matrix.md (C_T_B_R; inverted to B_T_C)",
             "mount": str(args.mount_calibration.resolve()),
         },
         "command": command,

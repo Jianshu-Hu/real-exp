@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
+import inspect
 import sys
 from pathlib import Path
 from typing import Any, TextIO
@@ -154,6 +155,11 @@ def patch_numpy_for_chumpy() -> None:
 
 
 def create_mano_model_quietly(**kwargs: Any) -> Any:
+    # chumpy 0.70 still calls inspect.getargspec, which was removed in
+    # Python 3.11.  Its only use is reading the positional ``args`` field, so
+    # FullArgSpec provides the compatible interface on modern Python versions.
+    if not hasattr(inspect, "getargspec"):
+        inspect.getargspec = inspect.getfullargspec  # type: ignore[attr-defined]
     patch_numpy_for_chumpy()
     import smplx
 

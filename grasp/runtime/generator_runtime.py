@@ -37,6 +37,7 @@ class GeneratorRuntimeConfig:
     diffusion_steps: int = 100
     retarget_landmark_fit_steps: int = 50
     device: str = "auto"
+    retarget_device: str = "cpu"
     seed: int = 0
 
 
@@ -152,7 +153,7 @@ class GeneratorRuntime:
             config=ManoToRobotRetargetConfig(
                 mano_root=Path(config.mano_root),
                 mano_side=str(config.mano_side),
-                device=str(config.device),
+                device=str(config.retarget_device),
                 landmark_fit_steps=int(config.retarget_landmark_fit_steps),
                 flat_hand_mean=self.mano_flat_hand_mean,
             ),
@@ -191,6 +192,7 @@ class GeneratorRuntime:
             "seed": int(config.seed),
             "hand_type": "wuji_hand_right",
             "device": str(self.device),
+            "retarget_device": str(config.retarget_device),
             "frame": "robodex_world_z_up",
         }
 

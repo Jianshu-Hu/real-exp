@@ -16,19 +16,22 @@ control-host operator for `y/yes` before motion.
 
 ## Inference dependencies
 
-Inference host dependencies: `numpy`, `scipy`, `torch`, and `pyzmq`. Live D435
-capture additionally requires `pyrealsense2`; nonzero camera distortion
-coefficients require `opencv-python` or `opencv-contrib-python`. The required
-deployment runtime is implemented in `grasp/runtime`; checkpoints, MANO models,
-and RoboDex Wuji URDF/mesh assets are bundled in `grasp/assets` and use fixed
-script paths.
+Inference host dependencies: `numpy`, `scipy`, `torch`, and `pyzmq`. The
+camera-only script keeps `pyrealsense2` in the system Python helper environment;
+the conda `lerobot` environment therefore only needs the model dependencies.
+Nonzero camera distortion coefficients require `opencv-python` or
+`opencv-contrib-python`. The required deployment runtime is implemented in
+`grasp/runtime`; checkpoints, MANO models, and RoboDex Wuji URDF/mesh assets are
+bundled in `grasp/assets` and use fixed script paths.
 
 ## Required transforms
 
-Transform notation is `A_T_B`. The inference client reads:
+Transform notation is `A_T_B`. The inference client uses the calibrated camera
+transforms embedded in `grasp/inference_client.py`:
 
-- `world_T_camera` from `calibration/calibrate_camera_to_world.py`.
-- `base_T_camera` from `calibration/calibrate_camera_to_robot_base.py`.
+- `world_T_camera` (`W_T_C`) from `calibration/matrix.md`.
+- `camera_T_right_base` (`C_T_B_R`) from `calibration/matrix.md`, inverted to
+  obtain the `base_T_camera` transform required by the command path.
 - `ee_T_hand` defaults to `grasp/ee_to_wuji_nominal.json`, the temporary
   nominal `panda_link8_T_hand_docking` value from `calibration/README.md`.
 
@@ -96,8 +99,6 @@ region while excluding the table and background:
 
 ```bash
 python -m grasp.inference_client \
-  --camera-to-world calibration/runs/TABLE_RUN/camera_to_world.json \
-  --camera-to-robot-base calibration/runs/HANDEYE_RUN/camera_to_robot_base.json \
   --world-min -0.25 -0.25 0.005 \
   --world-max 0.25 0.25 0.40 \
   --control-address tcp://CONTROL_HOST_IP:5570 \
@@ -107,6 +108,42 @@ python -m grasp.inference_client \
 The first run is a dry run even if the server allows execution. Add `--execute`
 only after checking `result.json`, `object_points_world.npy`, the reported
 `base_T_ee`, mount direction, Wuji joint order, and the control-host IK output.
+
+## Camera-only inference
+
+When the inference machine has the D435 camera but no connection to the control
+host, run `camera_inference.py` from the conda `lerobot` environment. The script
+starts `realsense_capture.py` with system `/usr/bin/python3` for camera capture,
+then continues in `lerobot` for Torch/model inference. This avoids requiring
+`pyrealsense2` inside the conda environment:
+
+```bash
+python -m grasp.camera_inference \
+  --output-dir grasp/runs/camera_trial_0001 \
+  --world-min -0.25 -0.25 0.10 \
+  --world-max 0.25 0.25 0.40
+```
+
+Override the interpreter when the system camera Python is installed elsewhere:
+
+```bash
+python -m grasp.camera_inference \
+  --camera-python /usr/bin/python3 \
+  --output-dir grasp/runs/camera_trial_0001
+```
+
+The helper writes a temporary RGB-D capture and metadata, which the parent
+process loads before coordinate conversion and inference.
+
+The output contains only a `world/` directory with the unfiltered and filtered
+scene point clouds, generator input, `grasp_object_points.ply`, `mano.ply`, and
+retargeted/refined Wuji meshes. No NPY files are written below `world/`.
+`result.json` records the calibration matrices and inference metadata, while
+`poses.json` stores the readable `world_T_hand`, `base_T_hand`, `base_T_ee`, and
+`base_T_ee_xyz_rpy` values for offline experiments. It also stores the final
+refined Wuji target in `hand_joints_rad`, together with the corresponding
+canonical `hand_joint_names` ordering. The pose conversion to the right-arm base
+is retained in JSON even though no right-base mesh directory is created.
 
 For a camera-free replay, provide all three offline arguments. The metadata can
 be a calibration `metadata.json` and must contain `color_intrinsics` and

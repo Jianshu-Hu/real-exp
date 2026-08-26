@@ -21,15 +21,8 @@ def _feature_dim(info, key):
 def mode_trajectory_config(source_config, mode, *, state_dim, action_dim):
     mode = normalize_training_mode(mode, str(source_config.get("state_action_mode", "joint")))
     n, ee = len(source_config["arms"]), _ee_dim(source_config)
-    if int(source_config.get("schema_version", 1)) == 1 and mode == "end_effector" and state_dim == action_dim and state_dim in {6 * n, (6 + ee) * n}:
-        policy_dim = (6 + ee) * n
-        config = dict(source_config)
-        config.update(robot_state_dim=policy_dim, action_dim=policy_dim, state_action_mode=mode, state_representation="end_effector_pose", action_representation="delta_end_effector_pose")
-        return validate_trajectory_config(config, policy_dim, policy_dim, source="selected training mode")
-    if int(source_config.get("schema_version", 1)) == 1 and mode == "end_effector" and state_dim == action_dim and state_dim in {6 * n, (6 + ee) * n}:
-        config = dict(source_config)
-        config.update(robot_state_dim=state_dim, action_dim=action_dim, state_action_mode=mode, state_representation="end_effector_pose", action_representation="delta_end_effector_pose")
-        return validate_trajectory_config(config, state_dim, action_dim, source="selected training mode")
+    if int(source_config.get("schema_version", -1)) != TRAJECTORY_CONFIG_SCHEMA_VERSION:
+        raise ValueError("Only schema-v2 datasets can be adapted for training.")
     source_state_expected = (ARM_JOINT_DIM if mode == "joint" else EE_STATE_DIM) * n
     source_action_expected = (ARM_JOINT_DIM if mode == "joint" else EE_ACTION_DIM) * n
     accepted_action_dims = {source_action_expected}
@@ -48,9 +41,9 @@ def mode_trajectory_config(source_config, mode, *, state_dim, action_dim):
 def mode_action_config(source_config, mode, trajectory):
     result = dict(source_config)
     arm_rep = "delta_joint_position" if mode == "joint" else "delta_end_effector_position_rotation_vector"
-    if int(trajectory.get("schema_version", 2)) == 1:
-        arm_rep = "absolute_joint_position" if mode == "joint" else "delta_end_effector_pose"
-    result.update(schema_version=int(trajectory.get("schema_version", TRAJECTORY_CONFIG_SCHEMA_VERSION)), action_dim=int(trajectory["action_dim"]), state_action_mode=trajectory["state_action_mode"], state_representation=trajectory["state_representation"], action_representation=trajectory["action_representation"], arm_action_representation=arm_rep, arm_action_definition="q_target[t+h]-q_measured[t]" if mode == "joint" else "base_spatial_delta(ee_measured[t],ee_target[t+h])", delta_alignment="chunk_anchor", chunk_anchor_definition="latest_generation_observation", ee_state_rotation_representation="rotation_6d_first_two_columns", ee_action_rotation_representation="rotation_vector", ee_action_rotation_frame="robot_base_spatial", ee_rotation_composition="R_target=Exp(rotvec)@R_anchor", transport_action_representation="absolute_target")
+    if int(trajectory.get("schema_version", -1)) != TRAJECTORY_CONFIG_SCHEMA_VERSION:
+        raise ValueError("Only schema-v2 trajectories can be used for training.")
+    result.update(schema_version=TRAJECTORY_CONFIG_SCHEMA_VERSION, action_dim=int(trajectory["action_dim"]), state_action_mode=trajectory["state_action_mode"], state_representation=trajectory["state_representation"], action_representation=trajectory["action_representation"], arm_action_representation=arm_rep, arm_action_definition="q_target[t+h]-q_measured[t]" if mode == "joint" else "base_spatial_delta(ee_measured[t],ee_target[t+h])", delta_alignment="chunk_anchor", chunk_anchor_definition="latest_generation_observation", ee_state_rotation_representation="rotation_6d_first_two_columns", ee_action_rotation_representation="rotation_vector", ee_action_rotation_frame="robot_base_spatial", ee_rotation_composition="R_target=Exp(rotvec)@R_anchor", transport_action_representation="absolute_target")
     return result
 
 def _tensor(x, like=None):
@@ -106,26 +99,18 @@ class ModeAwareDataset(torch.utils.data.Dataset):
         self.dataset=dataset; self.mode=normalize_training_mode(mode,"joint"); self.meta=copy.copy(dataset.meta); self.meta.info=copy.deepcopy(dataset.meta.info); self.meta.stats=copy.deepcopy(dataset.meta.stats)
         jd=_feature_dim(self.meta.info,"observation.joint_state"); candidates=[(n,e) for n in (1,2) for e in (0,1,20) if n*(7+e)==jd]
         if len(candidates)!=1: raise ValueError(f"Cannot infer robot layout from {jd}-value joint state.")
-        self.n,self.extra=candidates[0]; self.state_key="observation.joint_state" if self.mode=="joint" else "observation.ee_pose"; self._legacy = False
+        self.n,self.extra=candidates[0]; self.state_key="observation.joint_state" if self.mode=="joint" else "observation.ee_pose"
         if self.mode == "joint":
             self.target_key = "action.target_joint"
-            self._legacy = "action.delta_joint" not in self.meta.info["features"]
         else:
-            self.target_key = "action.target_ee_pose" if "action.target_ee_pose" in self.meta.info["features"] else "action.delta_ee_pose"
-            self._legacy = self.target_key == "action.delta_ee_pose"
-        self._old_ee_compat = self.mode == "end_effector" and self._legacy and _feature_dim(self.meta.info, self.state_key) == _feature_dim(self.meta.info, self.target_key) and _feature_dim(self.meta.info, self.state_key) != EE_STATE_DIM * self.n
-        for k in (self.state_key,self.target_key,"observation.joint_state","action.target_joint"):
+            self.target_key = "action.target_ee_pose"
+        for k in (self.state_key,self.target_key,"observation.joint_state","action.target_joint", "action.target_ee_pose"):
             if k not in self.meta.info["features"]: raise ValueError(f"Dataset is missing required field {k!r}.")
         self._configure_windows()
-        sd = ((6 + self.extra) * self.n) if self._old_ee_compat else ((7 if self.mode=="joint" else 9)+self.extra)*self.n
-        ad = ((6 + self.extra) * self.n) if self._old_ee_compat else ((7 if self.mode=="joint" or self._legacy else 6)+self.extra)*self.n
+        sd = ((7 if self.mode=="joint" else 9)+self.extra)*self.n
+        ad = ((7 if self.mode=="joint" else 6)+self.extra)*self.n
         self.meta.info["features"]["observation.state"]=copy.deepcopy(self.meta.info["features"][self.state_key]); self.meta.info["features"]["action"]=copy.deepcopy(self.meta.info["features"][self.target_key]); self.meta.info["features"]["observation.state"]["shape"]=(sd,); self.meta.info["features"]["action"]["shape"]=(ad,)
-        if self._old_ee_compat:
-            self.meta.stats["observation.state"] = copy.deepcopy(self.meta.stats[self.state_key]); self.meta.stats["action"] = copy.deepcopy(self.meta.stats[self.target_key])
-        elif self._legacy:
-            self.meta.stats["observation.state"] = copy.deepcopy(self.meta.stats[self.state_key])
-            self.meta.stats["action"] = copy.deepcopy(self.meta.stats[self.target_key])
-        elif self.mode == "joint":
+        if self.mode == "joint":
             self.meta.stats["observation.state"] = copy.deepcopy(self.meta.stats[self.state_key])
             self.meta.stats["action"] = self._chunk_stats()
         else:
@@ -167,22 +152,8 @@ class ModeAwareDataset(torch.utils.data.Dataset):
     def __len__(self): return len(self.dataset)
     def __getitem__(self,index):
         item=dict(self.dataset[index]); st=_tensor(item[self.state_key]); js=_tensor(item["observation.joint_state"],st); anchor=st[-1] if st.ndim>1 else st; ja=js[-1] if js.ndim>1 else js; tgt=_tensor(item[self.target_key],st); jt=_tensor(item["action.target_joint"],st)
-        if self._old_ee_compat:
-            state = _ee_state(st, js, self.n, self.extra)
-            parts=[]; blocks=_blocks(jt,self.n,self.extra)
-            for i in range(self.n): parts.extend((tgt[..., i*6:(i+1)*6], blocks[i][...,7:]))
-            action=torch.cat(parts,-1)
-        elif self._legacy:
-            state = st if self.mode == "joint" else _ee_state(st, js, self.n, self.extra)
-            action = tgt
-            if self.mode == "end_effector" and self.extra:
-                # Legacy arm-only EE fields are composed with absolute
-                # gripper/hand targets for compatibility with schema-v1 tests.
-                parts=[]; blocks=_blocks(jt,self.n,self.extra)
-                for i in range(self.n): parts.extend((tgt[..., i*6:(i+1)*6], blocks[i][...,7:]))
-                action=torch.cat(parts,-1)
-        else:
-            state=js if self.mode=="joint" else _ee_state(st,js,self.n,self.extra); action=_joint_delta(ja,jt,self.n,self.extra) if self.mode=="joint" else _ee_action(anchor,tgt,jt,self.n,self.extra)
+        state=js if self.mode=="joint" else _ee_state(st,js,self.n,self.extra)
+        action=_joint_delta(ja,jt,self.n,self.extra) if self.mode=="joint" else _ee_action(anchor,tgt,jt,self.n,self.extra)
         pad=item.get(f"{self.target_key}_is_pad",item.get("action_is_pad")); pad=torch.zeros(action.shape[:-1],dtype=torch.bool) if pad is None else _tensor(pad).bool()
         if action.ndim>1: pad=pad|torch.as_tensor([o<0 for o in self.action_offsets],dtype=torch.bool)
         item["observation.state"]=state; item["action"]=action; item["action_is_pad"]=pad; return item

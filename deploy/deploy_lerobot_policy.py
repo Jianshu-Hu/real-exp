@@ -1119,9 +1119,7 @@ def inspect_policy(policy_path: Path, dataset_root: Path | None = None) -> None:
             f"gripper={action_cfg.get('gripper_action_representation')}"
         )
         if arm_action_representation not in {
-            "absolute_joint_position",
             "delta_joint_position",
-            "delta_end_effector_pose",
             "delta_end_effector_position_rotation_vector",
         }:
             print(

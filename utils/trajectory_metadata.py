@@ -15,8 +15,6 @@ STATE_ACTION_MODES = {"joint", "end_effector"}
 ARM_JOINT_DIM = 7
 EE_STATE_DIM = 9
 EE_ACTION_DIM = 6
-# Backward-compatible name for callers that mean the policy EE action block.
-EE_POSE_DIM = EE_ACTION_DIM
 HAND_JOINT_DIM = 20
 
 
@@ -118,10 +116,10 @@ def validate_trajectory_config(
 ) -> dict[str, Any]:
     """Validate and normalize the metadata-driven robot vector contract."""
     schema_version = int(config.get("schema_version", -1))
-    if schema_version not in {1, TRAJECTORY_CONFIG_SCHEMA_VERSION}:
+    if schema_version != TRAJECTORY_CONFIG_SCHEMA_VERSION:
         raise ValueError(
             f"{source} has unsupported schema_version={config.get('schema_version')!r}; "
-            f"expected 1 or {TRAJECTORY_CONFIG_SCHEMA_VERSION}."
+            f"expected {TRAJECTORY_CONFIG_SCHEMA_VERSION}."
         )
     arm_mode = normalize_arm_mode(str(config.get("arm_mode", "")))
     expected_arms = ["left", "right"] if arm_mode == "duo" else [arm_mode]
@@ -151,22 +149,18 @@ def validate_trajectory_config(
             f"{source} has unsupported state_action_mode={state_action_mode!r}; "
             "expected joint or end_effector."
         )
-    legacy = schema_version == 1
     expected_state_representation = (
-        "joint" if state_action_mode == "joint" else
-        "end_effector_pose" if legacy else "end_effector_position_rotation_6d"
+        "joint" if state_action_mode == "joint" else "end_effector_position_rotation_6d"
     )
     expected_action_representation = (
-        "target_joint" if legacy and state_action_mode == "joint" else
-        "delta_end_effector_pose" if legacy else
-        "delta_joint_position" if state_action_mode == "joint" else
-        "delta_end_effector_position_rotation_vector"
+        "delta_joint_position" if state_action_mode == "joint"
+        else "delta_end_effector_position_rotation_vector"
     )
     if config.get("state_representation", expected_state_representation) != expected_state_representation:
         raise ValueError(f"{source} state_representation is inconsistent with state_action_mode.")
     if config.get("action_representation", expected_action_representation) != expected_action_representation:
         raise ValueError(f"{source} action_representation is inconsistent with state_action_mode.")
-    state_arm_dim = ARM_JOINT_DIM if state_action_mode == "joint" else (EE_POSE_DIM if legacy else EE_STATE_DIM)
+    state_arm_dim = ARM_JOINT_DIM if state_action_mode == "joint" else EE_STATE_DIM
     action_arm_dim = ARM_JOINT_DIM if state_action_mode == "joint" else EE_ACTION_DIM
     state_block_dim = state_arm_dim
     action_block_dim = action_arm_dim
@@ -215,15 +209,23 @@ def validate_action_trajectory_contract(
     source: str = "dataset metadata",
 ) -> None:
     """Require action semantics metadata to agree with the vector layout."""
+    state_action_mode = trajectory_config.get("state_action_mode", "joint")
+    expected_state_representation = (
+        "joint" if state_action_mode == "joint" else "end_effector_position_rotation_6d"
+    )
+    expected_action_representation = (
+        "delta_joint_position" if state_action_mode == "joint"
+        else "delta_end_effector_position_rotation_vector"
+    )
     expected = {
         "action_dim": int(trajectory_config["action_dim"]),
         "arm_mode": trajectory_config["arm_mode"],
         "include_gripper": bool(trajectory_config["include_gripper"]),
         "include_hand": bool(trajectory_config["include_hand"]),
         "include_right_arm": trajectory_config["arm_mode"] == "duo",
-        "state_action_mode": trajectory_config.get("state_action_mode", "joint"),
-        "state_representation": trajectory_config.get("state_representation", "joint"),
-        "action_representation": trajectory_config.get("action_representation", "target_joint"),
+        "state_action_mode": state_action_mode,
+        "state_representation": expected_state_representation,
+        "action_representation": expected_action_representation,
     }
     mismatches = [
         f"{key}: action metadata={action_config.get(key, value)!r}, trajectory metadata={value!r}"
@@ -233,14 +235,18 @@ def validate_action_trajectory_contract(
     if mismatches:
         raise ValueError(f"{source} contracts disagree: " + "; ".join(mismatches))
 
+    if action_config.get("delta_alignment") == "chunk_anchor":
+        if action_config.get("transport_action_representation") != "absolute_target":
+            raise ValueError(
+                f"{source} chunk-anchored actions must declare "
+                "transport_action_representation='absolute_target'."
+            )
+
     arm_representation = str(action_config.get("arm_action_representation", "")).strip().lower()
     state_action_mode = str(trajectory_config.get("state_action_mode", "joint")).strip().lower()
-    legacy = int(trajectory_config.get("schema_version", 1)) == 1
     expected_arm_representation = (
-        "absolute_joint_position" if legacy and state_action_mode == "joint" else
-        "delta_end_effector_pose" if legacy else
-        "delta_joint_position" if state_action_mode == "joint" else
-        "delta_end_effector_position_rotation_vector"
+        "delta_joint_position" if state_action_mode == "joint"
+        else "delta_end_effector_position_rotation_vector"
     )
     if arm_representation != expected_arm_representation:
         raise ValueError(
@@ -343,7 +349,7 @@ def split_trajectory_vector(
             result[f"{side}_arm"] = array[offset : offset + ARM_JOINT_DIM]
             offset += ARM_JOINT_DIM
         else:
-            arm_dim = EE_STATE_DIM if kind == "state" and int(config.get("schema_version", 1)) >= 2 else EE_ACTION_DIM
+            arm_dim = EE_STATE_DIM if kind == "state" else EE_ACTION_DIM
             pose = array[offset : offset + arm_dim]
             result[f"{side}_arm"] = pose
             if kind == "state":
@@ -360,6 +366,24 @@ def split_trajectory_vector(
     if offset != expected_dim:  # pragma: no cover - guarded by config validation
         raise ValueError(f"Trajectory layout consumed {offset} of {expected_dim} values.")
     return result
+
+
+def absolute_transport_action_dim(config: dict[str, Any]) -> int:
+    """Return the executor transport width for one absolute target vector."""
+    arm_dim = ARM_JOINT_DIM if config["state_action_mode"] == "joint" else EE_STATE_DIM
+    extra_dim = (
+        1 if config["end_effector"] == "gripper"
+        else HAND_JOINT_DIM if config["end_effector"] == "hand"
+        else 0
+    )
+    return (arm_dim + extra_dim) * len(config["arms"])
+
+
+def split_absolute_transport_action(values: Any, config: dict[str, Any]) -> dict[str, Any]:
+    """Split the absolute target vector sent from the policy server to an executor."""
+    transport_config = dict(config)
+    transport_config["robot_state_dim"] = absolute_transport_action_dim(config)
+    return split_trajectory_vector(values, transport_config, kind="state")
 
 
 def validate_live_packet(config: dict[str, Any], packet: dict[str, Any]) -> None:

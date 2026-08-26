@@ -55,8 +55,10 @@ It also requires `meta/real_exp_trajectory_config.json`. This metadata is the
 authoritative vector layout: it records `arm_mode` (`left`, `right`, or `duo`),
 the end-effector type (`arm`, `gripper`, or `hand`), active arms, and the state
 and action dimensions. The trainer validates it against `meta/info.json` and
-the action metadata before creating a policy. A dataset containing the neutral
-joint and EE fields can be trained in either mode with `--state-action-mode joint` or
+the action metadata before creating a policy. A recording always stores the
+neutral joint state/action as its primary fields and also stores complete EE
+state/target and joint state/target fields. A single dataset can therefore be
+trained in either mode with `--state-action-mode joint` or
 `--state-action-mode end_effector`; the trainer selects the corresponding
 neutral fields and derives each action chunk from one shared anchor
 (`observation.joint_state` + `action.target_joint`, or `observation.ee_pose` +

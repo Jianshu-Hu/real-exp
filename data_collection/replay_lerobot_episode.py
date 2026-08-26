@@ -312,9 +312,7 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
 
     arm_action_representation = str(action_config.get("arm_action_representation", "")).strip().lower()
     if arm_action_representation not in {
-        "absolute_joint_position",
         "delta_joint_position",
-        "delta_end_effector_pose",
         "delta_end_effector_position_rotation_vector",
     }:
         raise ValueError(

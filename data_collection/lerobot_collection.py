@@ -251,6 +251,11 @@ def bridge_packet_readiness(packet: Any) -> tuple[bool, str]:
             )
     if state_action_mode not in {"joint", "end_effector"}:
         return False, f"unsupported state_action_mode={state_action_mode!r}"
+    if state_action_mode != "joint":
+        return False, (
+            "collection requires the neutral joint primary state/action view; "
+            "restart the schema-v2 bridge with deployment_mode=false"
+        )
 
     try:
         action_config_from_packet(packet)
@@ -305,10 +310,9 @@ def is_lerobot_dataset_root(root: Path) -> bool:
 def action_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
     packet_arm_representation = str(packet.get("arm_action_representation", "absolute_joint_position")).strip().lower()
     state_action_mode = trajectory_config_from_packet(packet)["state_action_mode"]
-    expected_arm_representation = (
-        "delta_joint_position" if state_action_mode == "joint"
-        else "delta_end_effector_position_rotation_vector"
-    )
+    if state_action_mode != "joint":
+        raise ValueError("Collection packets must use the neutral joint primary state/action view.")
+    expected_arm_representation = "delta_joint_position"
     if packet_arm_representation != expected_arm_representation:
         raise ValueError(
             f"ROS 2 bridge published arm_action_representation={packet_arm_representation!r}. "
@@ -316,10 +320,12 @@ def action_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
         )
     arm_action_representation = expected_arm_representation
     gripper_action_representation = str(packet.get("gripper_action_representation", "absolute_width"))
-    arm_action_definition = (
-        "q_target[t+1]-q_measured[t]" if state_action_mode == "joint"
-        else "base_translation_delta+Log(R_target@R_current.T)"
-    )
+    if trajectory_config_from_packet(packet)["end_effector"] == "gripper" and gripper_action_representation != "absolute_width":
+        raise ValueError(
+            "Collection requires normalized absolute_width gripper actions; "
+            f"got {gripper_action_representation!r}."
+        )
+    arm_action_definition = "q_target[t+1]-q_measured[t]"
     gripper_action_definition = {
         "absolute_width": "open_width_percent",
         "binary_open_close": "latched_binary_command (0=close, 1=open)",
@@ -334,7 +340,7 @@ def action_config_from_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "hand_action_definition": "hand_q_target[t+1]",
         "arm_mode": arm_mode,
         "include_right_arm": bool(packet.get("include_right_arm", True)),
-        "include_gripper": bool(packet.get("include_gripper", True)),
+        "include_gripper": bool(packet.get("include_gripper", False)),
         "include_hand": bool(packet.get("include_hand", False)),
         "action_dim": int(packet["action_dim"]),
         "state_action_mode": trajectory_config_from_packet(packet)["state_action_mode"],
@@ -359,25 +365,6 @@ def write_action_config(dataset_root: Path, action_config: dict[str, Any]) -> No
 def finalize_dataset(dataset: LeRobotDataset, repo_id: str) -> None:
     dataset.finalize()
     ensure_dataset_stats(repo_id, Path(dataset.root), force_recompute=True)
-
-
-def assumed_legacy_action_config(packet: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "arm_action_representation": "delta_joint_position",
-        "arm_action_definition": "q[t+1]-q[t]",
-        "gripper_action_representation": "absolute_width",
-        "gripper_action_definition": "open_width_percent",
-        "hand_action_representation": "absolute_joint_position",
-        "hand_action_definition": "hand_q_target[t+1]",
-        "arm_mode": trajectory_config_from_packet(packet)["arm_mode"],
-        "include_right_arm": bool(packet.get("include_right_arm", True)),
-        "include_gripper": bool(packet.get("include_gripper", True)),
-        "include_hand": bool(packet.get("include_hand", False)),
-        "action_dim": int(packet["action_dim"]),
-        "state_action_mode": "joint",
-        "state_representation": "joint",
-        "action_representation": "target_joint",
-    }
 
 
 def build_features(first_packet: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], list[str]]:
@@ -478,13 +465,16 @@ def make_dataset(
         existing_trajectory_config = (
             json.loads(trajectory_config_path.read_text()) if trajectory_config_path.exists() else None
         )
-        resolved_existing_action_config = (
-            existing_action_config if existing_action_config is not None else assumed_legacy_action_config(first_packet)
-        )
+        if existing_action_config is None or existing_trajectory_config is None:
+            raise ValueError(
+                "Existing datasets must contain schema-v2 action and trajectory metadata; "
+                "migrate the dataset before resuming collection."
+            )
+        resolved_existing_action_config = existing_action_config
         if (
             normalize_feature_specs(dataset.features) == normalize_feature_specs(features)
             and resolved_existing_action_config == action_config
-            and (existing_trajectory_config is None or existing_trajectory_config == trajectory_config)
+            and existing_trajectory_config == trajectory_config
         ):
             write_action_config(dataset_root, action_config)
             write_trajectory_config(dataset_root, trajectory_config)
@@ -502,13 +492,9 @@ def make_dataset(
         )
         print(f"  existing features: {', '.join(existing_features)}")
         print(f"  incoming features: {', '.join(incoming_features)}")
-        if existing_action_config is not None:
-            print(f"  existing action config: {existing_action_config}")
-        else:
-            print(f"  existing action config: assumed legacy {resolved_existing_action_config}")
+        print(f"  existing action config: {existing_action_config}")
         print(f"  incoming action config: {action_config}")
-        if existing_trajectory_config is not None:
-            print(f"  existing trajectory config: {existing_trajectory_config}")
+        print(f"  existing trajectory config: {existing_trajectory_config}")
         print(f"  incoming trajectory config: {trajectory_config}")
         dataset_root = compatible_root
 

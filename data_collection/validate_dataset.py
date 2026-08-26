@@ -35,7 +35,6 @@ from utils.trajectory_metadata import (  # noqa: E402
 )
 from utils.limit import (  # noqa: E402
     TrajectoryViolationCounts,
-    arm_joint_slices,
     validate_joint_trajectory,
 )
 
@@ -56,11 +55,10 @@ def trajectory_vector_layout(
 ) -> tuple[dict[str, slice], tuple[int, ...]]:
     """Return arm slices and gripper indices from trajectory metadata.
 
-    A trajectory consists of one block per active arm. Each block starts with
-    seven Franka joints and is followed by no values, one gripper value, or
-    twenty hand-joint values. In particular, a 27-D hand trajectory must not be
-    interpreted as a 16-D dual-arm/gripper trajectory merely because it is long
-    enough to contain the old hard-coded indices.
+    A trajectory consists of one block per active arm. Joint mode starts with
+    seven Franka joints; EE mode starts with a nine-value position/rotation-6D
+    state or a six-value translation/rotation-vector action. Each block is
+    followed by no values, one gripper value, or twenty hand-joint values.
     """
     raw_arms = trajectory_config.get("arms")
     if not isinstance(raw_arms, list) or not raw_arms:
@@ -82,12 +80,10 @@ def trajectory_vector_layout(
     if kind not in {"state", "action"}:
         raise ValueError(f"unsupported trajectory vector kind {kind!r}")
     is_ee = str(trajectory_config.get("state_action_mode", "joint")).strip().lower() == "end_effector"
-    schema_version = int(trajectory_config.get("schema_version", 1))
-    arm_value_size = (
-        (EE_STATE_DIM if kind == "state" and schema_version >= 2 else EE_ACTION_DIM)
-        if is_ee
-        else ARM_JOINT_DIM
-    )
+    schema_version = int(trajectory_config.get("schema_version", -1))
+    if schema_version != 2:
+        raise ValueError(f"schema_version must be 2, got {schema_version}")
+    arm_value_size = (EE_STATE_DIM if kind == "state" else EE_ACTION_DIM) if is_ee else ARM_JOINT_DIM
     block_size = arm_value_size + end_effector_size
     expected_size = block_size * len(arms)
     if vector_size != expected_size:
@@ -105,13 +101,6 @@ def trajectory_vector_layout(
         if end_effector == "gripper"
         else ()
     )
-    return arm_layout, gripper_indices
-
-
-def legacy_vector_layout(vector_size: int) -> tuple[dict[str, slice], tuple[int, ...]]:
-    """Return the historical arm/gripper layout when metadata is unavailable."""
-    arm_layout = dict(arm_joint_slices(vector_size))
-    gripper_indices = {8: (7,), 16: (7, 15)}.get(vector_size, ())
     return arm_layout, gripper_indices
 
 
@@ -350,19 +339,13 @@ def check_state_action_semantics(
         first_action = flatten_numeric(sorted_rows[0].get("action"))
         try:
             if trajectory_config is None:
-                state_layout, state_gripper_indices = legacy_vector_layout(
-                    len(first_state)
-                )
-                action_layout, action_gripper_indices = legacy_vector_layout(
-                    len(first_action)
-                )
-            else:
-                state_layout, state_gripper_indices = trajectory_vector_layout(
-                    trajectory_config, len(first_state), kind="state"
-                )
-                action_layout, action_gripper_indices = trajectory_vector_layout(
-                    trajectory_config, len(first_action), kind="action"
-                )
+                raise ValueError("schema-v2 trajectory metadata is required")
+            state_layout, state_gripper_indices = trajectory_vector_layout(
+                trajectory_config, len(first_state), kind="state"
+            )
+            action_layout, action_gripper_indices = trajectory_vector_layout(
+                trajectory_config, len(first_action), kind="action"
+            )
         except ValueError as exc:
             issues.append(f"semantic layout check failed: {exc}")
         metrics["gripper_checked"] = bool(
@@ -408,7 +391,6 @@ def check_state_action_semantics(
             if (
                 arm_action_representation in {
                     "delta_joint_position",
-                    "delta_end_effector_pose",
                     "delta_end_effector_position_rotation_vector",
                 }
                 and arm_max > action_outlier_threshold
@@ -435,9 +417,7 @@ def check_state_action_semantics(
     # targets below. A large target-minus-measured value is useful telemetry,
     # but is not by itself schema corruption and therefore remains diagnostic.
     if arm_action_representation not in {
-        "absolute_joint_position",
         "delta_joint_position",
-        "delta_end_effector_pose",
         "delta_end_effector_position_rotation_vector",
     }:
         issues.append(f"unsupported arm action representation '{arm_action_representation}'")
@@ -545,7 +525,6 @@ def check_ee_joint_kinematic_consistency(
         apply_ee_delta,
         ee_state_to_matrix,
         infer_flange_to_ee,
-        pose_vector_to_matrix,
         pose_error,
     )
 
@@ -566,8 +545,7 @@ def check_ee_joint_kinematic_consistency(
         "max_ee_target_fk_orientation_error_rad": 0.0,
     }
     valid_rows: list[tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-    legacy_pose = int(trajectory_config.get("schema_version", 1)) == 1
-    expected_state_pose_dim = (6 if legacy_pose else EE_STATE_DIM) * len(arms)
+    expected_state_pose_dim = EE_STATE_DIM * len(arms)
     expected_action_pose_dim = 6 * len(arms)
     expected_joint_dim = joint_stride * len(arms)
     for row in ordered_rows:
@@ -603,7 +581,7 @@ def check_ee_joint_kinematic_consistency(
         return issues, metrics
 
     for arm_index, arm_name in enumerate(arms):
-        state_width = 6 if legacy_pose else EE_STATE_DIM
+        state_width = EE_STATE_DIM
         state_pose_slice = slice(arm_index * state_width, arm_index * state_width + state_width)
         action_pose_slice = slice(
             arm_index * EE_ACTION_DIM, arm_index * EE_ACTION_DIM + EE_ACTION_DIM
@@ -617,16 +595,9 @@ def check_ee_joint_kinematic_consistency(
         )
         for row, observed_ee, delta_ee, target_ee, observed_joint, target_joint in valid_rows:
             frame = int(row["frame_index"])
-            if legacy_pose:
-                observed_matrix = pose_vector_to_matrix(observed_ee[state_pose_slice])
-                target_matrix = pose_vector_to_matrix(target_ee[state_pose_slice])
-                reconstructed_matrix = pose_vector_to_matrix(
-                    observed_ee[state_pose_slice] + delta_ee[action_pose_slice]
-                )
-            else:
-                observed_matrix = ee_state_to_matrix(observed_ee[state_pose_slice])
-                target_matrix = ee_state_to_matrix(target_ee[state_pose_slice])
-                reconstructed_matrix = apply_ee_delta(observed_matrix, delta_ee[action_pose_slice])
+            observed_matrix = ee_state_to_matrix(observed_ee[state_pose_slice])
+            target_matrix = ee_state_to_matrix(target_ee[state_pose_slice])
+            reconstructed_matrix = apply_ee_delta(observed_matrix, delta_ee[action_pose_slice])
             delta_position, delta_orientation = pose_error(
                 reconstructed_matrix, target_matrix
             )
@@ -922,11 +893,9 @@ def check_joint_safety_constraints(
 
     try:
         if trajectory_config is None:
-            state_layout, _ = legacy_vector_layout(len(states[0]))
-            action_layout, _ = legacy_vector_layout(len(actions[0]))
-        else:
-            state_layout, _ = joint_vector_layout(trajectory_config, len(states[0]))
-            action_layout, _ = joint_vector_layout(trajectory_config, len(actions[0]))
+            raise ValueError("schema-v2 trajectory metadata is required")
+        state_layout, _ = joint_vector_layout(trajectory_config, len(states[0]))
+        action_layout, _ = joint_vector_layout(trajectory_config, len(actions[0]))
     except ValueError as exc:
         return [f"joint safety check skipped: {exc}"], warnings, metrics
 
@@ -974,9 +943,7 @@ def check_joint_safety_constraints(
 
         action_trajectory = action_array[:, action_layout[arm_name]]
         if arm_action_representation not in {
-            "absolute_joint_position",
             "delta_joint_position",
-            "delta_end_effector_pose",
             "delta_end_effector_position_rotation_vector",
         }:
             issues.append(
@@ -1229,7 +1196,7 @@ def validate_dataset(
 
     action_config = load_action_config(dataset_root)
     arm_action_representation = str(
-        (action_config or {}).get("arm_action_representation", "absolute_joint_position")
+        (action_config or {}).get("arm_action_representation", "")
     ).strip().lower()
     fps = float(info["fps"])
     total_episodes = int(info["total_episodes"])
@@ -1625,7 +1592,7 @@ def validate_dataset(
         print(f"  max target-reconstruction error: {max_joint_delta_error:.6g}")
         print(f"  target-reconstruction bad frames: {total_joint_delta_mismatch_frames}")
     else:
-        print("  delta-action consistency check: skipped for absolute_joint_position actions")
+        print("  joint delta-action consistency check: not applicable to the primary EE action")
 
     print("\nJoint safety checks")
     print(

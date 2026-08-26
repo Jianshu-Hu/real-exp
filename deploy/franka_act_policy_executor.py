@@ -33,6 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 from deploy.action_aggregation import TemporalProposalAggregator
 from utils.trajectory_metadata import (
     describe_trajectory_layout,
+    split_absolute_transport_action,
     split_trajectory_vector,
     validate_action_trajectory_contract,
     validate_live_packet,
@@ -300,10 +301,8 @@ class FrankaPolicyExecutor:
             source=metadata_url,
         )
         self.dataset_action_dim = int(self.trajectory_config["action_dim"])
-        if self._arm_action_representation() not in {"absolute_joint_position", "delta_joint_position", "delta_end_effector_pose", "delta_end_effector_position_rotation_vector"}:
-            raise ValueError(
-                "Deployment expects absolute_joint_position or delta_end_effector_pose arm actions."
-            )
+        if self._arm_action_representation() not in {"delta_joint_position", "delta_end_effector_position_rotation_vector"}:
+            raise ValueError("Deployment expects schema-v2 delta arm actions.")
 
         grpc, services_pb2, services_pb2_grpc, grpc_channel_options, send_bytes_in_chunks = import_grpc_runtime()
         self.grpc = grpc
@@ -336,7 +335,7 @@ class FrankaPolicyExecutor:
 
     def _arm_action_representation(self) -> str:
         return str(
-            self.action_config.get("arm_action_representation", "absolute_joint_position")
+            self.action_config.get("arm_action_representation", "delta_joint_position")
         ).strip().lower()
 
     def _gripper_action_representation(self) -> str:
@@ -352,7 +351,7 @@ class FrankaPolicyExecutor:
 
     def _ee_targets_from_action(self, split: dict[str, Any], current_packet: dict[str, Any]) -> dict[str, list[float]]:
         current = np.asarray(current_packet.get("ee_pose", []), dtype=float)
-        state_width = 9 if int(self.trajectory_config.get("schema_version", 1)) >= 2 else 6
+        state_width = 9
         action_width = 6 if state_width == 9 else 6
         if current.shape != (state_width * len(self.trajectory_config["arms"]),):
             raise ValueError("Live bridge did not provide the EE pose required by an EE-action checkpoint.")
@@ -559,26 +558,29 @@ class FrankaPolicyExecutor:
         queue_snapshot_after_pop: dict[str, Any],
     ) -> None:
         predicted_action = np.asarray(action.get_action(), dtype=float)
-        split = split_action(predicted_action, self.trajectory_config)
+        split = split_absolute_transport_action(predicted_action, self.trajectory_config)
         current_state = np.asarray(current_packet["state"], dtype=float)
-        state_split = split_action(current_state, self.trajectory_config)
-        joint_targets = self._joint_targets_from_action(split)
+        state_split = split_trajectory_vector(current_state, self.trajectory_config, kind="state")
+        arm_targets = {
+            side: np.asarray(split[f"{side}_arm"], dtype=float)
+            for side in self.trajectory_config["arms"]
+        }
         left_delta_from_state = None
         right_delta_from_state = None
         if state_split is not None:
             left_delta_from_state = (
                 None
-                if "left" not in joint_targets
+                if "left" not in arm_targets
                 else (
-                    np.asarray(joint_targets["left"], dtype=float)
+                    arm_targets["left"]
                     - np.asarray(state_split["left_arm"], dtype=float)
                 ).tolist()
             )
             right_delta_from_state = (
                 None
-                if "right" not in joint_targets
+                if "right" not in arm_targets
                 else (
-                    np.asarray(joint_targets["right"], dtype=float)
+                    arm_targets["right"]
                     - np.asarray(state_split["right_arm"], dtype=float)
                 ).tolist()
             )
@@ -863,18 +865,12 @@ class FrankaPolicyExecutor:
         values = np.asarray(action.get_action(), dtype=float)
         transport = self.action_config.get("transport_action_representation") == "absolute_target"
         if transport and self.trajectory_config.get("state_action_mode") == "end_effector":
-            split = {}
-            extra = 1 if self.trajectory_config["end_effector"] == "gripper" else 20 if self.trajectory_config["end_effector"] == "hand" else 0
-            stride = 9 + extra
-            for i, side in enumerate(self.trajectory_config["arms"]):
-                block = values[i*stride:(i+1)*stride]
-                split[f"{side}_ee_pose"] = block[:9]
-                if extra: split[f"{side}_gripper" if extra == 1 else f"{side}_hand"] = block[9:]
+            split = split_absolute_transport_action(values, self.trajectory_config)
             joint_targets = {}; ee_targets = {side: np.asarray(split[f"{side}_ee_pose"]).tolist() for side in self.trajectory_config["arms"]}
         else:
             split = split_action(values, self.trajectory_config)
-            joint_targets = self._joint_targets_from_action(split) if self._arm_action_representation() == "absolute_joint_position" or transport else {}
-            ee_targets = self._ee_targets_from_action(split, current_packet) if self._arm_action_representation() in {"delta_end_effector_pose", "delta_end_effector_position_rotation_vector"} and not transport else {}
+            joint_targets = self._joint_targets_from_action(split) if transport else {}
+            ee_targets = self._ee_targets_from_action(split, current_packet) if self._arm_action_representation() == "delta_end_effector_position_rotation_vector" and not transport else {}
         payload: dict[str, Any] = {
             "timestamp": time.time(),
             **{f"{side}_joint_target": target for side, target in joint_targets.items()},

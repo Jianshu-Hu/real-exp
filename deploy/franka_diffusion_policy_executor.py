@@ -104,13 +104,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--task", default="pick and place")
     parser.add_argument(
-        "--diffusion-chunk-size-threshold",
+        "--chunk-size-threshold",
         type=float,
         default=0.8,
         help=(
-            "Send a new observation when queue_size / actions_per_chunk is at or below this value "
-            "for diffusion deployment. Defaults to 1.0 to refresh diffusion chunks as soon as "
-            "a full observation history is available."
+            "Send a new observation when queue_size / actions_per_chunk is at or below this value. "
+            "Defaults to 0.8."
         ),
     )
     parser.add_argument("--execute", action="store_true")
@@ -321,7 +320,7 @@ def json_safe(value: Any) -> Any:
 def default_run_name(args: argparse.Namespace) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     policy_name = args.policy_path.expanduser().name if args.policy_path else "remote-policy"
-    threshold = args.diffusion_chunk_size_threshold
+    threshold = args.chunk_size_threshold
     proposal_decay = args.temporal_proposal_decay
     return (
         f"{timestamp}_{policy_name}_diffusion"
@@ -370,17 +369,17 @@ class FrankaPolicyExecutor:
                     f"chunk size ({max_actions_per_chunk})."
                 )
 
-        if not 0.0 <= args.diffusion_chunk_size_threshold <= 1.0:
+        if not 0.0 <= args.chunk_size_threshold <= 1.0:
             raise ValueError(
-                "--diffusion-chunk-size-threshold must be between 0 and 1, "
-                f"got {args.diffusion_chunk_size_threshold}"
+                "--chunk-size-threshold must be between 0 and 1, "
+                f"got {args.chunk_size_threshold}"
             )
         if not 0.0 <= args.temporal_proposal_decay <= 1.0:
             raise ValueError(
                 "--temporal-proposal-decay must be between 0 and 1, "
                 f"got {args.temporal_proposal_decay}"
             )
-        self.chunk_size_threshold = args.diffusion_chunk_size_threshold
+        self.chunk_size_threshold = args.chunk_size_threshold
         self.temporal_proposal_decay = args.temporal_proposal_decay
         self.dataset_info = self.deployment_contract.get("dataset_info", {"fps": self.deployment_contract["fps"], "features": self.deployment_contract["features"]})
         dataset_fps = float(self.deployment_contract["fps"])
@@ -600,7 +599,6 @@ class FrankaPolicyExecutor:
             "actions_per_chunk": self.actions_per_chunk,
             "chunk_size_threshold": self.chunk_size_threshold,
             "temporal_proposal_decay": self.temporal_proposal_decay,
-            "diffusion_chunk_size_threshold": self.args.diffusion_chunk_size_threshold,
             "diffusion_observation_streaming": True,
             "policy_n_obs_steps": self.n_obs_steps,
             "diffusion_min_history_for_inference": self.min_history_for_inference,

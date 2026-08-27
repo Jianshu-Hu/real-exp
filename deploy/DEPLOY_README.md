@@ -138,7 +138,7 @@ python deploy/franka_diffusion_policy_executor.py \
   --server-address 192.168.50.13:8080 \
   --policy-device cuda:0 \
   --task "pick and place" \
-  --diffusion-chunk-size-threshold 0.5 \
+  --chunk-size-threshold 0.5 \
   --temporal-proposal-decay 0.5
 ```
 

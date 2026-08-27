@@ -226,6 +226,30 @@ def test_ik_recovers_a_known_reachable_pose_with_tool_transform() -> None:
     assert np.all(result.q <= move.ARM_POSITION_UPPER_RAD)
 
 
+def test_ik_recovers_pose_with_dependency_free_fr3_backend() -> None:
+    from utils.fr3_kinematics import Fr3ForwardKinematics
+
+    kinematics = Fr3ForwardKinematics(backend="numpy")
+    known_q = np.asarray([0.2, 0.6, 0.5, -1.8, -0.5, 1.5, 0.3])
+    flange_to_ee = move.pose_vector_to_matrix([0, 0, 0.1034, 0, 0, -np.pi / 4])
+    target = kinematics.end_effector_pose(known_q, flange_to_ee)
+    seed = known_q + np.asarray([0.03, -0.02, 0.02, -0.03, 0.02, -0.02, 0.03])
+
+    result = move.solve_fr3_ik(
+        seed,
+        target,
+        flange_to_ee,
+        kinematics=kinematics,
+        try_alternative_seeds=False,
+        max_function_evaluations=100,
+    )
+
+    assert result.position_error_m <= move.IK_POSITION_TOLERANCE_M
+    assert result.orientation_error_rad <= move.IK_ORIENTATION_TOLERANCE_RAD
+    assert np.all(result.q >= move.ARM_POSITION_LOWER_RAD)
+    assert np.all(result.q <= move.ARM_POSITION_UPPER_RAD)
+
+
 def test_ik_rejects_unreachable_pose_before_transport() -> None:
     model, frame_id = move.build_fr3_model()
     seed = np.asarray([0.2, 0.6, 0.5, -1.8, -0.5, 1.5, 0.3])

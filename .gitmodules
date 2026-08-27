@@ -10,3 +10,6 @@
 [submodule "libs/hand-tracking-streamer"]
 	path = libs/hand-tracking-streamer
 	url = https://github.com/wengmister/hand-tracking-streamer.git
+[submodule "libs/FoundationPose-plus-plus"]
+	path = libs/FoundationPose-plus-plus
+	url = https://github.com/Jianshu-Hu/FoundationPose-plus-plus.git

@@ -4,12 +4,80 @@ from fractions import Fraction
 
 import av
 import numpy as np
+import pytest
 
 from data_collection.validate_dataset import (
+    check_ee_joint_kinematic_consistency,
     check_joint_safety_constraints,
     check_physical_video_frames,
     check_state_action_semantics,
+    trajectory_vector_layout,
 )
+from utils.fr3_kinematics import matrix_to_pose_vector, pose_vector_to_matrix, wrapped_pose_delta
+
+
+def test_ee_duo_gripper_layout_uses_gripper_after_each_pose_block() -> None:
+    trajectory = {
+        "state_action_mode": "end_effector",
+        "end_effector": "gripper",
+        "arm_mode": "duo",
+        "arms": ["left", "right"],
+    }
+
+    layout, gripper_indices = trajectory_vector_layout(trajectory, vector_size=14)
+
+    assert layout == {"left": slice(0, 6), "right": slice(7, 13)}
+    assert gripper_indices == (6, 13)
+
+
+def test_wrapped_pose_delta_avoids_euler_boundary_jump() -> None:
+    current = np.asarray([0.4, 0.2, 0.3, np.pi - 0.01, 0.0, 0.0])
+    target = np.asarray([0.4, 0.2, 0.3, -np.pi + 0.01, 0.0, 0.0])
+
+    delta = wrapped_pose_delta(current, target)
+
+    assert delta[3] == pytest.approx(0.02)
+    np.testing.assert_allclose(
+        pose_vector_to_matrix(current + delta),
+        pose_vector_to_matrix(target),
+        atol=1e-12,
+    )
+
+
+def test_ee_validator_rejects_joint_target_that_disagrees_with_ee_target() -> None:
+    class FakeKinematics:
+        def flange_pose(self, q: np.ndarray) -> np.ndarray:
+            matrix = np.eye(4)
+            matrix[0, 3] = float(q[0])
+            return matrix
+
+        def end_effector_pose(self, q: np.ndarray, flange_to_ee: np.ndarray) -> np.ndarray:
+            return self.flange_pose(q) @ flange_to_ee
+
+    observed_pose = matrix_to_pose_vector(np.eye(4))
+    wrong_target_pose = observed_pose.copy()
+    rows = [
+        {
+            "frame_index": 0,
+            "observation.ee_pose": observed_pose,
+            "action.target_ee_pose": wrong_target_pose,
+            "action.delta_ee_pose": wrapped_pose_delta(observed_pose, wrong_target_pose),
+            "observation.joint_state": [0.0] * 8,
+            "action.target_joint": [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        }
+    ]
+    trajectory = {
+        "arms": ["left"],
+        "arm_mode": "left",
+        "end_effector": "gripper",
+    }
+
+    issues, metrics = check_ee_joint_kinematic_consistency(
+        rows, trajectory, FakeKinematics()
+    )
+
+    assert metrics["ee_target_fk_mismatch_frames"] == [(0, "left")]
+    assert any("FK(action.target_joint)" in issue for issue in issues)
 from utils.limit import (
     FR3_SAFE_POSITION_LOWER_RAD,
     FR3_SAFE_POSITION_UPPER_RAD,

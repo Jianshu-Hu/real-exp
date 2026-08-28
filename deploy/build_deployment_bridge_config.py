@@ -31,6 +31,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--arm-mode", required=True, choices=("left", "right", "duo"))
     parser.add_argument("--include-gripper", required=True, type=parse_bool)
     parser.add_argument("--include-hand", required=True, type=parse_bool)
+    parser.add_argument("--state-action-mode", choices=("joint", "end_effector"), default=None)
     parser.add_argument("--hand-telemetry-host", required=True)
     parser.add_argument("--hand-telemetry-port", required=True, type=int)
     for index in range(1, 4):
@@ -75,6 +76,8 @@ def build_config(base_config: dict[str, Any], args: argparse.Namespace) -> dict[
             },
         }
     )
+    if getattr(args, "state_action_mode", None) is not None:
+        parameters["state_action_mode"] = args.state_action_mode
     return base_config
 
 

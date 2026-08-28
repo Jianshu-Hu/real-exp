@@ -45,6 +45,11 @@ generation. Gripper values are continuous action dimensions and are aggregated w
 Deployment requires `gripper_action_representation: absolute_width`; old binary checkpoints are
 rejected instead of converting their outputs with a threshold.
 
+Schema-v2 policies emit chunk-anchored deltas. The policy server decodes every complete chunk
+against the exact generation observation before sending it to the executor. The executor queue
+therefore contains absolute joint targets or absolute 9D EE targets, and overlapping chunks are
+never blended in incompatible delta coordinate frames.
+
 The dataset root passed to the client, server, and executor must identify the
 same data contract. It does not need to have the same absolute path on both
 computers. The startup scripts resolve arm mode, end effector, state/action
@@ -133,7 +138,7 @@ python deploy/franka_diffusion_policy_executor.py \
   --server-address 192.168.50.13:8080 \
   --policy-device cuda:0 \
   --task "pick and place" \
-  --diffusion-chunk-size-threshold 0.5 \
+  --chunk-size-threshold 0.5 \
   --temporal-proposal-decay 0.5
 ```
 
@@ -143,9 +148,13 @@ Diffusion requires two observation frames before its first inference. Add
 ## Metadata-Driven Hardware Contract
 
 The executor fetches the server-owned checkpoint contract instead of
-assuming a 14- or 16-value dual-arm vector. For example, a left-gripper policy
-uses `[left arm(7), left gripper(1)]`, while a right-hand policy uses
-`[right arm(7), right hand(20)]`. Before inference it rejects any live bridge
+assuming a 14- or 16-value dual-arm vector. Joint checkpoints use arm current
+joint angles and arm target joint angles. EE checkpoints replace only those
+seven arm values with current 6D EE pose and 6D delta EE pose; grippers retain
+current normalized width in state and target width in action, and hands retain
+current and target joint angles. For example, a left-gripper policy uses
+`[left arm(7), left gripper(1)]` in joint mode or
+`[left EE pose(6), left gripper(1)]` in EE mode. Before inference it rejects any live bridge
 whose arm mode, end-effector type, state/action dimensions, or required camera
 set differs from the contract. Checkpoint directories must contain
 `meta/info.json`, `meta/real_exp_trajectory_config.json`,

@@ -32,6 +32,27 @@ EOF
 }
 die() { echo "Error: $*" >&2; exit 1; }
 validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535)); }
+check_port_available() {
+  local port="$1" label="$2"
+  command -v ss >/dev/null 2>&1 || return 0
+  if ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
+    die "${label} port ${port} is already in use; stop the existing service or choose another port"
+  fi
+}
+clear_port() {
+  local port="$1"
+  command -v fuser >/dev/null 2>&1 || return 0
+  if ! fuser -n tcp "${port}" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Clearing existing policy service on tcp port ${port}." >&2
+  fuser -TERM -k -n tcp "${port}" >/dev/null 2>&1 || true
+  for _ in {1..10}; do
+    fuser -n tcp "${port}" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  fuser -KILL -k -n tcp "${port}" >/dev/null 2>&1 || true
+}
 
 policy_path=""; metadata_port=8081; requested_fps=""
 server_ip="${DEPLOYMENT_SERVER_IP:-192.168.50.13}"
@@ -78,21 +99,28 @@ validate_port "${metadata_port}" || die "invalid metadata port: ${metadata_port}
    "${metadata_port}" != "${camera_cache_port}" && "${metadata_port}" != "${policy_port}" && \
    "${metadata_port}" != "${hand_telemetry_port}" ]] || die "deployment ports must be distinct"
 
+# A previous policy process commonly survives an interrupted deployment. Clear
+# only the configured policy port before starting any ROS or policy children.
+if [[ "${print_config}" -eq 0 ]]; then
+  clear_port "${policy_port}"
+fi
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
 policy_path="$(cd -- "${policy_path}" 2>/dev/null && pwd)" || die "policy path not found: ${policy_path}"
 trajectory_output="$(PYTHONPATH="${repository_root}" python3 "${repository_root}/utils/deployment_metadata.py" --checkpoint "${policy_path}" --deployment-lines)" \
   || die "could not resolve deployment metadata from ${policy_path}"
 mapfile -t trajectory_lines <<<"${trajectory_output}"
-(( ${#trajectory_lines[@]} == 8 )) || die "deployment metadata resolver returned an unexpected number of fields"
+(( ${#trajectory_lines[@]} == 9 )) || die "deployment metadata resolver returned an unexpected number of fields"
 arm_mode="${trajectory_lines[0]}"; end_effector="${trajectory_lines[1]}"; fps="${trajectory_lines[2]}"
-state_dim="${trajectory_lines[3]}"; action_dim="${trajectory_lines[4]}"; camera_names="${trajectory_lines[5]}"
-policy_type="${trajectory_lines[6]}"; actions_per_chunk="${trajectory_lines[7]}"
+state_dim="${trajectory_lines[3]}"; action_dim="${trajectory_lines[4]}"; state_action_mode="${trajectory_lines[5]}"; camera_names="${trajectory_lines[6]}"
+policy_type="${trajectory_lines[7]}"; actions_per_chunk="${trajectory_lines[8]}"
 if [[ -n "${requested_fps}" && "${requested_fps}" != "${fps}" ]]; then
   die "--fps=${requested_fps} does not match checkpoint metadata fps=${fps}"
 fi
 case "${arm_mode}" in left|right|duo) ;; *) die "unsupported metadata arm mode: ${arm_mode}" ;; esac
 case "${end_effector}" in arm|gripper|hand) ;; *) die "unsupported metadata end effector: ${end_effector}" ;; esac
+case "${state_action_mode}" in joint|end_effector) ;; *) die "unsupported metadata state/action mode: ${state_action_mode}" ;; esac
 [[ "${state_dim}" =~ ^[0-9]+$ && "${action_dim}" =~ ^[0-9]+$ ]] || die "metadata dimensions must be integers"
 [[ "${fps}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "metadata fps must be numeric"
 include_right_arm=false; [[ "${arm_mode}" == "duo" ]] && include_right_arm=true
@@ -108,12 +136,21 @@ if [[ "${camera_names}" != "" ]]; then
   done
 fi
 if [[ "${print_config}" -eq 1 ]]; then
-  printf 'policy_path=%s\narm_mode=%s\nend_effector=%s\nfps=%s\nstate_dim=%s\naction_dim=%s\ncameras=%s\npolicy_type=%s\nactions_per_chunk=%s\ninclude_right_arm=%s\ninclude_gripper=%s\ninclude_hand=%s\ncamera_1_enabled=%s\ncamera_2_enabled=%s\ncamera_3_enabled=%s\nserver_ip=%s\nmetadata_port=%s\n' \
-    "${policy_path}" "${arm_mode}" "${end_effector}" "${fps}" "${state_dim}" "${action_dim}" \
+  printf 'policy_path=%s\narm_mode=%s\nend_effector=%s\nfps=%s\nstate_dim=%s\naction_dim=%s\nstate_action_mode=%s\ncameras=%s\npolicy_type=%s\nactions_per_chunk=%s\ninclude_right_arm=%s\ninclude_gripper=%s\ninclude_hand=%s\ncamera_1_enabled=%s\ncamera_2_enabled=%s\ncamera_3_enabled=%s\nserver_ip=%s\nmetadata_port=%s\n' \
+    "${policy_path}" "${arm_mode}" "${end_effector}" "${fps}" "${state_dim}" "${action_dim}" "${state_action_mode}" \
     "${camera_names}" "${policy_type}" "${actions_per_chunk}" "${include_right_arm}" "${include_gripper}" "${include_hand}" \
     "${camera_left}" "${camera_front}" "${camera_right}" "${server_ip}" "${metadata_port}"
   exit 0
 fi
+# Fail before starting ROS processes when a previous deployment (or another
+# service) still owns one of the server-side TCP ports.
+check_port_available "${publish_port}" "observation"
+check_port_available "${command_port}" "command"
+check_port_available "${camera_cache_port}" "camera cache"
+check_port_available "${policy_port}" "policy"
+check_port_available "${metadata_port}" "metadata"
+check_port_available "${hand_telemetry_port}" "hand telemetry"
+
 # shellcheck source=scripts/conda_env.sh
 source "${script_dir}/conda_env.sh"
 if [[ -n "${ros_distro}" ]]; then
@@ -145,7 +182,7 @@ export ROS_LOCALHOST_ONLY=0
 export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
 command -v setsid >/dev/null || die "setsid is required"
 command -v ros2 >/dev/null || die "ros2 is unavailable after sourcing ROS"
-for required_package in franka_realsense_camera_publisher franka_lerobot_data_bridge; do
+for required_package in franka_realsense_camera_publisher franka_lerobot_data_bridge franka_msgs; do
   ros2 pkg prefix "${required_package}" >/dev/null 2>&1 || die \
     "required ROS package is unavailable after sourcing overlays: ${required_package}"
 done
@@ -172,6 +209,7 @@ if ! python3 "${repository_root}/deploy/build_deployment_bridge_config.py" \
   --command-host "${server_ip}" --command-port "${command_port}" \
   --camera-cache-host 127.0.0.1 --camera-cache-port "${camera_cache_port}" \
   --include-right-arm "${include_right_arm}" --arm-mode "${arm_mode}" \
+  --state-action-mode "${state_action_mode}" \
   --include-gripper "${include_gripper}" --include-hand "${include_hand}" \
   --hand-telemetry-host "${server_ip}" --hand-telemetry-port "${hand_telemetry_port}" \
   --camera-1-enabled "${camera_left}" --camera-2-enabled "${camera_front}" \
@@ -196,7 +234,7 @@ shutdown() {
 }
 trap shutdown EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 
-echo "Deployment contract: ${end_effector}/${arm_mode}, state/action=${state_dim}/${action_dim}, cameras=${camera_names}, fps=${fps}"
+echo "Deployment contract: ${end_effector}/${arm_mode}, mode=${state_action_mode}, state/action=${state_dim}/${action_dim}, cameras=${camera_names}, fps=${fps}"
 echo "Deployment server: observation tcp://${server_ip}:${publish_port}, command tcp://${server_ip}:${command_port}, hand telemetry tcp://${server_ip}:${hand_telemetry_port}, camera cache tcp://127.0.0.1:${camera_cache_port}, gRPC :${policy_port}"
 start_process "RealSense camera publisher" ros2 launch franka_realsense_camera_publisher cameras.launch.py
 start_process "Deployment observation bridge" ros2 launch franka_lerobot_data_bridge bridge.launch.py \

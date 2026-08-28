@@ -31,7 +31,7 @@ try:
         build_dataloader,
         ensure_runtime_env,
         evaluate_validation_loss,
-        require_absolute_joint_action_dataset,
+        require_state_action_mode_dataset,
     )
 except ImportError:
     from train_lerobot_policy import (
@@ -40,8 +40,9 @@ except ImportError:
         build_dataloader,
         ensure_runtime_env,
         evaluate_validation_loss,
-        require_absolute_joint_action_dataset,
+        require_state_action_mode_dataset,
     )
+from utils.mode_aware_dataset import adapt_dataset_for_mode, normalize_training_mode
 
 
 def parse_args() -> argparse.Namespace:
@@ -247,8 +248,6 @@ def evaluate_checkpoint(
     dataset_repo_id = args.dataset_repo_id or str(train_config["dataset"]["repo_id"])
     val_episodes = infer_validation_episodes(train_config, dataset_root, args.val_episodes)
 
-    require_absolute_joint_action_dataset(dataset_root)
-
     policy_config = load_json(checkpoint_dir / "config.json")
     policy_type = str(policy_config["type"])
     if not policy_type_matches(policy_type, args.policy_type):
@@ -256,6 +255,15 @@ def evaluate_checkpoint(
             f"Checkpoint {checkpoint_dir} is policy type {policy_type}, "
             f"but --policy-type={args.policy_type} was requested."
         )
+
+    trajectory_path = checkpoint_dir / "meta" / "real_exp_trajectory_config.json"
+    if not trajectory_path.exists():
+        raise FileNotFoundError(f"Missing checkpoint trajectory metadata: {trajectory_path}")
+    checkpoint_trajectory = load_json(trajectory_path)
+    training_mode = normalize_training_mode(
+        checkpoint_trajectory.get("state_action_mode"), "joint"
+    )
+    require_state_action_mode_dataset(dataset_root, training_mode)
 
     cli_overrides = build_policy_cli_overrides(policy_type, args)
     policy_class = get_policy_class(policy_type)
@@ -269,7 +277,7 @@ def evaluate_checkpoint(
         num_workers=args.num_workers,
         tolerance_s=float(train_config.get("tolerance_s", 1e-4)),
     )
-    val_dataset = make_dataset(build_cfg)
+    val_dataset = adapt_dataset_for_mode(make_dataset(build_cfg), training_mode)
     apply_dataset_image_transform(val_dataset, resize_pad_config)
 
     preprocessor, _ = make_pre_post_processors(

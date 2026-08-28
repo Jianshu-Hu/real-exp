@@ -33,6 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 from deploy.action_aggregation import TemporalProposalAggregator
 from utils.trajectory_metadata import (
     describe_trajectory_layout,
+    split_absolute_transport_action,
     split_trajectory_vector,
     validate_action_trajectory_contract,
     validate_live_packet,
@@ -102,12 +103,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--task", default="pick and place")
     parser.add_argument(
-        "--act-chunk-size-threshold",
+        "--chunk-size-threshold",
         type=float,
-        default=0.9,
+        default=0.8,
         help=(
             "Send a new observation when queue_size / actions_per_chunk is at or below this value. "
-            "Default 0.9 was validated to give smooth overlapping ACT chunks."
+            "Defaults to 0.8."
         ),
     )
     parser.add_argument("--execute", action="store_true")
@@ -235,7 +236,7 @@ def json_safe(value: Any) -> Any:
 def default_run_name(args: argparse.Namespace) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     policy_name = args.policy_path.expanduser().name if args.policy_path else "remote-policy"
-    threshold = args.act_chunk_size_threshold
+    threshold = args.chunk_size_threshold
     proposal_decay = args.temporal_proposal_decay
     return (
         f"{timestamp}_{policy_name}_act"
@@ -274,16 +275,16 @@ class FrankaPolicyExecutor:
                     f"chunk size ({max_actions_per_chunk})."
                 )
 
-        if not 0.0 <= args.act_chunk_size_threshold <= 1.0:
+        if not 0.0 <= args.chunk_size_threshold <= 1.0:
             raise ValueError(
-                f"--act-chunk-size-threshold must be between 0 and 1, got {args.act_chunk_size_threshold}"
+                f"--chunk-size-threshold must be between 0 and 1, got {args.chunk_size_threshold}"
             )
         if not 0.0 <= args.temporal_proposal_decay <= 1.0:
             raise ValueError(
                 "--temporal-proposal-decay must be between 0 and 1, "
                 f"got {args.temporal_proposal_decay}"
             )
-        self.chunk_size_threshold = args.act_chunk_size_threshold
+        self.chunk_size_threshold = args.chunk_size_threshold
         self.temporal_proposal_decay = args.temporal_proposal_decay
         self.dataset_info = self.deployment_contract.get("dataset_info", {"fps": self.deployment_contract["fps"], "features": self.deployment_contract["features"]})
         dataset_fps = float(self.deployment_contract["fps"])
@@ -300,11 +301,8 @@ class FrankaPolicyExecutor:
             source=metadata_url,
         )
         self.dataset_action_dim = int(self.trajectory_config["action_dim"])
-        if self._arm_action_representation() != "absolute_joint_position":
-            raise ValueError(
-                "Deployment expects absolute_joint_position arm actions. "
-                "Record and train a new absolute-target dataset before executing this policy."
-            )
+        if self._arm_action_representation() not in {"delta_joint_position", "delta_end_effector_position_rotation_vector"}:
+            raise ValueError("Deployment expects schema-v2 delta arm actions.")
 
         grpc, services_pb2, services_pb2_grpc, grpc_channel_options, send_bytes_in_chunks = import_grpc_runtime()
         self.grpc = grpc
@@ -337,7 +335,7 @@ class FrankaPolicyExecutor:
 
     def _arm_action_representation(self) -> str:
         return str(
-            self.action_config.get("arm_action_representation", "absolute_joint_position")
+            self.action_config.get("arm_action_representation", "delta_joint_position")
         ).strip().lower()
 
     def _gripper_action_representation(self) -> str:
@@ -350,6 +348,27 @@ class FrankaPolicyExecutor:
             side: np.asarray(split[f"{side}_arm"], dtype=float).tolist()
             for side in self.trajectory_config["arms"]
         }
+
+    def _ee_targets_from_action(self, split: dict[str, Any], current_packet: dict[str, Any]) -> dict[str, list[float]]:
+        current = np.asarray(current_packet.get("ee_pose", []), dtype=float)
+        state_width = 9
+        action_width = 6 if state_width == 9 else 6
+        if current.shape != (state_width * len(self.trajectory_config["arms"]),):
+            raise ValueError("Live bridge did not provide the EE pose required by an EE-action checkpoint.")
+        from utils.fr3_kinematics import apply_ee_delta, ee_state_to_matrix, matrix_to_ee_state
+        targets: dict[str, list[float]] = {}
+        for index, side in enumerate(self.trajectory_config["arms"]):
+            delta = np.asarray(split[f"{side}_delta_ee_pose"], dtype=float)
+            if state_width == 9:
+                targets[side] = matrix_to_ee_state(
+                    apply_ee_delta(
+                        ee_state_to_matrix(current[index * state_width : (index + 1) * state_width]),
+                        delta[:action_width],
+                    )
+                ).tolist()
+            else:
+                targets[side] = (current[index * state_width : (index + 1) * state_width] + delta).tolist()
+        return targets
 
     def _queue_snapshot(self) -> dict[str, Any]:
         with self.action_queue_lock:
@@ -410,7 +429,6 @@ class FrankaPolicyExecutor:
             "actions_per_chunk": self.actions_per_chunk,
             "chunk_size_threshold": self.chunk_size_threshold,
             "temporal_proposal_decay": self.temporal_proposal_decay,
-            "act_chunk_size_threshold": self.args.act_chunk_size_threshold,
             "fps": self.fps,
             "task": self.args.task,
             "execute": self.args.execute,
@@ -539,26 +557,29 @@ class FrankaPolicyExecutor:
         queue_snapshot_after_pop: dict[str, Any],
     ) -> None:
         predicted_action = np.asarray(action.get_action(), dtype=float)
-        split = split_action(predicted_action, self.trajectory_config)
+        split = split_absolute_transport_action(predicted_action, self.trajectory_config)
         current_state = np.asarray(current_packet["state"], dtype=float)
-        state_split = split_action(current_state, self.trajectory_config)
-        joint_targets = self._joint_targets_from_action(split)
+        state_split = split_trajectory_vector(current_state, self.trajectory_config, kind="state")
+        arm_targets = {
+            side: np.asarray(split[f"{side}_arm"], dtype=float)
+            for side in self.trajectory_config["arms"]
+        }
         left_delta_from_state = None
         right_delta_from_state = None
         if state_split is not None:
             left_delta_from_state = (
                 None
-                if "left" not in joint_targets
+                if "left" not in arm_targets
                 else (
-                    np.asarray(joint_targets["left"], dtype=float)
+                    arm_targets["left"]
                     - np.asarray(state_split["left_arm"], dtype=float)
                 ).tolist()
             )
             right_delta_from_state = (
                 None
-                if "right" not in joint_targets
+                if "right" not in arm_targets
                 else (
-                    np.asarray(joint_targets["right"], dtype=float)
+                    arm_targets["right"]
                     - np.asarray(state_split["right_arm"], dtype=float)
                 ).tolist()
             )
@@ -838,12 +859,21 @@ class FrankaPolicyExecutor:
             except zmq.Again:
                 return packet, dropped
 
-    def _command_payload_from_action(self, action: TimedAction) -> dict[str, Any]:
-        split = split_action(np.asarray(action.get_action(), dtype=float), self.trajectory_config)
-        joint_targets = self._joint_targets_from_action(split)
+    def _command_payload_from_action(self, action: TimedAction, current_packet: dict[str, Any] | None = None) -> dict[str, Any]:
+        current_packet = {} if current_packet is None else current_packet
+        values = np.asarray(action.get_action(), dtype=float)
+        transport = self.action_config.get("transport_action_representation") == "absolute_target"
+        if transport and self.trajectory_config.get("state_action_mode") == "end_effector":
+            split = split_absolute_transport_action(values, self.trajectory_config)
+            joint_targets = {}; ee_targets = {side: np.asarray(split[f"{side}_ee_pose"]).tolist() for side in self.trajectory_config["arms"]}
+        else:
+            split = split_action(values, self.trajectory_config)
+            joint_targets = self._joint_targets_from_action(split) if transport else {}
+            ee_targets = self._ee_targets_from_action(split, current_packet) if self._arm_action_representation() == "delta_end_effector_position_rotation_vector" and not transport else {}
         payload: dict[str, Any] = {
             "timestamp": time.time(),
             **{f"{side}_joint_target": target for side, target in joint_targets.items()},
+            **{f"{side}_ee_pose_target": target for side, target in ee_targets.items()},
         }
         if self.trajectory_config["end_effector"] == "gripper":
             for side in self.trajectory_config["arms"]:
@@ -992,7 +1022,7 @@ class FrankaPolicyExecutor:
 
                 action, queue_before_pop, queue_after_pop = self.maybe_pop_action()
                 if action is not None:
-                    payload = self._command_payload_from_action(action)
+                    payload = self._command_payload_from_action(action, current_packet)
                     if self.args.execute:
                         self._send_bridge_command(payload)
                     self._log_action_executed(

@@ -32,6 +32,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils.trajectory_metadata import (
+    EE_ACTION_DIM,
+    EE_STATE_DIM,
     require_dataset_trajectory_config,
     validate_action_trajectory_contract,
     validate_setting,
@@ -69,6 +71,12 @@ class EpisodeData:
     trajectory_config: dict[str, Any] = field(default_factory=lambda: {
         "end_effector": "gripper", "arm_mode": "duo", "arms": ["left", "right"]
     })
+    ee_poses: np.ndarray | None = None
+    delta_ee_poses: np.ndarray | None = None
+    target_ee_poses: np.ndarray | None = None
+    joint_states: np.ndarray | None = None
+    target_joints: np.ndarray | None = None
+    replay_mode: str | None = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -80,6 +88,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dataset-root", type=Path, help="LeRobot dataset root.")
     parser.add_argument("--episode", type=int, default=0, help="Episode index to replay.")
+    parser.add_argument(
+        "--replay-mode",
+        choices=["joint", "ee"],
+        default=None,
+        help=(
+            "Arm representation to replay. 'joint' publishes stored joint targets; "
+            "'ee' verifies stored EE targets against their recorded joint targets "
+            "before replaying those geometrically consistent targets. "
+            "Defaults to the dataset's state_action_mode."
+        ),
+    )
     parser.add_argument("--fps", type=float, default=None, help="Replay FPS. Defaults to dataset metadata fps.")
     parser.add_argument(
         "--output",
@@ -150,6 +169,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--right-gripper-topic", default="/right/gripper/gripper_client/target_gripper_width_percent")
     parser.add_argument("--left-state-topic", default="/left/franka/joint_states")
     parser.add_argument("--right-state-topic", default="/right/franka/joint_states")
+    parser.add_argument(
+        "--left-robot-state-topic",
+        default="/left/franka_robot_state_broadcaster/robot_state",
+        help="FrankaRobotState topic used for EE replay and IK.",
+    )
+    parser.add_argument(
+        "--right-robot-state-topic",
+        default="/right/franka_robot_state_broadcaster/robot_state",
+        help="FrankaRobotState topic used for EE replay and IK.",
+    )
     parser.add_argument("--left-gripper-state-topic", default="/left/franka_gripper/joint_states")
     parser.add_argument("--right-gripper-state-topic", default="/right/franka_gripper/joint_states")
     args = parser.parse_args(argv)
@@ -282,10 +311,14 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
     action_config = load_json(dataset_root / ACTION_CONFIG_PATH)
 
     arm_action_representation = str(action_config.get("arm_action_representation", "")).strip().lower()
-    if arm_action_representation != "absolute_joint_position":
+    if arm_action_representation not in {
+        "delta_joint_position",
+        "delta_end_effector_position_rotation_vector",
+    }:
         raise ValueError(
-            "LeRobot episode replay currently requires arm_action_representation="
-            f"absolute_joint_position, got {arm_action_representation!r}."
+            "LeRobot episode replay requires arm_action_representation="
+            "a supported joint/EE action representation, got "
+            f"{arm_action_representation!r}."
         )
     gripper_action_representation = str(
         action_config.get("gripper_action_representation", "absolute_width")
@@ -300,26 +333,58 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
     if not parquet_files:
         raise FileNotFoundError(f"No parquet data files found under {dataset_root / 'data'}")
 
-    rows: list[tuple[int, float, list[float], list[float]]] = []
+    trajectory_config = require_dataset_trajectory_config(dataset_root)
+    ee_mode = str(trajectory_config.get("state_action_mode", "joint")).strip().lower() == "end_effector"
+    available_columns = set(pq.read_schema(parquet_files[0]).names)
+    ee_columns_available = {"observation.ee_pose", "action.delta_ee_pose"}.issubset(available_columns)
+    target_ee_column_available = "action.target_ee_pose" in available_columns
+    joint_columns_available = {"observation.joint_state", "action.target_joint"}.issubset(available_columns)
+    if ee_mode and not ee_columns_available:
+        raise ValueError(
+            "End-effector replay requires observation.ee_pose and action.delta_ee_pose dataset fields."
+        )
+
+    rows: list[tuple[int, float, list[float], list[float], list[float] | None, list[float] | None, list[float] | None, list[float] | None]] = []
     available_episodes: set[int] = set()
     for parquet_file in parquet_files:
-        table = pq.read_table(
-            parquet_file,
-            columns=["episode_index", "frame_index", "timestamp", "observation.state", "action"],
-        )
+        columns = ["episode_index", "frame_index", "timestamp", "observation.state", "action"]
+        if ee_columns_available:
+            columns.extend(["observation.ee_pose", "action.delta_ee_pose"])
+        if target_ee_column_available:
+            columns.append("action.target_ee_pose")
+        if joint_columns_available:
+            columns.extend(["observation.joint_state", "action.target_joint"])
+        table = pq.read_table(parquet_file, columns=columns)
         data = table.to_pydict()
-        for row_episode, frame_index, timestamp, state, action in zip(
-            data["episode_index"],
-            data["frame_index"],
-            data["timestamp"],
-            data["observation.state"],
-            data["action"],
-            strict=True,
-        ):
+        values = [
+            data[name]
+            for name in ("episode_index", "frame_index", "timestamp", "observation.state", "action")
+        ]
+        if ee_columns_available:
+            values.extend([data["observation.ee_pose"], data["action.delta_ee_pose"]])
+        if target_ee_column_available:
+            values.append(data["action.target_ee_pose"])
+        if joint_columns_available:
+            values.extend([data["observation.joint_state"], data["action.target_joint"]])
+        for row_values in zip(*values, strict=True):
+            row_episode, frame_index, timestamp, state, action = row_values[:5]
+            cursor = 5
+            ee_pose = row_values[cursor] if ee_columns_available else None
+            delta_ee_pose = row_values[cursor + 1] if ee_columns_available else None
+            cursor += 2 if ee_columns_available else 0
+            target_ee_pose = row_values[cursor] if target_ee_column_available else None
+            cursor += 1 if target_ee_column_available else 0
+            joint_state = row_values[cursor] if joint_columns_available else None
+            target_joint = row_values[cursor + 1] if joint_columns_available else None
             available_episodes.add(int(row_episode))
             if int(row_episode) != episode_index:
                 continue
-            rows.append((int(frame_index), float(timestamp), state, action))
+            rows.append(
+                (
+                    int(frame_index), float(timestamp), state, action, ee_pose,
+                    delta_ee_pose, target_ee_pose, joint_state, target_joint,
+                )
+            )
 
     if not rows:
         raise ValueError(f"Episode {episode_index} not found. Available episodes: {sorted(available_episodes)}")
@@ -327,12 +392,11 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
     rows.sort(key=lambda item: item[0])
     states = np.asarray([row[2] for row in rows], dtype=float)
     actions = np.asarray([row[3] for row in rows], dtype=float)
-    if states.ndim != 2 or actions.ndim != 2 or states.shape[1] != actions.shape[1]:
+    if states.ndim != 2 or actions.ndim != 2:
         raise ValueError(
-            "Replay requires two-dimensional state/action arrays with matching dimensions. "
+            "Replay requires two-dimensional state/action arrays. "
             f"Got state shape {states.shape}, action shape {actions.shape}."
         )
-    trajectory_config = require_dataset_trajectory_config(dataset_root)
     validate_action_trajectory_contract(
         action_config, trajectory_config, source=str(dataset_root / "meta")
     )
@@ -341,6 +405,56 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
         raise ValueError(
             f"Trajectory metadata declares action_dim={expected_dim}, but episode data has {actions.shape[1]}."
         )
+    if ee_columns_available:
+        expected_ee_state_dim = EE_STATE_DIM * len(trajectory_config["arms"])
+        expected_ee_action_dim = EE_ACTION_DIM * len(trajectory_config["arms"])
+        ee_poses = np.asarray([row[4] for row in rows], dtype=float)
+        delta_ee_poses = np.asarray([row[5] for row in rows], dtype=float)
+        if (
+            ee_poses.shape != (len(rows), expected_ee_state_dim)
+            or delta_ee_poses.shape != (len(rows), expected_ee_action_dim)
+            or not np.all(np.isfinite(ee_poses))
+            or not np.all(np.isfinite(delta_ee_poses))
+        ):
+            raise ValueError(
+                "End-effector replay requires finite EE fields with shape "
+                f"({len(rows)}, {expected_ee_state_dim}) state and "
+                f"({len(rows)}, {expected_ee_action_dim}) action."
+            )
+    else:
+        ee_poses = None
+        delta_ee_poses = None
+    if target_ee_column_available:
+        expected_ee_dim = EE_STATE_DIM * len(trajectory_config["arms"])
+        target_ee_poses = np.asarray([row[6] for row in rows], dtype=float)
+        if (
+            target_ee_poses.shape != (len(rows), expected_ee_dim)
+            or not np.all(np.isfinite(target_ee_poses))
+        ):
+            raise ValueError(
+                "EE replay requires finite action.target_ee_pose values with shape "
+                f"({len(rows)}, {expected_ee_dim})."
+            )
+    else:
+        target_ee_poses = None
+    if joint_columns_available:
+        expected_joint_dim = 7 * len(trajectory_config["arms"])
+        if trajectory_config["end_effector"] == "gripper":
+            expected_joint_dim += len(trajectory_config["arms"])
+        elif trajectory_config["end_effector"] == "hand":
+            expected_joint_dim += 20 * len(trajectory_config["arms"])
+        joint_states = np.asarray([row[7] for row in rows], dtype=float)
+        target_joints = np.asarray([row[8] for row in rows], dtype=float)
+        if (
+            joint_states.shape != (len(rows), expected_joint_dim)
+            or target_joints.shape != (len(rows), expected_joint_dim)
+            or not np.all(np.isfinite(joint_states))
+            or not np.all(np.isfinite(target_joints))
+        ):
+            raise ValueError("Replay requires finite joint state/target fields with the expected layout.")
+    else:
+        joint_states = None
+        target_joints = None
 
     return EpisodeData(
         states=states,
@@ -349,8 +463,35 @@ def load_episode_data(dataset_root: Path, episode_index: int) -> EpisodeData:
         timestamps=np.asarray([row[1] for row in rows], dtype=float),
         fps=float(info["fps"]),
         action_config=action_config,
+        ee_poses=ee_poses,
+        delta_ee_poses=delta_ee_poses,
+        target_ee_poses=target_ee_poses,
+        joint_states=joint_states,
+        target_joints=target_joints,
         trajectory_config=trajectory_config,
     )
+
+
+def resolve_replay_mode(data: EpisodeData, requested_mode: str | None) -> str:
+    dataset_mode = str(data.trajectory_config.get("state_action_mode", "joint")).strip().lower()
+    default_mode = "ee" if dataset_mode == "end_effector" else "joint"
+    replay_mode = default_mode if requested_mode is None else requested_mode
+    if replay_mode == "joint" and data.joint_states is None:
+        raise ValueError(
+            "--replay-mode joint requires observation.joint_state and action.target_joint fields."
+        )
+    if replay_mode == "ee" and (
+        data.ee_poses is None
+        or data.delta_ee_poses is None
+        or data.target_ee_poses is None
+        or data.joint_states is None
+        or data.target_joints is None
+    ):
+        raise ValueError(
+            "--replay-mode ee requires observation.ee_pose, action.delta_ee_pose, "
+            "action.target_ee_pose, observation.joint_state, and action.target_joint fields."
+        )
+    return replay_mode
 
 
 def select_frame_range(data: EpisodeData, start_frame: int, end_frame: int | None, max_frames: int | None) -> EpisodeData:
@@ -370,26 +511,73 @@ def select_frame_range(data: EpisodeData, start_frame: int, end_frame: int | Non
         timestamps=data.timestamps[indices],
         fps=data.fps,
         action_config=data.action_config,
+        ee_poses=None if data.ee_poses is None else data.ee_poses[indices],
+        delta_ee_poses=None if data.delta_ee_poses is None else data.delta_ee_poses[indices],
+        target_ee_poses=None if data.target_ee_poses is None else data.target_ee_poses[indices],
+        joint_states=None if data.joint_states is None else data.joint_states[indices],
+        target_joints=None if data.target_joints is None else data.target_joints[indices],
         trajectory_config=data.trajectory_config,
+        replay_mode=data.replay_mode,
     )
 
 
-def split_targets(data: EpisodeData) -> dict[str, np.ndarray]:
-    source = data.actions
+def split_targets(data: EpisodeData, *, source_kind: str = "action") -> dict[str, np.ndarray]:
+    if source_kind not in {"state", "action"}:
+        raise ValueError(f"Unsupported target source {source_kind!r}; expected state or action.")
+    source = data.states if source_kind == "state" else data.actions
+    ee_source = data.ee_poses if source_kind == "state" else data.delta_ee_poses
+    joint_source = data.joint_states if source_kind == "state" else data.target_joints
     arm_mode = str(data.trajectory_config["arm_mode"])
     end_effector = str(data.trajectory_config["end_effector"])
+    dataset_mode = str(data.trajectory_config.get("state_action_mode", "joint"))
+    if dataset_mode == "end_effector":
+        stored_arm_size = EE_STATE_DIM if source_kind == "state" else EE_ACTION_DIM
+    else:
+        stored_arm_size = 7
+    replay_mode = data.replay_mode or ("ee" if dataset_mode == "end_effector" else "joint")
     result: dict[str, np.ndarray] = {}
     offset = 0
+    joint_offset = 0
+    ee_offset = 0
     arms = ["left", "right"] if arm_mode == "duo" else [arm_mode]
     for side in arms:
-        result[f"{side}_arm"] = source[:, offset : offset + 7]
-        offset += 7
+        stored_arm_values = source[:, offset : offset + stored_arm_size]
+        if replay_mode == "joint" and joint_source is not None:
+            stored_arm_values = np.asarray(joint_source[:, joint_offset : joint_offset + 7], dtype=float)
+        if replay_mode == "ee":
+            if ee_source is None:
+                raise ValueError(
+                    f"EE replay requires the dedicated {source_kind} EE pose field."
+                )
+            ee_arm_size = EE_STATE_DIM if source_kind == "state" else EE_ACTION_DIM
+            arm_values = np.asarray(
+                ee_source[:, ee_offset : ee_offset + ee_arm_size], dtype=float
+            )
+            ee_offset += ee_arm_size
+        else:
+            arm_values = stored_arm_values
+        result[f"{side}_arm"] = arm_values
+        if replay_mode == "ee":
+            result[f"{side}_delta_ee_pose"] = arm_values
+        offset += stored_arm_size
         if end_effector == "gripper":
-            result[f"{side}_gripper_raw"] = source[:, offset]
+            result[f"{side}_gripper_raw"] = (
+                joint_source[:, joint_offset + 7]
+                if joint_source is not None
+                else source[:, offset]
+            )
             offset += 1
+            joint_offset += 8
         elif end_effector == "hand":
-            result[f"{side}_hand"] = source[:, offset : offset + 20]
+            result[f"{side}_hand"] = (
+                joint_source[:, joint_offset + 7 : joint_offset + 27]
+                if joint_source is not None
+                else source[:, offset : offset + 20]
+            )
             offset += 20
+            joint_offset += 27
+        else:
+            joint_offset += 7
     if offset != source.shape[1]:
         raise ValueError(
             f"Trajectory layout {end_effector}/{arm_mode} consumes {offset} values, "
@@ -425,15 +613,23 @@ def print_dry_run_summary(
         "trajectory setting: "
         f"{data.trajectory_config['end_effector']} / {data.trajectory_config['arm_mode']}"
     )
-    print(f"initial state source: observation.state at frame {int(data.frame_indices[0])}")
+    replay_mode = data.replay_mode or resolve_replay_mode(data, None)
+    state_action_mode = "end_effector" if replay_mode == "ee" else "joint"
+    initial_source = "observation.ee_pose" if replay_mode == "ee" else "observation.state"
+    print(f"initial state source: {initial_source} at frame {int(data.frame_indices[0])}")
     state_data = EpisodeData(
         states=data.states, actions=data.states, frame_indices=data.frame_indices,
         timestamps=data.timestamps, fps=data.fps, action_config=data.action_config,
         trajectory_config=data.trajectory_config,
+        ee_poses=data.ee_poses, delta_ee_poses=data.delta_ee_poses,
+        target_ee_poses=data.target_ee_poses,
+        joint_states=data.joint_states, target_joints=data.target_joints,
     )
-    initial_states = split_targets(state_data)
+    state_data.replay_mode = replay_mode
+    initial_states = split_targets(state_data, source_kind="state")
     for side in data.trajectory_config["arms"]:
-        print(f"{side} arm initial q: {initial_states[f'{side}_arm'][0].round(6).tolist()}")
+        label = "initial EE pose" if replay_mode == "ee" else "arm initial q"
+        print(f"{side} {label}: {initial_states[f'{side}_arm'][0].round(6).tolist()}")
     print(f"initial move timeout: {initial_state_timeout:g} s")
     print(f"initial move max joint velocity: {initial_state_max_velocity:g} rad/s")
     print(f"initial move max joint acceleration: {initial_state_max_acceleration:g} rad/s^2")
@@ -442,8 +638,9 @@ def print_dry_run_summary(
     print(f"arm action config: {data.action_config.get('arm_action_representation')} / {data.action_config.get('arm_action_definition')}")
     for arm_name in (f"{side}_arm" for side in data.trajectory_config["arms"]):
         values = np.asarray(targets[arm_name], dtype=float)
-        print(f"{arm_name} target min: {np.min(values, axis=0).round(6).tolist()}")
-        print(f"{arm_name} target max: {np.max(values, axis=0).round(6).tolist()}")
+        label = "delta EE pose" if replay_mode == "ee" else "target"
+        print(f"{arm_name} {label} min: {np.min(values, axis=0).round(6).tolist()}")
+        print(f"{arm_name} {label} max: {np.max(values, axis=0).round(6).tolist()}")
     if data.trajectory_config["end_effector"] == "gripper" and not no_gripper:
         for side in data.trajectory_config["arms"]:
             values = continuous_gripper_targets(targets[f"{side}_gripper_raw"])
@@ -468,10 +665,29 @@ def flatten_joint(prefix: str, values: np.ndarray | None) -> dict[str, float | s
 
 def trace_fieldnames() -> list[str]:
     fields = ["time_s", "frame_index", "dataset_timestamp", "mode", "target_source"]
-    for prefix in ("left_target_q", "right_target_q", "left_actual_q", "right_actual_q", "left_error_q", "right_error_q"):
+    for prefix in (
+        "left_recorded_state_q",
+        "right_recorded_state_q",
+        "left_recorded_target_q",
+        "right_recorded_target_q",
+        "left_target_q",
+        "right_target_q",
+        "left_actual_q",
+        "right_actual_q",
+        "left_error_q",
+        "right_error_q",
+        "left_target_vs_recorded_target_q",
+        "right_target_vs_recorded_target_q",
+        "left_actual_vs_recorded_state_q",
+        "right_actual_vs_recorded_state_q",
+    ):
         fields.extend(f"{prefix}_{index}" for index in range(1, 8))
     fields.extend(
         [
+            "left_target_vs_recorded_target_max_abs_rad",
+            "right_target_vs_recorded_target_max_abs_rad",
+            "left_actual_vs_recorded_state_max_abs_rad",
+            "right_actual_vs_recorded_state_max_abs_rad",
             "left_gripper_target",
             "right_gripper_target",
             "left_gripper_actual",
@@ -502,7 +718,19 @@ def import_ros_dependencies() -> tuple[Any, Any, Any, Any, Any]:
     return rclpy, ExternalShutdownException, Node, JointState, Float32
 
 
-def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
+def import_franka_robot_state() -> Any:
+    try:
+        from franka_msgs.msg import FrankaRobotState
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "franka_msgs is required for delta end-effector replay."
+        ) from exc
+    return FrankaRobotState
+
+
+def build_replay_node_class(
+    Node: Any, JointState: Any, Float32: Any, FrankaRobotState: Any = None
+) -> type:
     class LerobotEpisodeReplayNode(Node):  # type: ignore[misc, valid-type]
         def __init__(self, args: argparse.Namespace) -> None:
             super().__init__("lerobot_episode_replay")
@@ -510,6 +738,12 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
             self.right_state_topic = args.right_state_topic
             self.left_gripper_state_topic = args.left_gripper_state_topic
             self.right_gripper_state_topic = args.right_gripper_state_topic
+            self.left_robot_state_topic = getattr(
+                args, "left_robot_state_topic", "/left/franka_robot_state_broadcaster/robot_state"
+            )
+            self.right_robot_state_topic = getattr(
+                args, "right_robot_state_topic", "/right/franka_robot_state_broadcaster/robot_state"
+            )
             self.left_target_publisher = self.create_publisher(JointState, args.left_target_topic, 10)
             self.right_target_publisher = self.create_publisher(JointState, args.right_target_topic, 10)
             self.left_gripper_publisher = self.create_publisher(Float32, args.left_gripper_topic, 10)
@@ -520,7 +754,10 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
             self.right_actual_dq: np.ndarray | None = None
             self.left_gripper_actual: float | None = None
             self.right_gripper_actual: float | None = None
+            self.ee_pose_matrices: dict[str, np.ndarray | None] = {"left": None, "right": None}
+            self.flange_to_ee: dict[str, np.ndarray | None] = {"left": None, "right": None}
             self.active_arms = list(args.active_arms)
+            self.state_action_mode = getattr(args, "state_action_mode", "joint")
             for side in self.active_arms:
                 state_topic = args.left_state_topic if side == "left" else args.right_state_topic
                 gripper_state_topic = (
@@ -534,6 +771,18 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
                     self.create_subscription(
                         JointState, gripper_state_topic,
                         lambda msg, arm=side: self._store_gripper_state(arm, msg), 10,
+                    )
+                if self.state_action_mode == "end_effector":
+                    if FrankaRobotState is None:
+                        raise RuntimeError("FrankaRobotState is required for delta end-effector replay.")
+                    robot_state_topic = (
+                        self.left_robot_state_topic if side == "left" else self.right_robot_state_topic
+                    )
+                    self.create_subscription(
+                        FrankaRobotState,
+                        robot_state_topic,
+                        lambda msg, arm=side: self._store_robot_state(arm, msg),
+                        10,
                     )
 
         def _ordered_arm_values(self, msg: Any, field_name: str) -> np.ndarray | None:
@@ -570,6 +819,12 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
                 self.left_gripper_actual = width
             else:
                 self.right_gripper_actual = width
+
+        def _store_robot_state(self, arm_name: str, msg: Any) -> None:
+            from data_collection.move_to_target_ee import pose_message_to_matrix
+
+            self.ee_pose_matrices[arm_name] = pose_message_to_matrix(msg.o_t_ee.pose)
+            self.flange_to_ee[arm_name] = pose_message_to_matrix(msg.f_t_ee.pose)
 
         def publish_targets(
             self,
@@ -615,9 +870,49 @@ def build_replay_node_class(Node: Any, JointState: Any, Float32: Any) -> type:
                     missing.append(self.left_gripper_state_topic)
                 if "right" in self.active_arms and self.right_gripper_actual is None:
                     missing.append(self.right_gripper_state_topic)
+            if self.state_action_mode == "end_effector":
+                if "left" in self.active_arms and (
+                    self.ee_pose_matrices["left"] is None or self.flange_to_ee["left"] is None
+                ):
+                    missing.append(self.left_robot_state_topic)
+                if "right" in self.active_arms and (
+                    self.ee_pose_matrices["right"] is None or self.flange_to_ee["right"] is None
+                ):
+                    missing.append(self.right_robot_state_topic)
             return missing
 
     return LerobotEpisodeReplayNode
+
+
+def solve_delta_ee_pose_target(
+    current_q: np.ndarray,
+    current_pose: np.ndarray,
+    delta_ee_pose: np.ndarray,
+    flange_to_ee: np.ndarray,
+    model: Any,
+    frame_id: int,
+) -> np.ndarray:
+    """Convert a recorded EE delta into the joint target sent to the robot."""
+    from data_collection.move_to_target_ee import solve_fr3_ik
+    from utils.fr3_kinematics import apply_ee_delta
+
+    delta = np.asarray(delta_ee_pose, dtype=float)
+    if delta.shape != (6,) or not np.all(np.isfinite(delta)):
+        raise ValueError(f"EE action delta must be a finite six-value pose vector, got {delta.shape}.")
+    current_matrix = np.asarray(current_pose, dtype=float)
+    if current_matrix.shape != (4, 4) or not np.all(np.isfinite(current_matrix)):
+        raise ValueError("Current EE pose must be a finite 4x4 transform.")
+    result = solve_fr3_ik(
+        np.asarray(current_q, dtype=float),
+        apply_ee_delta(current_matrix, delta),
+        np.asarray(flange_to_ee, dtype=float),
+        model,
+        frame_id,
+    )
+    target_q = np.asarray(result.q, dtype=float)
+    if target_q.shape != (7,) or not np.all(np.isfinite(target_q)):
+        raise ValueError(f"FR3 IK returned an invalid joint target with shape {target_q.shape}.")
+    return target_q
 
 
 def build_trace_row(
@@ -627,8 +922,12 @@ def build_trace_row(
     dataset_timestamp: float,
     mode: str,
     target_source: str,
-    left_target: np.ndarray,
-    right_target: np.ndarray,
+    left_recorded_state: np.ndarray | None,
+    right_recorded_state: np.ndarray | None,
+    left_recorded_target: np.ndarray | None,
+    right_recorded_target: np.ndarray | None,
+    left_target: np.ndarray | None,
+    right_target: np.ndarray | None,
     left_actual: np.ndarray | None,
     right_actual: np.ndarray | None,
     left_gripper_target: float | None,
@@ -638,12 +937,33 @@ def build_trace_row(
     abort_requested: bool,
     controller_ready: bool,
 ) -> dict[str, Any]:
+    def difference(
+        minuend: np.ndarray | None,
+        subtrahend: np.ndarray | None,
+    ) -> np.ndarray | None:
+        if minuend is None or subtrahend is None:
+            return None
+        return np.asarray(minuend, dtype=float) - np.asarray(subtrahend, dtype=float)
+
+    def max_abs(values: np.ndarray | None) -> float | str:
+        return "" if values is None else float(np.max(np.abs(values)))
+
+    left_tracking_error = difference(left_target, left_actual)
+    right_tracking_error = difference(right_target, right_actual)
+    left_target_recorded_error = difference(left_target, left_recorded_target)
+    right_target_recorded_error = difference(right_target, right_recorded_target)
+    left_actual_recorded_error = difference(left_actual, left_recorded_state)
+    right_actual_recorded_error = difference(right_actual, right_recorded_state)
     row: dict[str, Any] = {
         "time_s": elapsed_s,
         "frame_index": frame_index,
         "dataset_timestamp": dataset_timestamp,
         "mode": mode,
         "target_source": target_source,
+        "left_target_vs_recorded_target_max_abs_rad": max_abs(left_target_recorded_error),
+        "right_target_vs_recorded_target_max_abs_rad": max_abs(right_target_recorded_error),
+        "left_actual_vs_recorded_state_max_abs_rad": max_abs(left_actual_recorded_error),
+        "right_actual_vs_recorded_state_max_abs_rad": max_abs(right_actual_recorded_error),
         "left_gripper_target": "" if left_gripper_target is None else float(left_gripper_target),
         "right_gripper_target": "" if right_gripper_target is None else float(right_gripper_target),
         "left_gripper_actual": "" if left_gripper_actual is None else float(left_gripper_actual),
@@ -651,12 +971,20 @@ def build_trace_row(
         "abort_requested": bool(abort_requested),
         "controller_ready": bool(controller_ready),
     }
+    row.update(flatten_joint("left_recorded_state_q", left_recorded_state))
+    row.update(flatten_joint("right_recorded_state_q", right_recorded_state))
+    row.update(flatten_joint("left_recorded_target_q", left_recorded_target))
+    row.update(flatten_joint("right_recorded_target_q", right_recorded_target))
     row.update(flatten_joint("left_target_q", left_target))
     row.update(flatten_joint("right_target_q", right_target))
     row.update(flatten_joint("left_actual_q", left_actual))
     row.update(flatten_joint("right_actual_q", right_actual))
-    row.update(flatten_joint("left_error_q", None if left_actual is None else left_target - left_actual))
-    row.update(flatten_joint("right_error_q", None if right_actual is None else right_target - right_actual))
+    row.update(flatten_joint("left_error_q", left_tracking_error))
+    row.update(flatten_joint("right_error_q", right_tracking_error))
+    row.update(flatten_joint("left_target_vs_recorded_target_q", left_target_recorded_error))
+    row.update(flatten_joint("right_target_vs_recorded_target_q", right_target_recorded_error))
+    row.update(flatten_joint("left_actual_vs_recorded_state_q", left_actual_recorded_error))
+    row.update(flatten_joint("right_actual_vs_recorded_state_q", right_actual_recorded_error))
     return row
 
 
@@ -775,8 +1103,12 @@ def move_hands_to_initial_state(
         fps=data.fps,
         action_config=data.action_config,
         trajectory_config=data.trajectory_config,
+        ee_poses=data.ee_poses, delta_ee_poses=data.delta_ee_poses,
+        target_ee_poses=data.target_ee_poses,
+        joint_states=data.joint_states, target_joints=data.target_joints,
     )
-    initial_states = split_targets(state_data)
+    state_data.replay_mode = data.replay_mode
+    initial_states = split_targets(state_data, source_kind="state")
     targets = {
         side: np.asarray(initial_states[f"{side}_hand"][0], dtype=float)
         for side in data.trajectory_config["arms"]
@@ -910,11 +1242,28 @@ def move_arms_to_initial_state(
         states=data.states, actions=data.states, frame_indices=data.frame_indices,
         timestamps=data.timestamps, fps=data.fps, action_config=data.action_config,
         trajectory_config=data.trajectory_config,
+        ee_poses=data.ee_poses, delta_ee_poses=data.delta_ee_poses,
+        target_ee_poses=data.target_ee_poses,
+        joint_states=data.joint_states, target_joints=data.target_joints,
     )
-    initial_states = split_targets(state_data)
+    replay_mode = data.replay_mode or resolve_replay_mode(data, None)
+    state_data.replay_mode = replay_mode
+    initial_states = split_targets(state_data, source_kind="state")
     active_arms = list(data.trajectory_config["arms"])
-    left_target = None if "left" not in active_arms else np.asarray(initial_states["left_arm"][0], dtype=float)
-    right_target = None if "right" not in active_arms else np.asarray(initial_states["right_arm"][0], dtype=float)
+    def initial_joint_target(side: str) -> np.ndarray:
+        values = np.asarray(initial_states[f"{side}_arm"][0], dtype=float)
+        if replay_mode == "ee":
+            if data.joint_states is None:
+                raise RuntimeError("EE replay requires recorded observation.joint_state values.")
+            side_index = active_arms.index(side)
+            end_effector = str(data.trajectory_config["end_effector"])
+            stride = 7 + (1 if end_effector == "gripper" else 20 if end_effector == "hand" else 0)
+            offset = side_index * stride
+            values = np.asarray(data.joint_states[0, offset : offset + 7], dtype=float)
+        return values
+
+    left_target = None if "left" not in active_arms else initial_joint_target("left")
+    right_target = None if "right" not in active_arms else initial_joint_target("right")
     targets_to_check = [target for target in (left_target, right_target) if target is not None]
     if not all(np.all(np.isfinite(target)) for target in targets_to_check):
         raise ValueError("Episode initial arm state must contain only finite values.")
@@ -1017,13 +1366,110 @@ def move_arms_to_initial_state(
     return False
 
 
+def verify_ee_replay_targets(node: Any, data: EpisodeData) -> None:
+    """Reject EE replay unless recorded joint and Cartesian targets agree."""
+    from utils.fr3_kinematics import (
+        Fr3ForwardKinematics,
+        apply_ee_delta,
+        ee_state_to_matrix,
+        pose_error,
+    )
+
+    if data.target_ee_poses is None or data.target_joints is None:
+        raise RuntimeError("EE replay requires recorded target EE poses and joint targets.")
+    arms = list(data.trajectory_config["arms"])
+    end_effector = str(data.trajectory_config["end_effector"])
+    stride = 7 + (1 if end_effector == "gripper" else 20 if end_effector == "hand" else 0)
+    kinematics = Fr3ForwardKinematics()
+    for arm_index, side in enumerate(arms):
+        flange_to_ee = node.flange_to_ee.get(side)
+        if flange_to_ee is None:
+            raise RuntimeError(f"{side} F_T_EE is unavailable for EE replay validation.")
+        joint_offset = arm_index * stride
+        state_pose_offset = arm_index * EE_STATE_DIM
+        action_pose_offset = arm_index * EE_ACTION_DIM
+        max_position_error = 0.0
+        max_orientation_error = 0.0
+        worst_frame = int(data.frame_indices[0])
+        for local_index, frame_index in enumerate(data.frame_indices):
+            actual_target = kinematics.end_effector_pose(
+                data.target_joints[local_index, joint_offset : joint_offset + 7],
+                flange_to_ee,
+            )
+            recorded_target = ee_state_to_matrix(
+                data.target_ee_poses[
+                    local_index, state_pose_offset : state_pose_offset + EE_STATE_DIM
+                ]
+            )
+            reconstructed_target = apply_ee_delta(
+                ee_state_to_matrix(
+                    data.ee_poses[
+                        local_index,
+                        state_pose_offset : state_pose_offset + EE_STATE_DIM,
+                    ]
+                ),
+                data.delta_ee_poses[
+                    local_index,
+                    action_pose_offset : action_pose_offset + EE_ACTION_DIM,
+                ],
+            )
+            delta_position_error, delta_orientation_error = pose_error(
+                reconstructed_target, recorded_target
+            )
+            if delta_position_error > 1e-5 or delta_orientation_error > 1e-5:
+                raise ValueError(
+                    f"{side} EE delta does not reconstruct its stored target at "
+                    f"frame {int(frame_index)}: errors are {delta_position_error:.6g} m "
+                    f"and {delta_orientation_error:.6g} rad."
+                )
+            position_error, orientation_error = pose_error(actual_target, recorded_target)
+            if position_error + orientation_error > max_position_error + max_orientation_error:
+                worst_frame = int(frame_index)
+            max_position_error = max(max_position_error, position_error)
+            max_orientation_error = max(max_orientation_error, orientation_error)
+        print(
+            f"{side} EE/joint target consistency: max position error="
+            f"{max_position_error:.6f} m, max orientation error="
+            f"{max_orientation_error:.6f} rad"
+        )
+        if max_position_error > 0.01 or max_orientation_error > 0.03:
+            raise ValueError(
+                f"{side} recorded EE/joint targets are inconsistent near frame {worst_frame}: "
+                f"max errors are {max_position_error:.6f} m and "
+                f"{max_orientation_error:.6f} rad. No episode actions were published."
+            )
+
+
 def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
+    replay_mode = resolve_replay_mode(data, args.replay_mode)
+    data.replay_mode = replay_mode
+    args.state_action_mode = "end_effector" if replay_mode == "ee" else "joint"
     rclpy, ExternalShutdownException, Node, JointState, Float32 = import_ros_dependencies()
-    ReplayNode = build_replay_node_class(Node, JointState, Float32)
+    FrankaRobotState = (
+        import_franka_robot_state() if args.state_action_mode == "end_effector" else None
+    )
+    ReplayNode = build_replay_node_class(Node, JointState, Float32, FrankaRobotState)
 
     targets = split_targets(data)
     end_effector = str(data.trajectory_config["end_effector"])
     active_arms = list(data.trajectory_config["arms"])
+    recorded_state_q: dict[str, np.ndarray] = {}
+    recorded_target_q: dict[str, np.ndarray] = {}
+    joint_offset = 0
+    joint_stride = 7
+    if end_effector == "gripper":
+        joint_stride += 1
+    elif end_effector == "hand":
+        joint_stride += 20
+    if data.joint_states is not None and data.target_joints is not None:
+        for side in active_arms:
+            recorded_state_q[side] = np.asarray(
+                data.joint_states[:, joint_offset : joint_offset + 7], dtype=float
+            )
+            recorded_target_q[side] = np.asarray(
+                data.target_joints[:, joint_offset : joint_offset + 7], dtype=float
+            )
+            joint_offset += joint_stride
     left_gripper_targets = (
         None if end_effector != "gripper" or args.no_gripper or "left" not in active_arms
         else continuous_gripper_targets(targets["left_gripper_raw"])
@@ -1058,6 +1504,7 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
             "dataset_root": str(args.dataset_root),
             "episode": args.episode,
             "mode": "action",
+            "replay_mode": data.replay_mode,
             "fps": fps,
             "start_frame": args.start_frame,
             "end_frame": args.end_frame,
@@ -1083,6 +1530,7 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
     with trace_path.open("w", newline="") as f:
         csv.DictWriter(f, fieldnames=trace_fieldnames()).writeheader()
     aborted = False
+    failure: str | None = None
     published_frames = 0
     last_controller_ready = False
     initial_state_reached = False
@@ -1099,6 +1547,9 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
         ):
             aborted = True
             return
+
+        if args.state_action_mode == "end_effector":
+            verify_ee_replay_targets(node, data)
 
         initial_state_start_time = time.perf_counter()
         if not move_arms_to_initial_state(
@@ -1152,12 +1603,22 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
                     break
 
                 rclpy.spin_once(node, timeout_sec=0.0)
-                left_target = (
-                    None if "left" not in active_arms else np.asarray(targets["left_arm"][local_idx], dtype=float)
-                )
-                right_target = (
-                    None if "right" not in active_arms else np.asarray(targets["right_arm"][local_idx], dtype=float)
-                )
+                if args.state_action_mode == "end_effector":
+                    left_target = (
+                        None if "left" not in recorded_target_q
+                        else recorded_target_q["left"][local_idx]
+                    )
+                    right_target = (
+                        None if "right" not in recorded_target_q
+                        else recorded_target_q["right"][local_idx]
+                    )
+                else:
+                    left_target = (
+                        None if "left" not in active_arms else np.asarray(targets["left_arm"][local_idx], dtype=float)
+                    )
+                    right_target = (
+                        None if "right" not in active_arms else np.asarray(targets["right_arm"][local_idx], dtype=float)
+                    )
                 left_gripper = None if left_gripper_targets is None else float(left_gripper_targets[local_idx])
                 right_gripper = None if right_gripper_targets is None else float(right_gripper_targets[local_idx])
                 node.publish_targets(left_target, right_target, left_gripper, right_gripper)
@@ -1182,6 +1643,22 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
                         dataset_timestamp=float(data.timestamps[local_idx]),
                         mode="action",
                         target_source="action",
+                        left_recorded_state=(
+                            None if "left" not in recorded_state_q
+                            else recorded_state_q["left"][local_idx]
+                        ),
+                        right_recorded_state=(
+                            None if "right" not in recorded_state_q
+                            else recorded_state_q["right"][local_idx]
+                        ),
+                        left_recorded_target=(
+                            None if "left" not in recorded_target_q
+                            else recorded_target_q["left"][local_idx]
+                        ),
+                        right_recorded_target=(
+                            None if "right" not in recorded_target_q
+                            else recorded_target_q["right"][local_idx]
+                        ),
                         left_target=left_target,
                         right_target=right_target,
                         left_actual=node.left_actual_q,
@@ -1194,6 +1671,7 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
                         controller_ready=last_controller_ready,
                     )
                 )
+                f.flush()
                 published_frames += 1
                 next_publish_time += 1.0 / fps
     except KeyboardInterrupt:
@@ -1202,11 +1680,16 @@ def run_replay(args: argparse.Namespace, data: EpisodeData, fps: float) -> None:
     except ExternalShutdownException:
         aborted = True
         print("ROS shut down while replay was running; stopping replay.")
+    except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         write_json(
             args.output / SUMMARY_FILENAME,
             {
                 "aborted": aborted,
+                "failed": failure is not None,
+                "failure": failure,
                 "completed": bool((not aborted) and published_frames == len(data.frame_indices)),
                 "published_frames": published_frames,
                 "selected_frames": int(len(data.frame_indices)),
@@ -1241,6 +1724,7 @@ def main() -> None:
         run_wuji_hand_process(args.internal_wuji_hand, command_port, status_port, args.hand_ip)
         return
     data = load_episode_data(args.dataset_root, args.episode)
+    data.replay_mode = resolve_replay_mode(data, args.replay_mode)
     recorded_end_effector = str(data.trajectory_config["end_effector"])
     recorded_arm_mode = str(data.trajectory_config["arm_mode"])
     if args.robot_end_effector is None:

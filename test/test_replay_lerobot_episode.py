@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from queue import Queue
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -11,12 +12,110 @@ from data_collection.replay_lerobot_episode import (
     INITIAL_STATE_STABLE_SAMPLES,
     EpisodeData,
     arm_reached_initial_state,
+    build_replay_node_class,
+    build_trace_row,
     move_arms_to_initial_state,
     parse_args,
     request_hand_status,
     ramp_initial_state_command,
+    split_targets,
     wait_for_start,
+    trace_fieldnames,
 )
+
+
+class FakeRosNode:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def create_publisher(self, *args: Any) -> object:
+        del args
+        return SimpleNamespace(publish=lambda message: None)
+
+    def create_subscription(self, *args: Any) -> object:
+        del args
+        return object()
+
+
+def make_replay_node_args(state_action_mode: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        left_state_topic="/left/joint_states",
+        right_state_topic="/right/joint_states",
+        left_gripper_state_topic="/left/gripper/joint_states",
+        right_gripper_state_topic="/right/gripper/joint_states",
+        left_robot_state_topic="/left/robot_state",
+        right_robot_state_topic="/right/robot_state",
+        left_target_topic="/left/target_joint_states",
+        right_target_topic="/right/target_joint_states",
+        left_gripper_topic="/left/gripper/target",
+        right_gripper_topic="/right/gripper/target",
+        active_arms=["left", "right"],
+        robot_end_effector="gripper",
+        state_action_mode=state_action_mode,
+    )
+
+
+@pytest.mark.parametrize(
+    ("state_action_mode", "expected_missing"),
+    [
+        ("joint", []),
+        ("end_effector", ["/left/robot_state", "/right/robot_state"]),
+    ],
+)
+def test_missing_state_topics_uses_node_replay_mode_after_initialization(
+    state_action_mode: str,
+    expected_missing: list[str],
+) -> None:
+    fake_message_type = object()
+    ReplayNode = build_replay_node_class(
+        FakeRosNode,
+        fake_message_type,
+        fake_message_type,
+        fake_message_type,
+    )
+    node = ReplayNode(make_replay_node_args(state_action_mode))
+    node.left_actual_q = np.zeros(7)
+    node.right_actual_q = np.zeros(7)
+    node.left_gripper_actual = 0.08
+    node.right_gripper_actual = 0.08
+
+    assert node.missing_state_topics(no_gripper=False) == expected_missing
+
+    node.ee_pose_matrices = {"left": np.eye(4), "right": np.eye(4)}
+    node.flange_to_ee = {"left": np.eye(4), "right": np.eye(4)}
+    assert node.missing_state_topics(no_gripper=False) == []
+
+
+def test_trace_compares_ee_ik_commands_with_recorded_and_actual_joints() -> None:
+    recorded_state = np.arange(7, dtype=float)
+    recorded_target = recorded_state + 0.1
+    replay_target = recorded_target + 0.2
+    actual = recorded_state + 0.05
+    row = build_trace_row(
+        elapsed_s=1.0,
+        frame_index=3,
+        dataset_timestamp=0.2,
+        mode="action",
+        target_source="action",
+        left_recorded_state=recorded_state,
+        right_recorded_state=recorded_state,
+        left_recorded_target=recorded_target,
+        right_recorded_target=recorded_target,
+        left_target=replay_target,
+        right_target=replay_target,
+        left_actual=actual,
+        right_actual=actual,
+        left_gripper_target=None,
+        right_gripper_target=None,
+        left_gripper_actual=None,
+        right_gripper_actual=None,
+        abort_requested=False,
+        controller_ready=True,
+    )
+
+    assert set(row) == set(trace_fieldnames())
+    assert row["left_target_vs_recorded_target_max_abs_rad"] == pytest.approx(0.2)
+    assert row["right_actual_vs_recorded_state_max_abs_rad"] == pytest.approx(0.05)
 
 
 def test_request_hand_status_forwards_initial_target() -> None:
@@ -63,7 +162,43 @@ def make_episode_data() -> EpisodeData:
         timestamps=np.asarray([0.0], dtype=float),
         fps=15.0,
         action_config={},
+        joint_states=state.copy(),
+        target_joints=state.copy(),
     )
+
+
+def test_ee_replay_uses_joint_target_widths_from_a_joint_primary_dataset() -> None:
+    primary_actions = np.arange(16, dtype=float).reshape(1, 16)
+    target_joints = np.arange(100, 116, dtype=float).reshape(1, 16)
+    target_joints[0, 7] = 0.23
+    target_joints[0, 15] = 0.87
+    data = EpisodeData(
+        states=np.zeros((1, 16), dtype=float),
+        actions=primary_actions,
+        frame_indices=np.asarray([0]),
+        timestamps=np.asarray([0.0]),
+        fps=15.0,
+        action_config={},
+        ee_poses=np.zeros((1, 12), dtype=float),
+        delta_ee_poses=np.arange(12, dtype=float).reshape(1, 12),
+        target_ee_poses=np.zeros((1, 12), dtype=float),
+        joint_states=np.zeros((1, 16), dtype=float),
+        target_joints=target_joints,
+        trajectory_config={
+            "state_action_mode": "joint",
+            "end_effector": "gripper",
+            "arm_mode": "duo",
+            "arms": ["left", "right"],
+        },
+        replay_mode="ee",
+    )
+
+    targets = split_targets(data)
+
+    np.testing.assert_array_equal(targets["left_delta_ee_pose"], np.arange(6, dtype=float).reshape(1, 6))
+    np.testing.assert_array_equal(targets["right_delta_ee_pose"], np.arange(6, 12, dtype=float).reshape(1, 6))
+    assert targets["left_gripper_raw"] == pytest.approx([0.23])
+    assert targets["right_gripper_raw"] == pytest.approx([0.87])
 
 
 def test_internal_wuji_worker_does_not_require_dataset_root() -> None:

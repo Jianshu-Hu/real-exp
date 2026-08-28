@@ -51,6 +51,12 @@ from utils.trajectory_metadata import (
     validate_action_trajectory_contract,
 )
 from utils.deployment_metadata import write_checkpoint_deployment_metadata
+from utils.mode_aware_dataset import (
+    adapt_dataset_for_mode,
+    mode_action_config,
+    mode_trajectory_config,
+    normalize_training_mode,
+)
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
@@ -88,6 +94,15 @@ def parse_args() -> argparse.Namespace:
         help="Imitation-learning policy family to train.",
     )
     parser.add_argument(
+        "--state-action-mode",
+        choices=("joint", "end_effector"),
+        default=None,
+        help=(
+            "State/action representation to train. Defaults to the dataset contract: "
+            "joint state + target joint action or end-effector pose state + delta pose action."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -99,6 +114,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=50_000, help="Number of optimizer steps.")
     parser.add_argument("--batch-size", type=int, default=128, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader worker count.")
+    parser.add_argument(
+        "--video-backend",
+        choices=("torchcodec", "pyav"),
+        default=None,
+        help=(
+            "Video decoder backend. Defaults to LeRobot's automatic selection; use pyav "
+            "when TorchCodec cannot decode the dataset's videos reliably."
+        ),
+    )
     parser.add_argument(
         "--save-freq",
         type=int,
@@ -406,26 +430,52 @@ def make_local_dataset_cfg(
     repo_id: str,
     root: Path,
     episodes: list[int],
+    video_backend: str | None = None,
 ) -> DatasetConfig:
-    return DatasetConfig(repo_id=repo_id, root=str(root), episodes=episodes)
+    config = DatasetConfig(repo_id=repo_id, root=str(root), episodes=episodes)
+    if video_backend is not None:
+        config.video_backend = video_backend
+    return config
 
 
-def require_absolute_joint_action_dataset(dataset_root: Path) -> None:
+def require_state_action_mode_dataset(dataset_root: Path, requested_mode: str | None = None) -> dict[str, Any]:
     action_config_path = dataset_root / ACTION_CONFIG_REL_PATH
     if not action_config_path.exists():
         raise FileNotFoundError(
             f"Missing action metadata: {action_config_path}. "
-            "Record a new dataset with the current absolute_joint_position collector."
+            "Record a dataset with the current representation-aware collector."
         )
 
     action_config = json.loads(action_config_path.read_text())
-    arm_representation = str(action_config.get("arm_action_representation", "")).strip().lower()
-    if arm_representation != "absolute_joint_position":
-        raise ValueError(
-            f"Dataset arm_action_representation is '{arm_representation}'. "
-            "Training now expects absolute_joint_position actions. "
-            "Record a new dataset or convert the old delta-action dataset first."
-        )
+    trajectory_path = dataset_root / TRAJECTORY_CONFIG_PATH
+    if not trajectory_path.exists():
+        raise FileNotFoundError(f"Missing trajectory metadata: {trajectory_path}")
+    trajectory_config = json.loads(trajectory_path.read_text())
+    validate_action_trajectory_contract(action_config, trajectory_config)
+    info = json.loads((dataset_root / "meta" / "info.json").read_text())
+    source_mode = normalize_training_mode(
+        trajectory_config.get("state_action_mode", "joint"), "joint"
+    )
+    mode = normalize_training_mode(requested_mode, source_mode)
+    if mode == source_mode:
+        return trajectory_config
+    selected_key = "observation.ee_pose" if mode == "end_effector" else "observation.joint_state"
+    # Mode-aware views derive chunk deltas from the neutral absolute targets;
+    # do not window the persisted one-step delta fields.
+    selected_action_key = "action.target_ee_pose" if mode == "end_effector" else "action.target_joint"
+    selected_state_dim = int(info["features"][selected_key]["shape"][0])
+    selected_action_dim = int(info["features"][selected_action_key]["shape"][0])
+    return mode_trajectory_config(
+        trajectory_config,
+        mode,
+        state_dim=selected_state_dim,
+        action_dim=selected_action_dim,
+    )
+
+
+def require_absolute_joint_action_dataset(dataset_root: Path) -> None:
+    """Backward-compatible validator for callers that explicitly require joint mode."""
+    require_state_action_mode_dataset(dataset_root, "joint")
 
 
 def load_action_config(dataset_root: Path) -> dict[str, Any]:
@@ -567,17 +617,20 @@ def main() -> None:
     if not dataset_info_path.exists():
         raise FileNotFoundError(f"Missing dataset metadata: {dataset_info_path}")
 
-    require_absolute_joint_action_dataset(dataset_root)
-    action_config = load_action_config(dataset_root)
-    trajectory_config = require_dataset_trajectory_config(dataset_root)
-    validate_action_trajectory_contract(action_config, trajectory_config)
+    source_action_config = load_action_config(dataset_root)
+    source_trajectory_config = require_dataset_trajectory_config(dataset_root)
+    trajectory_config = require_state_action_mode_dataset(dataset_root, args.state_action_mode)
+    selected_mode = normalize_training_mode(
+        trajectory_config.get("state_action_mode"),
+        str(source_trajectory_config.get("state_action_mode", "joint")),
+    )
+    action_config = mode_action_config(source_action_config, selected_mode, trajectory_config)
     ensure_dataset_stats(args.dataset_repo_id, dataset_root)
 
-    dataset_info = json.loads(dataset_info_path.read_text())
-    total_episodes = int(dataset_info["total_episodes"])
+    source_dataset_info = json.loads(dataset_info_path.read_text())
+    total_episodes = int(source_dataset_info["total_episodes"])
     train_episodes, val_episodes = resolve_episode_split(args, total_episodes)
     resize_pad_config = resolve_resize_pad_config(args)
-    apply_resize_pad_to_feature_specs(dataset_info["features"], resize_pad_config)
 
     if not train_episodes:
         raise ValueError("Training split is empty.")
@@ -597,6 +650,7 @@ def main() -> None:
         args.dataset_repo_id,
         dataset_root,
         train_episodes,
+        video_backend=args.video_backend,
     )
 
     cfg = TrainPipelineConfig(
@@ -658,8 +712,9 @@ def main() -> None:
             f"{describe_trajectory_layout(trajectory_config)}"
         )
 
-    train_dataset = make_dataset(cfg)
+    train_dataset = adapt_dataset_for_mode(make_dataset(cfg), selected_mode)
     apply_dataset_image_transform(train_dataset, resize_pad_config)
+    dataset_info = json.loads(json.dumps(train_dataset.meta.info))
     val_dataset = None
     if val_episodes:
         val_cfg = TrainPipelineConfig(
@@ -667,6 +722,7 @@ def main() -> None:
                 args.dataset_repo_id,
                 dataset_root,
                 val_episodes,
+                video_backend=args.video_backend,
             ),
             policy=policy_cfg,
             output_dir=output_dir,
@@ -681,7 +737,7 @@ def main() -> None:
             save_freq=save_freq,
             wandb=wandb_cfg,
         )
-        val_dataset = make_dataset(val_cfg)
+        val_dataset = adapt_dataset_for_mode(make_dataset(val_cfg), selected_mode)
         apply_dataset_image_transform(val_dataset, resize_pad_config)
 
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta, rename_map=cfg.rename_map)

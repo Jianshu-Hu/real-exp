@@ -12,6 +12,7 @@ before modifying recorded data.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import shutil
@@ -25,6 +26,7 @@ INFO_PATH = Path("meta/info.json")
 ACTION_CONFIG_PATH = Path("meta/real_exp_action_config.json")
 TRAJECTORY_CONFIG_PATH = Path("meta/real_exp_trajectory_config.json")
 PROCESSED_FLAG = "processed"
+VIDEO_CODEC = "h264"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
 if str(REPO_ROOT) not in sys.path:
@@ -84,6 +86,16 @@ def parse_args() -> argparse.Namespace:
         help="Print the trim plan without modifying files.",
     )
     return parser.parse_args()
+
+
+def h264_video_features(features: dict[str, Any]) -> dict[str, Any]:
+    """Return feature metadata that matches videos rewritten by this utility."""
+    result = copy.deepcopy(features)
+    for feature in result.values():
+        if feature.get("dtype") == "video":
+            feature.setdefault("info", {})["video.codec"] = VIDEO_CODEC
+            feature["info"]["video.pix_fmt"] = "yuv420p"
+    return result
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -349,7 +361,7 @@ def trim_initial_static_segments(args: argparse.Namespace) -> int:
         new_meta = LeRobotDatasetMetadata.create(
             repo_id=f"local/{output_root.name}",
             fps=source_meta.fps,
-            features=source_meta.features,
+            features=h264_video_features(source_meta.features),
             robot_type=source_meta.robot_type,
             root=output_root,
             use_videos=bool(source_meta.video_keys),
@@ -382,6 +394,29 @@ def trim_initial_static_segments(args: argparse.Namespace) -> int:
                     file_index=file_index,
                 )
                 destination_video.parent.mkdir(parents=True, exist_ok=True)
+
+                # Preserve video files that do not contain an actual trim. Besides
+                # being substantially faster, this avoids generational quality loss
+                # and does not make unrelated source-video damage a prerequisite for
+                # trimming episodes stored in another file.
+                if not any(trim_plan[index].trim_frames for index in episode_ids):
+                    shutil.copy2(source_video, destination_video)
+                    for index in sorted(episode_ids):
+                        episode = source_meta.episodes[index]
+                        video_metadata[index].update(
+                            {
+                                f"videos/{video_key}/chunk_index": chunk,
+                                f"videos/{video_key}/file_index": file_index,
+                                f"videos/{video_key}/from_timestamp": episode[
+                                    f"videos/{video_key}/from_timestamp"
+                                ],
+                                f"videos/{video_key}/to_timestamp": episode[
+                                    f"videos/{video_key}/to_timestamp"
+                                ],
+                            }
+                        )
+                    continue
+
                 ranges: list[tuple[int, int]] = []
                 cumulative = 0.0
                 for index in sorted(episode_ids):
@@ -396,7 +431,12 @@ def trim_initial_static_segments(args: argparse.Namespace) -> int:
                     )
                     ranges.append((start + trim_plan[index].trim_frames, end))
                 _keep_episodes_from_video_with_av(
-                    source_video, destination_video, ranges, source_meta.fps
+                    source_video,
+                    destination_video,
+                    ranges,
+                    source_meta.fps,
+                    VIDEO_CODEC,
+                    "yuv420p",
                 )
                 for index in sorted(episode_ids):
                     trim = trim_plan[index]

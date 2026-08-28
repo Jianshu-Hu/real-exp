@@ -7,3 +7,6 @@
 [submodule "libs/wuji-retargeting"]
 	path = libs/wuji-retargeting
 	url = https://github.com/wuji-technology/wuji-retargeting.git
+[submodule "libs/hand-tracking-streamer"]
+	path = libs/hand-tracking-streamer
+	url = https://github.com/wengmister/hand-tracking-streamer.git

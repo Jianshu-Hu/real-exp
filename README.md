@@ -1,6 +1,6 @@
 # Real Experiments
 
-This repository groups the code and notes used for real-world Franka FR3 experiments with GELLO teleoperation, LeRobot dataset collection, and training workflows.
+This repository groups the code and notes used for real-world Franka FR3 experiments with GELLO and Meta Quest teleoperation, LeRobot dataset collection, and training workflows.
 
 ## Repository Layout
 
@@ -10,11 +10,15 @@ This repository groups the code and notes used for real-world Franka FR3 experim
 - `utils/`: shared dataset-statistics and image-preprocessing helpers.
 - `lerobot/`: vendored LeRobot codebase used by the local collection and training workflow.
 - `gello_software/`: GELLO and ROS 2 integration code, tracked as a git submodule.
+- `libs/hand-tracking-streamer/`: upstream Meta Quest tracking application, tracked as a git submodule.
+- `data_collection/meta_quest/`: standalone, robot-disconnected Quest pose transport and monitor.
 - `data/`: local datasets and experiment outputs.
 
 ## Submodules
 
-The repo expects `lerobot/` and `gello_software/` to be available locally. If either directory is empty after cloning, initialize the submodules:
+The repo expects its submodules, including `lerobot/`, `gello_software/`, and
+`libs/hand-tracking-streamer/`, to be available locally. If a submodule is
+empty after cloning, initialize all submodules:
 
 ```bash
 git submodule update --init --recursive
@@ -33,6 +37,7 @@ This repo uses two different Python environments:
 
 Data collection and replay instructions live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md).
 - [`scripts/start_teleoperation.sh`](scripts/start_teleoperation.sh): start left-, right-, or dual-arm GELLO/FR3 teleoperation with matching Franka grippers or Wuji hands.
+- [`scripts/start_meta_quest_pose_monitor.sh`](scripts/start_meta_quest_pose_monitor.sh): receive and display uncalibrated Quest wrist/controller poses without connecting to a robot. See [`data_collection/meta_quest/README.md`](data_collection/meta_quest/README.md).
 - `start_teleoperation.sh` accepts exactly one end-effector mode (`--arm`, `--gripper`, or `--hand`) and one arm selection (`--left`, `--right`, or `--duo`).
 
 All launchers can be invoked from a bare shell; manually activating Conda is

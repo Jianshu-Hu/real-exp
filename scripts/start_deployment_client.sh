@@ -70,12 +70,13 @@ source "${script_dir}/conda_env.sh"
 trajectory_output="$(PYTHONPATH="${repository_root}" python3 "${repository_root}/utils/deployment_metadata.py" --url "http://${metadata_address}/deployment-metadata" --deployment-lines 2>/dev/null)" \
   || die "could not resolve deployment metadata from ${metadata_address}"
 mapfile -t trajectory_lines <<<"${trajectory_output}"
-(( ${#trajectory_lines[@]} == 8 )) || die "deployment metadata resolver returned an unexpected number of fields"
+(( ${#trajectory_lines[@]} == 9 )) || die "deployment metadata resolver returned an unexpected number of fields"
 arm_mode="${trajectory_lines[0]}"; end_effector="${trajectory_lines[1]}"; fps="${trajectory_lines[2]}"
-state_dim="${trajectory_lines[3]}"; action_dim="${trajectory_lines[4]}"; camera_names="${trajectory_lines[5]}"
-policy_type="${trajectory_lines[6]}"; actions_per_chunk="${trajectory_lines[7]}"
+state_dim="${trajectory_lines[3]}"; action_dim="${trajectory_lines[4]}"; state_action_mode="${trajectory_lines[5]}"; camera_names="${trajectory_lines[6]}"
+policy_type="${trajectory_lines[7]}"; actions_per_chunk="${trajectory_lines[8]}"
 case "${arm_mode}" in left|right|duo) ;; *) die "unsupported metadata arm mode: ${arm_mode}" ;; esac
 case "${end_effector}" in arm|gripper|hand) ;; *) die "unsupported metadata end effector: ${end_effector}" ;; esac
+case "${state_action_mode}" in joint|end_effector) ;; *) die "unsupported metadata state/action mode: ${state_action_mode}" ;; esac
 if [[ -z "${robot_config}" ]]; then
   case "${arm_mode}:${end_effector}" in
     left:gripper) robot_config=example_fr3_config.yaml ;;
@@ -101,8 +102,8 @@ if [[ "${end_effector}" == "hand" ]]; then
   fi
 fi
 if [[ "${print_config}" -eq 1 ]]; then
-  printf 'arm_mode=%s\nend_effector=%s\nfps=%s\nstate_dim=%s\naction_dim=%s\ncameras=%s\npolicy_type=%s\nactions_per_chunk=%s\nrobot_config=%s\ngripper_config=%s\nserver_ip=%s\nserver_address=%s\nmetadata_address=%s\n' \
-    "${arm_mode}" "${end_effector}" "${fps}" "${state_dim}" "${action_dim}" \
+  printf 'arm_mode=%s\nend_effector=%s\nfps=%s\nstate_dim=%s\naction_dim=%s\nstate_action_mode=%s\ncameras=%s\npolicy_type=%s\nactions_per_chunk=%s\nrobot_config=%s\ngripper_config=%s\nserver_ip=%s\nserver_address=%s\nmetadata_address=%s\n' \
+    "${arm_mode}" "${end_effector}" "${fps}" "${state_dim}" "${action_dim}" "${state_action_mode}" \
     "${camera_names}" "${policy_type}" "${actions_per_chunk}" "${robot_config}" "${gripper_config}" "${server_ip}" "${server_address}" "${metadata_address}"
   exit 0
 fi
@@ -159,7 +160,7 @@ if [[ "${end_effector}" == "hand" ]]; then
       --telemetry-address "tcp://${server_ip}:${hand_telemetry_port}" --telemetry-rate "${fps}"
   fi
 fi
-echo "Deployment contract: ${end_effector}/${arm_mode}, state/action=${state_dim}/${action_dim}, cameras=${camera_names}, fps=${fps}"
+echo "Deployment contract: ${end_effector}/${arm_mode}, mode=${state_action_mode}, state/action=${state_dim}/${action_dim}, cameras=${camera_names}, fps=${fps}"
 echo "Deployment client is running. Start the policy executor here; press Ctrl-C to stop controllers."
 set +e; completed_pid=""; wait -n -p completed_pid "${child_pids[@]}"; status=$?; set -e
 echo "${child_names[${completed_pid}]} exited with status ${status}." >&2; exit "${status}"

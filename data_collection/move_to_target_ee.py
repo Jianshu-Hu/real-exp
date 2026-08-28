@@ -365,6 +365,10 @@ def solve_fr3_ik(
     flange_to_ee: np.ndarray,
     model: Any | None = None,
     frame_id: int | None = None,
+    *,
+    kinematics: Any | None = None,
+    try_alternative_seeds: bool = True,
+    max_function_evaluations: int = IK_MAX_FUNCTION_EVALUATIONS,
 ) -> IkResult:
     """Solve bounded final-pose IK and independently verify its FK residual."""
     from scipy.optimize import least_squares
@@ -377,18 +381,29 @@ def solve_fr3_ik(
         raise ValueError("IK seed must be a finite seven-joint FR3 configuration")
     if target.shape != (4, 4) or flange_to_ee.shape != (4, 4):
         raise ValueError("IK target and F_T_EE must be 4x4 transforms")
-    if model is None or frame_id is None:
+    if max_function_evaluations <= 0:
+        raise ValueError("IK maximum function evaluations must be positive")
+    if kinematics is not None and (model is not None or frame_id is not None):
+        raise ValueError("Pass either an FK kinematics backend or a Pinocchio model/frame pair")
+    if kinematics is None and (model is None or frame_id is None):
         model, frame_id = build_fr3_model()
 
     target_flange = target @ np.linalg.inv(flange_to_ee)
-    data = model.createData()
+    data = model.createData() if kinematics is None else None
 
     def flange_pose(q: np.ndarray) -> np.ndarray:
+        if kinematics is not None:
+            return np.asarray(kinematics.flange_pose(q), dtype=float)
         import pinocchio as pin
 
         pin.forwardKinematics(model, data, q)
         pin.updateFramePlacements(model, data)
         return np.asarray(data.oMf[frame_id].homogeneous, dtype=float)
+
+    def end_effector_pose(q: np.ndarray) -> np.ndarray:
+        if kinematics is not None:
+            return np.asarray(kinematics.end_effector_pose(q, flange_to_ee), dtype=float)
+        return forward_end_effector_pose(model, frame_id, q, flange_to_ee)
 
     def residual(q: np.ndarray) -> np.ndarray:
         current = flange_pose(q)
@@ -401,14 +416,15 @@ def solve_fr3_ik(
         return np.concatenate((translation, orientation, 1e-5 * (q - seed)))
 
     candidate_seeds = [seed]
-    for joint, delta in ((6, 0.45), (6, -0.45), (2, 0.30), (2, -0.30)):
-        candidate = seed.copy()
-        candidate[joint] = np.clip(
-            candidate[joint] + delta,
-            ARM_POSITION_LOWER_RAD[joint] + 1e-6,
-            ARM_POSITION_UPPER_RAD[joint] - 1e-6,
-        )
-        candidate_seeds.append(candidate)
+    if try_alternative_seeds:
+        for joint, delta in ((6, 0.45), (6, -0.45), (2, 0.30), (2, -0.30)):
+            candidate = seed.copy()
+            candidate[joint] = np.clip(
+                candidate[joint] + delta,
+                ARM_POSITION_LOWER_RAD[joint] + 1e-6,
+                ARM_POSITION_UPPER_RAD[joint] - 1e-6,
+            )
+            candidate_seeds.append(candidate)
 
     results: list[IkResult] = []
     total_evaluations = 0
@@ -417,13 +433,13 @@ def solve_fr3_ik(
             residual,
             np.clip(candidate_seed, ARM_POSITION_LOWER_RAD, ARM_POSITION_UPPER_RAD),
             bounds=(ARM_POSITION_LOWER_RAD, ARM_POSITION_UPPER_RAD),
-            max_nfev=IK_MAX_FUNCTION_EVALUATIONS,
+            max_nfev=max_function_evaluations,
             ftol=1e-12,
             xtol=1e-12,
             gtol=1e-12,
         )
         total_evaluations += int(solution.nfev)
-        achieved = forward_end_effector_pose(model, frame_id, solution.x, flange_to_ee)
+        achieved = end_effector_pose(solution.x)
         position_error, orientation_error = pose_error(achieved, target)
         results.append(
             IkResult(

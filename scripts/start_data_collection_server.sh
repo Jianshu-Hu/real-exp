@@ -102,6 +102,7 @@ done
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
+export PYTHONPATH="${repository_root}${PYTHONPATH:+:${PYTHONPATH}}"
 # shellcheck source=scripts/conda_env.sh
 source "${script_dir}/conda_env.sh"
 
@@ -147,18 +148,33 @@ command -v timeout >/dev/null 2>&1 || die "required command not found: timeout"
 command -v pkill >/dev/null 2>&1 || die "required command not found: pkill"
 command -v ps >/dev/null 2>&1 || die "required command not found: ps"
 command -v ros2 >/dev/null 2>&1 || die "ros2 is unavailable after sourcing ROS ${ros_distro}"
+ros2 pkg prefix franka_msgs >/dev/null 2>&1 || die \
+  "required ROS package is unavailable after sourcing overlays: franka_msgs (source/build the Franka ROS 2 workspace)"
 
 ros_python="/usr/bin/python3"
 [[ -x "${ros_python}" ]] || die "ROS Python interpreter is missing: ${ros_python}"
 missing_ros_modules="$(${ros_python} - <<'PY'
 import importlib.util
 
-modules = ("controller_manager_msgs", "pyrealsense2", "rclpy", "zmq")
+modules = ("controller_manager_msgs", "numpy", "pyrealsense2", "rclpy", "zmq")
 print(" ".join(module for module in modules if importlib.util.find_spec(module) is None))
 PY
 )"
 [[ -z "${missing_ros_modules}" ]] || die \
   "missing ROS Python modules for ${ros_python}: ${missing_ros_modules}"
+
+if ! "${ros_python}" - "${repository_root}" <<'PY'
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from utils.fr3_kinematics import Fr3ForwardKinematics
+
+kinematics = Fr3ForwardKinematics()
+print(f"Ready: FR3 target-pose FK backend is {kinematics.backend}")
+PY
+then
+  die "FR3 target-pose FK preflight failed in ${ros_python}; update the repository and restart"
+fi
 
 # The bridge package calls the left-arm configuration "example_single.yaml"
 # for historical compatibility; keep the command-line mode names independent

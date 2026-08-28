@@ -146,6 +146,32 @@ bash scripts/replay.sh \
   --episode 0
 ```
 
+Select the stored arm representation with `--replay-mode joint` or
+`--replay-mode ee`. The replay supervisor passes this option to
+`replay_lerobot_episode.py`:
+
+```bash
+# Replay the stored joint targets directly.
+bash scripts/replay.sh \
+  --dataset-root data/test-pick-and-place-new \
+  --episode 0 \
+  --replay-mode joint
+
+# Apply the stored delta EE poses to the live EE poses, solve IK for the
+# resulting targets, and send the solved target joint angles to the robots.
+bash scripts/replay.sh \
+  --dataset-root data/test-pick-and-place-new \
+  --episode 0 \
+  --replay-mode ee
+```
+
+Joint replay reads `observation.joint_state` and `action.target_joint`. EE
+replay reads `observation.ee_pose` and `action.delta_ee_pose`. When
+`--replay-mode` is omitted, replay defaults to the dataset's compatibility
+`state_action_mode`. A requested mode fails validation if its required fields
+are absent, while a dataset containing both representations can be replayed in
+either mode.
+
 Explicit settings are useful as a hardware safety check:
 
 ```bash
@@ -331,10 +357,15 @@ control host; it has no camera USB devices in this layout. The server bridge
 still subscribes to `/left/...` and `/right/...` robot/action topics over ROS 2
 and to `/cameras/...` image topics locally.
 
-The dataset currently records:
+The dataset records all representation-neutral robot fields on every frame:
 
-- `observation.state`: actual robot joint positions, plus gripper width if enabled
-- `action`: absolute arm joint targets for the next sample, plus gripper command if enabled
+- `observation.joint_state`: measured robot joints, plus gripper/hand state when enabled
+- `action.target_joint`: accepted/commanded joint targets, plus gripper/hand targets when enabled
+- `observation.ee_pose`: measured end-effector pose as position plus continuous 6D rotation (9 values per arm)
+- `action.target_ee_pose`: absolute target EE pose in the same 9D representation
+- `action.delta_ee_pose`: base-frame translation plus spatial rotation-vector delta (6 values per arm)
+- `action.delta_joint`: target joint minus measured joint (7 values per arm)
+- `observation.state` and `action`: the bridge's selected compatibility/training view
 - `observation.images.<camera_name>`: enabled RGB video streams (`cam_left`, `cam_front`, and `cam_right` for duo; `cam_left` and `cam_front` for single-arm collection)
 
 The bridge expects:
@@ -346,13 +377,25 @@ The bridge expects:
 - Gripper commands on a topic like `/left/gripper/gripper_client/target_gripper_width_percent`
 - RGB image topics for each camera enabled by the selected bridge configuration
 
-By default the bridge publishes current measured robot joint states as `observation.state` and uses the robot-accepted target topic (`/left|right/gello/accepted_joint_states`) as the arm action source. The recorder labels each frame with the next packet's absolute arm joint target, so new datasets use `arm_action_representation=absolute_joint_position`.
+By default the bridge publishes current measured robot joint states as `observation.state` and records both neutral absolute targets and schema-v2 deltas. Joint-mode policy actions are chunk-anchored joint deltas; EE-mode policy actions are chunk-anchored position plus spatial rotation-vector deltas. The neutral absolute fields remain the replay, validation, and training source of truth.
+
+The bridge also subscribes to each arm's `franka_robot_state_broadcaster/robot_state`
+topic. Every recorded frame contains all neutral fields regardless of the
+selected training view. Set `state_action_mode: end_effector` to expose 9D EE
+state and 6D spatial-rotation-vector action; `joint` exposes measured joints
+and joint deltas. Grippers remain current normalized width in state and target
+width in action, while hands remain current/target joint angles.
 
 New datasets use continuous normalized gripper commands with
 `gripper_action_representation=absolute_width`. The recorder preserves values
 between `0` and `1` and clamps only out-of-range gripper values at serialization.
 This normalized command is distinct from the physical gripper widths used by
 `reset_pylibfranka.py`.
+
+The recorder writes H.264/yuv420p video by default (`--video-codec h264`). This
+is deliberate: the training pipeline uses TorchCodec's random frame access, and
+H.264 is the project-supported codec for reliable random seeking. Dataset
+trimming and episode deletion also re-encode edited video as H.264.
 
 The control-host supervisor supports the same four arm/gripper combinations as
 the teleoperation script:
@@ -430,7 +473,8 @@ The validator checks:
 - approximate measured-state motion from 15 Hz position finite differences
 - accepted-waypoint slew as a command-distribution diagnostic
 - video timestamp ranges against episode lengths
-- physical MP4 frame counts when OpenCV is available
+- strict MP4 decode, frame counts, resolution, and FPS
+- TorchCodec random seeking at the first, middle, and final frame of every MP4
 
 For `absolute_joint_position` datasets, consecutive actions are accepted 15 Hz
 waypoints, not samples of the constrained controller reference. Their finite
@@ -452,6 +496,28 @@ python3 data_collection/validate_dataset.py \
   --dataset-root data/pick_and_place_test \
   --skip-video-frames
 ```
+
+Run validation from the `lerobot` Conda environment. The standard video checks
+require TorchCodec; do not use `--skip-video-frames` as a pre-training check.
+
+## Repairing Older AV1 Data
+
+Some older AV1 recordings can pass a full sequential FFmpeg decode but fail
+when TorchCodec seeks to a later frame during training. Re-encode such a dataset
+to H.264 with a retained original backup:
+
+```bash
+conda activate lerobot
+python data_collection/reencode_dataset_videos.py \
+  --dataset-root data/pick_and_place_test
+python data_collection/validate_dataset.py \
+  --dataset-root data/pick_and_place_test
+```
+
+The command moves the original dataset to
+`data/pick_and_place_test_av1_backup`, writes the H.264 replacement at the
+original path, and restores the original automatically if conversion or the
+TorchCodec preflight fails.
 
 ## Episode Deletion
 

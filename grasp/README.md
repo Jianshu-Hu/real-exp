@@ -16,9 +16,17 @@ control-host operator for `y/yes` before motion.
 
 ## Inference dependencies
 
-Inference host dependencies: `numpy`, `scipy`, `torch`, and `pyzmq`. The
-camera-only script keeps `pyrealsense2` in the system Python helper environment;
-the conda `lerobot` environment therefore only needs the model dependencies.
+Inference host dependencies: `numpy`, `scipy`, `torch`, `pyzmq`, `smplx`, and
+`chumpy`. Install the MANO runtime dependencies in the Conda environment used
+by the launcher (the default is `wjh_grasp`):
+
+```bash
+conda run -n wjh_grasp python -m pip install chumpy smplx
+```
+
+The camera-only script keeps `pyrealsense2` in the system Python helper
+environment; the Conda `wjh_grasp` environment therefore only needs the model
+dependencies.
 Nonzero camera distortion coefficients require `opencv-python` or
 `opencv-contrib-python`. The required deployment runtime is implemented in
 `grasp/runtime`; checkpoints, MANO models, and RoboDex Wuji URDF/mesh assets are
@@ -117,9 +125,9 @@ control-host IK output.
 ## Camera-only inference
 
 When the inference machine has the D435 camera but no connection to the control
-host, run `camera_inference.py` from the conda `lerobot` environment. The script
+host, run `camera_inference.py` from the Conda `wjh_grasp` environment. The script
 starts `realsense_capture.py` with system `/usr/bin/python3` for camera capture,
-then continues in `lerobot` for Torch/model inference. This avoids requiring
+then continues in `wjh_grasp` for Torch/model inference. This avoids requiring
 `pyrealsense2` inside the conda environment:
 
 ```bash
@@ -201,7 +209,7 @@ directory contains the same inference artifacts as a one-shot
 `result.json`, and the point clouds/hand meshes under `world/`. Override the
 network and output locations with `GRASP_SERVER_IP`, `GRASP_INFERENCE_PORT`,
 and `GRASP_RUNS_DIR`. Use `GRASP_CONDA_ENV` when the inference environment is
-not named `lerobot`.
+not named `wjh_grasp`.
 
 On the robot-control computer, select exactly one control mode. When the Wuji
 hand is installed, first run in dry-run arm-with-hand mode:
@@ -209,6 +217,15 @@ hand is installed, first run in dry-run arm-with-hand mode:
 ```bash
 ./grasp/start_grasp_execution_client.sh --arm-with-hand
 ```
+
+Before the client enters its existing request loop, the launcher moves the
+right-arm EE to the initial `xyzrpy` recorded in `note.txt` (`0.682977,
+0.154027, 0.452649, -2.134387, 0.498717, -2.334388`) by invoking
+`scripts/move_to_target_ee.sh --right --arm`. The move utility plans and
+previews the initial motion, then asks the local operator for `y/yes`. Declining
+the move or any planning/execution failure stops startup instead of continuing
+with the grasp workflow. Running the launcher with `-h` or `--help` never starts
+this initial motion.
 
 Press Enter or type `g` to request one observation and inference. After the
 response is validated, the client invokes `scripts/move_to_target_ee.sh` with

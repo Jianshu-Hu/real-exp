@@ -15,6 +15,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
+import traceback
 from typing import Any
 
 import numpy as np
@@ -61,8 +63,8 @@ def add_camera_inference_arguments(
         default=Path(__file__).resolve().parent / "realsense_capture.py",
         help="System-Python RGB-D capture helper.",
     )
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--warmup-frames", type=int, default=30)
     parser.add_argument(
@@ -100,7 +102,7 @@ def add_camera_inference_arguments(
     parser.add_argument("--retarget-landmark-fit-steps", type=int, default=75)
     parser.add_argument("--semantic-refine-steps", type=int, default=40)
     parser.add_argument("--semantic-learning-rate", type=float, default=1e-2)
-    parser.add_argument("--max-penetration-m", type=float, default=0.02)
+    parser.add_argument("--max-penetration-m", type=float, default=0.05)
     parser.add_argument("--contact-sigma-m", type=float, default=0.01)
     parser.add_argument("--contact-d-max-m", type=float, default=0.03)
     parser.add_argument("--contact-binary-threshold-m", type=float, default=0.010)
@@ -217,65 +219,93 @@ def _write_coordinate_outputs(
     _write_ply_mesh(directory / "wuji_refined.ply", *wuji_refined)
 
 
+def _write_json(path: Path, value: Any) -> None:
+    """Atomically write JSON so an interrupted run does not leave truncated metadata."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, default=_json_default) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _write_run_status(
+    output_dir: Path,
+    *,
+    status: str,
+    stage: str,
+    error: BaseException | None = None,
+) -> None:
+    value: dict[str, Any] = {
+        "status": status,
+        "stage": stage,
+        "updated_unix_s": time.time(),
+    }
+    if error is not None:
+        value["error"] = {
+            "type": type(error).__name__,
+            "message": str(error),
+        }
+    _write_json(output_dir / "run_status.json", value)
+
+
+def _write_failure(
+    output_dir: Path,
+    *,
+    status: str,
+    stage: str,
+    error: BaseException,
+) -> None:
+    available_outputs = sorted(
+        str(path.relative_to(output_dir))
+        for path in output_dir.rglob("*")
+        if path.is_file() and path.name != "failure.json"
+    )
+    _write_json(
+        output_dir / "failure.json",
+        {
+            "status": status,
+            "stage": stage,
+            "failed_unix_s": time.time(),
+            "error": {
+                "type": type(error).__name__,
+                "message": str(error),
+                "traceback": traceback.format_exc(),
+            },
+            "available_outputs": available_outputs,
+        },
+    )
+
+
 def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
     """Capture, infer, persist one trial, and return its JSON-compatible record."""
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    transforms = load_calibration_transforms(args.mount_calibration)
+    stage = "initialization"
+    _write_run_status(args.output_dir, status="running", stage=stage)
+    try:
+        stage = "calibration"
+        _write_run_status(args.output_dir, status="running", stage=stage)
+        transforms = load_calibration_transforms(args.mount_calibration)
 
-    rgb, depth, camera = _capture_with_system_python(args)
-    if rgb.shape[:2] != depth.shape:
-        raise ValueError("RGB and aligned depth image dimensions differ")
-    camera_points, depth_m = backproject_depth(depth, camera["intrinsics"], camera["depth_scale_m"])
-    valid_camera, filtered_world, sampled_world = filter_and_sample_points(
-        camera_points, depth_m, transforms["world_T_camera"], args
-    )
-    unfiltered_world = transform_points(transforms["world_T_camera"], valid_camera)
+        stage = "camera_capture"
+        _write_run_status(args.output_dir, status="running", stage=stage)
+        rgb, depth, camera = _capture_with_system_python(args)
+        if rgb.shape[:2] != depth.shape:
+            raise ValueError("RGB and aligned depth image dimensions differ")
+        np.save(args.output_dir / "rgb_bgr.npy", rgb)
+        np.save(args.output_dir / "depth_raw.npy", depth)
+        _write_json(args.output_dir / "camera.json", camera)
 
-    # run_model expects the complete set of refinement/contact parameters; the
-    # parser above deliberately keeps these local to this camera-only tool.
-    generated, refined = run_model(sampled_world, args)
-    final_penetration = float(
-        refined.metadata["final_penetration"]["max_penetration_depth_m"]
-    )
-    if not np.isfinite(final_penetration) or final_penetration > args.max_penetration_m:
-        raise ValueError(
-            f"refined grasp penetration {final_penetration:.6f} m exceeds "
-            f"limit {args.max_penetration_m:.6f} m"
+        stage = "point_cloud_filtering"
+        _write_run_status(args.output_dir, status="running", stage=stage)
+        camera_points, depth_m = backproject_depth(
+            depth, camera["intrinsics"], camera["depth_scale_m"]
         )
-    mano_faces = np.asarray(generated.mano_faces, dtype=np.int64)
-    wuji_retargeted_world = _posed_wuji_mesh(
-        generated.robot_trans, generated.robot_global_orient, generated.robot_joints
-    )
-    wuji_refined_world = _posed_wuji_mesh(
-        refined.robot_trans, refined.robot_global_orient, refined.robot_joints
-    )
-    world_outputs = {
-        "unfiltered_points": unfiltered_world,
-        "filtered_points": filtered_world,
-        "sampled_points": sampled_world,
-        "grasp_points": np.asarray(generated.object_points, dtype=np.float32),
-        "mano_vertices": np.asarray(generated.mano_vertices, dtype=np.float32),
-        "mano_faces": mano_faces,
-        "wuji_retargeted": wuji_retargeted_world,
-        "wuji_refined": wuji_refined_world,
-    }
-    _write_coordinate_outputs(args.output_dir / "world", **world_outputs)
-
-    world_t_hand = _world_hand_pose(refined)
-    base_t_world = transforms["base_T_world"]
-    base_t_hand = base_t_world @ world_t_hand
-    final_hand_joints = reorder_wuji_joints(
-        refined.robot_joints, generated.robot_joint_names
-    )
-    record = {
-        "camera": camera,
-        "calibration": {
-            "world_T_camera": transforms["world_T_camera"].tolist(),
-            "base_T_camera": transforms["base_T_camera"].tolist(),
-            "base_T_world": base_t_world.tolist(),
-            "ee_T_hand": transforms["ee_T_hand"].tolist(),
-        },
-        "filter": {
+        valid_camera, filtered_world, sampled_world = filter_and_sample_points(
+            camera_points, depth_m, transforms["world_T_camera"], args
+        )
+        unfiltered_world = transform_points(transforms["world_T_camera"], valid_camera)
+        filter_record = {
             "min_depth_m": args.min_depth_m,
             "max_depth_m": args.max_depth_m,
             "world_min": args.world_min,
@@ -283,42 +313,138 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
             "valid_depth_points": int(valid_camera.shape[0]),
             "filtered_world_points": int(filtered_world.shape[0]),
             "generator_input_points": int(sampled_world.shape[0]),
-        },
-        "poses": {
-            "world_T_hand": world_t_hand.tolist(),
-            "base_T_hand": base_t_hand.tolist(),
-            "base_T_ee": hand_pose_to_ee_pose(
-                world_t_hand, base_t_world, transforms["ee_T_hand"]
-            ).tolist(),
-            "base_T_ee_xyz_rpy": matrix_to_xyz_rpy(
-                hand_pose_to_ee_pose(world_t_hand, base_t_world, transforms["ee_T_hand"])
-            ).tolist(),
-            "hand_joint_names": list(WUJI_RIGHT_JOINT_NAMES),
-            "hand_joints_rad": final_hand_joints.tolist(),
-        },
-        "inference": {
-            "generator_checkpoint": str(args.generator_checkpoint.resolve()),
-            "seed": args.seed,
-            "retarget_fit_error": generated.retarget_fit_error,
-            "refinement": refined.metadata,
-        },
-    }
-    record_json = json.dumps(record, indent=2, default=_json_default)
-    (args.output_dir / "result.json").write_text(
-        record_json + "\n", encoding="utf-8"
-    )
-    (args.output_dir / "poses.json").write_text(
-        json.dumps(record["poses"], indent=2, default=_json_default) + "\n",
-        encoding="utf-8",
-    )
-    np.save(args.output_dir / "rgb_bgr.npy", rgb)
-    np.save(args.output_dir / "depth_raw.npy", depth)
-    print(f"Inference complete; outputs saved to {args.output_dir}")
-    print(f"World points: {filtered_world.shape[0]} filtered / {unfiltered_world.shape[0]} valid")
-    print(f"World-frame outputs: {args.output_dir / 'world'}")
-    # The daemon sends this value with standard JSON, so normalize any NumPy
-    # scalar nested in model metadata before returning it to callers.
-    return json.loads(record_json)
+        }
+        _write_json(args.output_dir / "filter.json", filter_record)
+        world_dir = args.output_dir / "world"
+        world_dir.mkdir(parents=True, exist_ok=True)
+        _write_ply_points(world_dir / "scene_points_unfiltered.ply", unfiltered_world)
+        _write_ply_points(world_dir / "scene_points_filtered.ply", filtered_world)
+        _write_ply_points(world_dir / "generator_input.ply", sampled_world)
+
+        stage = "model_inference"
+        _write_run_status(args.output_dir, status="running", stage=stage)
+        # run_model expects the complete set of refinement/contact parameters;
+        # the parser deliberately keeps these local to this camera-only tool.
+        generated, refined = run_model(sampled_world, args)
+        mano_faces = np.asarray(generated.mano_faces, dtype=np.int64)
+        wuji_retargeted_world = _posed_wuji_mesh(
+            generated.robot_trans,
+            generated.robot_global_orient,
+            generated.robot_joints,
+        )
+        wuji_refined_world = _posed_wuji_mesh(
+            refined.robot_trans, refined.robot_global_orient, refined.robot_joints
+        )
+        _write_coordinate_outputs(
+            world_dir,
+            unfiltered_points=unfiltered_world,
+            filtered_points=filtered_world,
+            sampled_points=sampled_world,
+            grasp_points=np.asarray(generated.object_points, dtype=np.float32),
+            mano_vertices=np.asarray(generated.mano_vertices, dtype=np.float32),
+            mano_faces=mano_faces,
+            wuji_retargeted=wuji_retargeted_world,
+            wuji_refined=wuji_refined_world,
+        )
+
+        stage = "result_serialization"
+        _write_run_status(args.output_dir, status="running", stage=stage)
+        world_t_hand = _world_hand_pose(refined)
+        base_t_world = transforms["base_T_world"]
+        base_t_hand = base_t_world @ world_t_hand
+        base_t_ee = hand_pose_to_ee_pose(
+            world_t_hand, base_t_world, transforms["ee_T_hand"]
+        )
+        final_hand_joints = reorder_wuji_joints(
+            refined.robot_joints, generated.robot_joint_names
+        )
+        final_penetration = float(
+            refined.metadata["final_penetration"]["max_penetration_depth_m"]
+        )
+        penetration_accepted = bool(
+            np.isfinite(final_penetration)
+            and final_penetration <= args.max_penetration_m
+        )
+        rejection_reason = None
+        if not penetration_accepted:
+            rejection_reason = (
+                f"refined grasp penetration {final_penetration:.6f} m exceeds "
+                f"limit {args.max_penetration_m:.6f} m"
+            )
+        record = {
+            "status": "completed" if penetration_accepted else "rejected",
+            "rejection_reason": rejection_reason,
+            "camera": camera,
+            "calibration": {
+                "world_T_camera": transforms["world_T_camera"].tolist(),
+                "base_T_camera": transforms["base_T_camera"].tolist(),
+                "base_T_world": base_t_world.tolist(),
+                "ee_T_hand": transforms["ee_T_hand"].tolist(),
+            },
+            "filter": filter_record,
+            "poses": {
+                "world_T_hand": world_t_hand.tolist(),
+                "base_T_hand": base_t_hand.tolist(),
+                "base_T_ee": base_t_ee.tolist(),
+                "base_T_ee_xyz_rpy": matrix_to_xyz_rpy(base_t_ee).tolist(),
+                "hand_joint_names": list(WUJI_RIGHT_JOINT_NAMES),
+                "hand_joints_rad": final_hand_joints.tolist(),
+            },
+            "safety": {
+                "penetration_accepted": penetration_accepted,
+                "final_penetration_m": final_penetration,
+                "max_penetration_m": args.max_penetration_m,
+            },
+            "inference": {
+                "generator_checkpoint": str(args.generator_checkpoint.resolve()),
+                "seed": args.seed,
+                "retarget_fit_error": generated.retarget_fit_error,
+                "refinement": refined.metadata,
+            },
+        }
+        record_json = json.dumps(record, indent=2, default=_json_default)
+        _write_json(args.output_dir / "result.json", record)
+        _write_json(args.output_dir / "poses.json", record["poses"])
+
+        if not penetration_accepted:
+            stage = "safety_validation"
+            raise ValueError(rejection_reason)
+
+        _write_run_status(args.output_dir, status="completed", stage="completed")
+        print(f"Inference complete; outputs saved to {args.output_dir}")
+        print(
+            f"World points: {filtered_world.shape[0]} filtered / "
+            f"{unfiltered_world.shape[0]} valid"
+        )
+        print(f"World-frame outputs: {world_dir}")
+        # Normalize any NumPy scalar nested in model metadata before returning
+        # this record to the JSON-based daemon.
+        return json.loads(record_json)
+    except Exception as exc:
+        failure_status = "rejected" if stage == "safety_validation" else "failed"
+        try:
+            _write_failure(
+                args.output_dir,
+                status=failure_status,
+                stage=stage,
+                error=exc,
+            )
+            _write_run_status(
+                args.output_dir,
+                status=failure_status,
+                stage=stage,
+                error=exc,
+            )
+        except Exception as persistence_error:
+            print(
+                f"Warning: could not persist failure metadata: {persistence_error}",
+                flush=True,
+            )
+        print(
+            f"Inference {failure_status}; available outputs saved to {args.output_dir}",
+            flush=True,
+        )
+        raise
 
 
 def main() -> int:
@@ -334,6 +460,8 @@ def _json_default(value: Any) -> Any:
         return value.tolist()
     if isinstance(value, (np.floating, np.integer)):
         return value.item()
+    if isinstance(value, Path):
+        return str(value)
     raise TypeError(f"not JSON serializable: {type(value).__name__}")
 
 

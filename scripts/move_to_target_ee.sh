@@ -3,27 +3,25 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/move_to_target_ee.sh --duo|--left|--right --arm|--gripper|--hand \
+Usage: ./scripts/move_to_target_ee.sh --left|--right --arm|--gripper|--hand \
   --target-ee-pose VALUES [--target-ee-joint VALUES] [options]
 
 Pose format:
   Each pose is x,y,z,roll,pitch,yaw in the FR3 base frame (meters/radians).
-  Always pass 6 comma- or space-separated values. --duo sends the same pose
-  to both sides. Brackets and mixed comma/space NumPy output are accepted.
+  Always pass 6 comma- or space-separated values. Brackets and mixed
+  comma/space NumPy output are accepted.
   Keep a vector on one shell line, or end each continued line with a backslash.
 
 End-effector target format:
   --arm       Omit --target-ee-joint.
   --gripper   Pass 1 physical width in meters.
   --hand      Pass 20 Wuji Hand 2 joint angles in radians.
-  With --duo, the same end-effector target is sent to both sides.
-
 Options:
   --ip-left ADDR       Left FR3 address (default: 172.16.0.3).
   --ip-right ADDR      Right FR3 address (default: 172.16.0.2).
   --left-hand-ip ADDR  Left Wuji Hand 2 SDK address (or WUJI_LEFT_HAND_IP).
   --right-hand-ip ADDR Right Wuji Hand 2 SDK address (or WUJI_RIGHT_HAND_IP).
-  --dry-run            Read current state and print it with the targets; do not move.
+  --dry-run            Plan and preview the motion, but do not execute it.
   --help               Show this help.
 
 Examples:
@@ -32,8 +30,14 @@ Examples:
   ./scripts/move_to_target_ee.sh --right --gripper \
     --target-ee-pose 0.45 -0.20 0.35 3.14 0 0 --target-ee-joint 0.06
 
-For a real motion, the utility reads and prints the current pose and selected
-end-effector state, then requires an explicit y/yes confirmation.
+The utility uses MoveIt/OMPL to produce a self-collision- and planning-scene-
+checked joint trajectory, previews the plan, and then requires explicit y/yes
+confirmation before FollowJointTrajectory execution.
+
+Only obstacles already published into the selected arm's MoveIt planning scene
+are checked. This launcher does not infer tables, fixtures, people, or the other
+FR3 from camera data. Keep the real workspace clear unless those objects have
+been added to the planning scene.
 EOF
 }
 
@@ -89,17 +93,16 @@ left_hand_ip="${WUJI_LEFT_HAND_IP:-}"
 right_hand_ip="${WUJI_RIGHT_HAND_IP:-}"
 for ((index = 0; index < ${#passthrough_args[@]}; index++)); do
   case "${passthrough_args[index]}" in
-    --left|--right|--duo) arm_mode="${passthrough_args[index]#--}" ;;
+    --left|--right) arm_mode="${passthrough_args[index]#--}" ;;
     --arm|--gripper|--hand) end_effector="${passthrough_args[index]#--}" ;;
     --left-hand-ip) left_hand_ip="${passthrough_args[index + 1]:-}"; ((index++)) ;;
     --right-hand-ip) right_hand_ip="${passthrough_args[index + 1]:-}"; ((index++)) ;;
   esac
 done
-[[ -n "${arm_mode}" ]] || die "one of --left, --right, or --duo is required"
+[[ -n "${arm_mode}" ]] || die "one of --left or --right is required"
 [[ -n "${end_effector}" ]] || die "one of --arm, --gripper, or --hand is required"
 
-if [[ "${arm_mode}" == "duo" ]]; then robot_config="example_fr3_duo_config_no_gripper.yaml"
-elif [[ "${arm_mode}" == "right" ]]; then robot_config="example_fr3_right_config_no_gripper.yaml"
+if [[ "${arm_mode}" == "right" ]]; then robot_config="example_fr3_right_config_no_gripper.yaml"
 else robot_config="example_fr3_config_no_gripper.yaml"; fi
 
 if [[ "${end_effector}" == "hand" ]]; then
@@ -160,24 +163,24 @@ wait_for_tcp_port() {
 
 echo "Starting ${arm_mode} FR3 ROS controller (${robot_config})."
 start_process ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py \
-  "robot_config_file:=${robot_config}"
+  "robot_config_file:=${robot_config}" motion_controller:=trajectory
 controller_pid="${child_pids[0]}"
-if [[ "${arm_mode}" == "left" || "${arm_mode}" == "duo" ]]; then
+if [[ "${arm_mode}" == "left" ]]; then
   wait_for_topic /left/franka/joint_states "${controller_pid}"
-  wait_for_subscription /left/gello/raw_joint_states "${controller_pid}"
+  wait_for_subscription /left/fr3_arm_controller/joint_trajectory "${controller_pid}"
 fi
-if [[ "${arm_mode}" == "right" || "${arm_mode}" == "duo" ]]; then
+if [[ "${arm_mode}" == "right" ]]; then
   wait_for_topic /right/franka/joint_states "${controller_pid}"
-  wait_for_subscription /right/gello/raw_joint_states "${controller_pid}"
+  wait_for_subscription /right/fr3_arm_controller/joint_trajectory "${controller_pid}"
 fi
 
 if [[ "${end_effector}" == "hand" ]]; then
-  if [[ "${arm_mode}" == "left" || "${arm_mode}" == "duo" ]]; then
+  if [[ "${arm_mode}" == "left" ]]; then
     start_process "${wuji_python[@]}" "${replay_program}" \
       --internal-wuji-hand left --left-hand-command-port 5561 --left-hand-status-port 5563 --hand-ip "${left_hand_ip}"
     wait_for_tcp_port 5563 "${child_pids[${#child_pids[@]} - 1]}"
   fi
-  if [[ "${arm_mode}" == "right" || "${arm_mode}" == "duo" ]]; then
+  if [[ "${arm_mode}" == "right" ]]; then
     start_process "${wuji_python[@]}" "${replay_program}" \
       --internal-wuji-hand right --right-hand-command-port 5562 --right-hand-status-port 5564 --hand-ip "${right_hand_ip}"
     wait_for_tcp_port 5564 "${child_pids[${#child_pids[@]} - 1]}"

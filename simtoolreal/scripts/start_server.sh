@@ -10,7 +10,10 @@ policy_bind="${SIMTOOLREAL_POLICY_ADDRESS:-tcp://0.0.0.0:5571}"
 ros_distro="${SIMTOOLREAL_ROS_DISTRO:-${ROS_DISTRO:-}}"
 policy_python="${SIMTOOLREAL_POLICY_PYTHON:-python3}"
 pose_python="${SIMTOOLREAL_POSE_PYTHON:-python3}"
-pose_mode=""; pose_mesh=""; pose_roi=(); pose_no_display=0; mock_policy=0; start_bridge=1; wait_only=1; policy_config=""; policy_checkpoint=""; policy_upstream=""; policy_device="cpu"; pose_file=""
+repository_root_default="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+policy_config="${SIMTOOLREAL_POLICY_CONFIG:-${repository_root_default}/libs/SimToolReal-Franka-Wuji2/pretrained_policy/config.yaml}"
+policy_checkpoint="${SIMTOOLREAL_POLICY_CHECKPOINT:-${repository_root_default}/libs/SimToolReal-Franka-Wuji2/pretrained_policy/model.pth}"
+pose_mode=""; pose_mesh=""; pose_roi=(); pose_no_display=0; mock_policy=0; start_bridge=1; wait_only=1; policy_upstream=""; policy_device="cpu"; pose_file=""
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -33,7 +36,7 @@ while [[ "$#" -gt 0 ]]; do
     --mock-policy) mock_policy=1; shift ;;
     --wait-only) wait_only=1; shift ;;
     --no-wait-only) wait_only=0; shift ;;
-    --help|-h) echo "Usage: start_server.sh --config CONFIG --checkpoint CHECKPOINT [--foundationpose-mesh MESH --foundationpose-roi X Y W H]"; exit 0 ;;
+    --help|-h) echo "Usage: start_server.sh [--config CONFIG --checkpoint CHECKPOINT] [--foundationpose-mesh MESH --foundationpose-roi X Y W H]"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done

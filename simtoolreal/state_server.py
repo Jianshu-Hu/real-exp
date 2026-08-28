@@ -28,9 +28,16 @@ from transport import make_joint_target, validate_packet
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_UPSTREAM = ROOT / "libs/SimToolReal-Franka-Wuji2"
-DEFAULT_ROBOT_URDF = DEFAULT_UPSTREAM / "assets/urdf/franka_wuji_right/fr3v2_wuji_hand2_right.urdf"
-DEFAULT_WORLD_FROM_ROBOT = np.eye(4)
-DEFAULT_WORLD_FROM_ROBOT[1, 3] = 0.8
+DEFAULT_ROBOT_URDF = DEFAULT_UPSTREAM / "assets/urdf/franka_wuji_right_slanted/fr3v2_wuji_hand2_right_slanted.urdf"
+DEFAULT_WORLD_FROM_ROBOT = np.asarray(
+    (
+        (0.0, 1.0, 0.0, 0.0),
+        (-1.0, 0.0, 0.0, 0.45),
+        (0.0, 0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    ),
+    dtype=np.float64,
+)
 
 
 def csv_floats(value: str, count: int, label: str) -> np.ndarray:
@@ -73,7 +80,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mock-pose", action="store_true")
     parser.add_argument("--pose-frame", choices=("robot", "world", "camera"), default="camera")
     parser.add_argument("--world-from-camera", type=transform_arg, help="Required calibration when --pose-frame=camera")
-    parser.add_argument("--world-from-robot", type=transform_arg, default=DEFAULT_WORLD_FROM_ROBOT, help="Policy world-from-robot transform (default: upstream direct profile, y=0.8 m)")
+    parser.add_argument("--world-from-robot", type=transform_arg, default=DEFAULT_WORLD_FROM_ROBOT, help="Policy world-from-robot transform (default: bundled slanted checkpoint profile)")
     parser.add_argument("--goal-pose", required=False, type=transform_arg, help="Goal object pose in policy-world coordinates")
     parser.add_argument("--object-scales", default="1,1,1", help="Training-scale triplet, not raw metres")
     parser.add_argument("--arm-moving-average", type=float, default=0.1)

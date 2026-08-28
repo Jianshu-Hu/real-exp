@@ -36,7 +36,16 @@ from transport import make_policy_observation, validate_packet
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_URDF = ROOT / "libs/SimToolReal-Franka-Wuji2/assets/urdf/franka_wuji_right/fr3v2_wuji_hand2_right.urdf"
+DEFAULT_URDF = ROOT / "libs/SimToolReal-Franka-Wuji2/assets/urdf/franka_wuji_right_slanted/fr3v2_wuji_hand2_right_slanted.urdf"
+DEFAULT_WORLD_FROM_ROBOT = np.asarray(
+    (
+        (0.0, 1.0, 0.0, 0.0),
+        (-1.0, 0.0, 0.0, 0.45),
+        (0.0, 0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    ),
+    dtype=np.float64,
+)
 
 
 def parse_matrix(value: str) -> np.ndarray:
@@ -148,7 +157,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--goal-pose", required=True, type=parse_matrix)
     parser.add_argument("--pose-frame", choices=("camera", "world", "robot"), default="camera")
     parser.add_argument("--world-from-camera", type=parse_matrix)
-    parser.add_argument("--world-from-robot", type=parse_matrix, default=np.eye(4))
+    parser.add_argument("--world-from-robot", type=parse_matrix, default=DEFAULT_WORLD_FROM_ROBOT, help="Policy-world pose of the selected robot URDF root")
     parser.add_argument("--object-scales", default="1,1,1")
     parser.add_argument("--robot-urdf", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--rate", type=float, default=POLICY_RATE_HZ)

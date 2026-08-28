@@ -26,9 +26,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.mock_policy and (args.config is None or args.checkpoint is None):
         parser.error("--config and --checkpoint are required unless --mock-policy is used")
-    policy = MockPolicy(27) if args.mock_policy else RlGamesPolicy(
-        args.upstream_root, args.config, args.checkpoint, 134, 27, args.device
-    )
+    if args.mock_policy:
+        policy = MockPolicy(27)
+        print("Using deterministic mock policy (27 actions)", flush=True)
+    else:
+        print(
+            f"Loading SimToolReal checkpoint: config={args.config} checkpoint={args.checkpoint} "
+            f"device={args.device}",
+            flush=True,
+        )
+        policy = RlGamesPolicy(
+            args.upstream_root, args.config, args.checkpoint, 134, 27, args.device
+        )
+        print("Loaded SimToolReal checkpoint (134 observations -> 27 actions)", flush=True)
     context = zmq.Context()
     socket = context.socket(zmq.REP)
     socket.setsockopt(zmq.LINGER, 0)

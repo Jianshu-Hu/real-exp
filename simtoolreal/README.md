@@ -75,8 +75,13 @@ one `protocol: 1`, `kind: object_pose` JSON packet per tracked frame on
 The server starts `simtoolreal/policy_server.py` on port `5571`, loads the
 checkpoint through the upstream `deployment/rl_player.py`, starts the right
 hand bridge on `5555/5556`, and waits until the bridge emits its first valid
-27-joint sample. The policy environment must provide PyTorch, `rl_games`,
-`gym`, `omegaconf`, and the upstream Python dependencies.
+27-joint sample. The bundled `pretrained_policy/config.yaml` and
+`pretrained_policy/model.pth` are used by default; override them with
+`--config`/`--checkpoint` or `SIMTOOLREAL_POLICY_CONFIG`/
+`SIMTOOLREAL_POLICY_CHECKPOINT`. This checkpoint is an LSTM/SAPG policy with
+134 observations and 27 actions. The policy environment must provide PyTorch,
+`rl_games`, `gym`, `omegaconf`, and the upstream Python dependencies. Use
+`--policy-python` or `SIMTOOLREAL_POLICY_PYTHON` to select that environment.
 
 Robot computer:
 
@@ -101,6 +106,12 @@ python3 simtoolreal/policy_executor.py \
 The executor automatically activates the bridge before commanding and returns
 it to standby on shutdown. Omit `--execute` for a dry-run that prints received
 state, pose, observation, and bounded targets.
+
+The executor defaults to the slanted training URDF because that is the geometry
+used by the bundled checkpoint. Supply `--world-from-robot` (and, for camera
+poses, `--world-from-camera`) from the real installation calibration; these
+transforms define the policy-world frame and should not be guessed from the
+network address or ROS namespace.
 
 The lightweight mock path remains available for transport tests, but it does
 not exercise ROS, CUDA, the real checkpoint, or the Wuji SDK.

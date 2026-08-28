@@ -213,3 +213,7 @@ lerobot_data
 data
 outputs
 replay_trace
+
+grasp/assets/checkpoints
+calibration/runs
+grasp/runs

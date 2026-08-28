@@ -10,6 +10,8 @@ import numpy as np
 
 
 COMMAND_FORMAT = "real_exp_wuji_grasp_command_v1"
+INFERENCE_REQUEST_FORMAT = "real_exp_camera_grasp_request_v1"
+INFERENCE_RESPONSE_FORMAT = "real_exp_camera_grasp_response_v1"
 WUJI_RIGHT_JOINT_NAMES = tuple(
     f"right_finger{finger}_joint{joint}"
     for finger in range(1, 6)
@@ -161,3 +163,23 @@ def validate_command(command: Any, *, max_age_s: float, expected_side: str) -> d
     normalized["ee_pose_xyz_rpy"] = pose
     normalized["hand_joints"] = canonical_joints
     return normalized
+
+
+def validate_inference_request(
+    request: Any, *, max_age_s: float, expected_side: str
+) -> dict[str, Any]:
+    """Validate a control-host request to start one camera inference."""
+    if not isinstance(request, dict) or request.get("format") != INFERENCE_REQUEST_FORMAT:
+        raise ValueError(f"request format must be {INFERENCE_REQUEST_FORMAT!r}")
+    request_id = request.get("request_id")
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+        raise ValueError("request_id must be a non-empty string of at most 128 characters")
+    if request.get("action") != "infer_grasp":
+        raise ValueError("request action must be 'infer_grasp'")
+    if request.get("side") != expected_side:
+        raise ValueError(f"inference server only accepts side={expected_side!r}")
+    created = float(request.get("created_unix_s", float("nan")))
+    age = time.time() - created
+    if not math.isfinite(created) or age < -5.0 or age > max_age_s:
+        raise ValueError(f"request timestamp is stale or invalid (age={age:.3f}s)")
+    return dict(request)

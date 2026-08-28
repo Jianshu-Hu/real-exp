@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run one RGB-D grasp inference using only the connected D435 camera.
+"""Run RGB-D grasp inference using only the connected D435 camera.
 
-The script captures a frame, transforms the valid depth points into the
-calibrated world frame, runs generator/retargeting/refinement, and writes all
-point clouds and hand meshes in the world coordinate frame.
+The script fuses consecutive aligned depth frames, transforms the valid depth
+points into the calibrated world frame, runs generator/retargeting/refinement,
+and writes all point clouds and hand meshes in the world coordinate frame.
 No control host or ZeroMQ connection is required.
 """
 
@@ -41,9 +41,12 @@ from grasp.common import (
 )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, required=True)
+def add_camera_inference_arguments(
+    parser: argparse.ArgumentParser, *, include_output_dir: bool = True
+) -> argparse.ArgumentParser:
+    """Add camera/model options shared by one-shot and server inference."""
+    if include_output_dir:
+        parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--generator-checkpoint", type=Path, default=DEFAULT_GENERATOR_CHECKPOINT)
     parser.add_argument("--mount-calibration", type=Path, default=Path(__file__).resolve().parent / "ee_to_wuji_nominal.json")
     parser.add_argument("--camera-serial", default=DEFAULT_CAMERA_SERIAL)
@@ -62,6 +65,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--warmup-frames", type=int, default=30)
+    parser.add_argument(
+        "--observation-frames",
+        type=int,
+        default=15,
+        help=(
+            "Number of consecutive aligned depth frames to fuse with a per-pixel "
+            "median (default: 15). Keep the camera and scene still during capture."
+        ),
+    )
+    parser.add_argument(
+        "--min-valid-depth-ratio",
+        type=float,
+        default=0.5,
+        help=(
+            "Minimum fraction of observation frames in which a pixel must have "
+            "nonzero depth to be retained (default: 0.5)."
+        ),
+    )
     parser.add_argument("--min-depth-m", type=float, default=0.15)
     parser.add_argument("--max-depth-m", type=float, default=1.50)
     parser.add_argument("--world-min", type=float, nargs=3, default=(-0.50, -0.50, 0.005))
@@ -88,7 +109,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+def build_parser() -> argparse.ArgumentParser:
+    return add_camera_inference_arguments(argparse.ArgumentParser(description=__doc__))
+
+
+def validate_camera_inference_args(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    if args.width <= 0 or args.height <= 0 or args.fps <= 0:
+        parser.error("camera width, height, and fps must be positive")
+    if args.warmup_frames < 0:
+        parser.error("warmup-frames must be non-negative")
+    if args.observation_frames <= 0:
+        parser.error("observation-frames must be positive")
+    if not 0.0 < args.min_valid_depth_ratio <= 1.0:
+        parser.error("min-valid-depth-ratio must be in (0, 1]")
     if args.min_depth_m < 0 or args.max_depth_m <= args.min_depth_m:
         parser.error("depth bounds must satisfy 0 <= min < max")
     if np.any(np.asarray(args.world_max) <= np.asarray(args.world_min)):
@@ -142,6 +177,10 @@ def _capture_with_system_python(args: argparse.Namespace) -> tuple[np.ndarray, n
             str(args.fps),
             "--warmup-frames",
             str(args.warmup_frames),
+            "--observation-frames",
+            str(args.observation_frames),
+            "--min-valid-depth-ratio",
+            str(args.min_valid_depth_ratio),
         ]
         completed = subprocess.run(command, text=True, capture_output=True)
         if completed.returncode != 0:
@@ -178,10 +217,8 @@ def _write_coordinate_outputs(
     _write_ply_mesh(directory / "wuji_refined.ply", *wuji_refined)
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-    _validate_args(args, parser)
+def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
+    """Capture, infer, persist one trial, and return its JSON-compatible record."""
     args.output_dir.mkdir(parents=True, exist_ok=False)
     transforms = load_calibration_transforms(args.mount_calibration)
 
@@ -197,6 +234,14 @@ def main() -> int:
     # run_model expects the complete set of refinement/contact parameters; the
     # parser above deliberately keeps these local to this camera-only tool.
     generated, refined = run_model(sampled_world, args)
+    final_penetration = float(
+        refined.metadata["final_penetration"]["max_penetration_depth_m"]
+    )
+    if not np.isfinite(final_penetration) or final_penetration > args.max_penetration_m:
+        raise ValueError(
+            f"refined grasp penetration {final_penetration:.6f} m exceeds "
+            f"limit {args.max_penetration_m:.6f} m"
+        )
     mano_faces = np.asarray(generated.mano_faces, dtype=np.int64)
     wuji_retargeted_world = _posed_wuji_mesh(
         generated.robot_trans, generated.robot_global_orient, generated.robot_joints
@@ -258,8 +303,9 @@ def main() -> int:
             "refinement": refined.metadata,
         },
     }
+    record_json = json.dumps(record, indent=2, default=_json_default)
     (args.output_dir / "result.json").write_text(
-        json.dumps(record, indent=2, default=_json_default) + "\n", encoding="utf-8"
+        record_json + "\n", encoding="utf-8"
     )
     (args.output_dir / "poses.json").write_text(
         json.dumps(record["poses"], indent=2, default=_json_default) + "\n",
@@ -270,6 +316,16 @@ def main() -> int:
     print(f"Inference complete; outputs saved to {args.output_dir}")
     print(f"World points: {filtered_world.shape[0]} filtered / {unfiltered_world.shape[0]} valid")
     print(f"World-frame outputs: {args.output_dir / 'world'}")
+    # The daemon sends this value with standard JSON, so normalize any NumPy
+    # scalar nested in model metadata before returning it to callers.
+    return json.loads(record_json)
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_camera_inference_args(args, parser)
+    run_camera_inference(args)
     return 0
 
 

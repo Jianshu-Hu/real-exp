@@ -137,8 +137,25 @@ python -m grasp.camera_inference \
   --output-dir grasp/runs/camera_trial_0001
 ```
 
-The helper writes a temporary RGB-D capture and metadata, which the parent
-process loads before coordinate conversion and inference.
+By default, the helper continuously observes 15 aligned frames (about 0.5 s at
+30 FPS) and takes the per-pixel median of nonzero depth values. A pixel is kept
+only when it has valid depth in at least half of the frames. Keep the camera and
+scene still during this window. The window and support threshold are tunable:
+
+```bash
+python -m grasp.camera_inference \
+  --output-dir grasp/runs/camera_trial_0001 \
+  --observation-frames 21 \
+  --min-valid-depth-ratio 0.6
+```
+
+The helper writes the fused depth image, the last aligned RGB frame, and
+capture metadata to a temporary directory, which the parent process loads
+before coordinate conversion and inference. `depth_raw.npy` is therefore in
+the camera's original integer depth units, but contains the temporally fused
+depth observation rather than one physical frame. `result.json` records the
+fusion settings, temporal span, and retained-pixel counts under
+`camera.observation`.
 
 The output contains only a `world/` directory with the unfiltered and filtered
 scene point clouds, generator input, `grasp_object_points.ply`, `mano.ply`, and
@@ -149,6 +166,75 @@ retargeted/refined Wuji meshes. No NPY files are written below `world/`.
 identity mount, `base_T_ee` equals `base_T_hand`. It also stores the final
 refined Wuji target in `hand_joints_rad`, together with the corresponding
 canonical `hand_joint_names` ordering.
+
+## Triggered inference across the two computers
+
+The camera server and robot-control computer can run as a request/response
+pair, so pose values no longer need to be copied out of `poses.json` manually:
+
+```text
+robot-control computer                    camera server (192.168.50.13)
+Enter / g                                 wait on TCP port 5571
+    |--- infer_grasp request -----------> capture and fuse D435 frames
+    |                                     run grasp inference
+    |<-- EE pose + 20 hand joints ------- save a unique trial directory
+validate target locally
+scripts/move_to_target_ee.sh
+```
+
+On the camera server, run the persistent service from the repository root. Its
+camera/model options are the same as `camera_inference.py`:
+
+```bash
+./grasp/start_grasp_inference_server.sh \
+  --world-min -0.25 -0.25 0.10 \
+  --world-max 0.25 0.25 0.40 \
+  --observation-frames 15
+```
+
+It binds to `tcp://192.168.50.13:5571` by default and creates a timestamped
+directory such as `grasp/runs/camera_trial_20260828_143052` for every accepted
+request. If multiple trials somehow start within the same second, later names
+receive `_01`, `_02`, and so on instead of overwriting existing output. Each
+directory contains the same inference artifacts as a one-shot
+`camera_inference.py` run: `rgb_bgr.npy`, fused `depth_raw.npy`, `poses.json`,
+`result.json`, and the point clouds/hand meshes under `world/`. Override the
+network and output locations with `GRASP_SERVER_IP`, `GRASP_INFERENCE_PORT`,
+and `GRASP_RUNS_DIR`. Use `GRASP_CONDA_ENV` when the inference environment is
+not named `lerobot`.
+
+On the robot-control computer, first run in the default dry-run mode:
+
+```bash
+./grasp/start_grasp_execution_client.sh \
+  --hand-ip WUJI_IP:PORT
+```
+
+Press Enter or type `g` to request one observation and inference. After the
+response is validated, the client invokes `scripts/move_to_target_ee.sh` with
+`--right --hand`, the returned `base_T_ee_xyz_rpy`, and all 20 returned joint
+angles. Type `q` to stop the client. For a noninteractive connectivity test,
+use `--once`; it still defaults to a hardware-safe dry run.
+
+Only after a successful dry run and inspection of the saved trial, restart the
+control-side process with local execution permission:
+
+```bash
+./grasp/start_grasp_execution_client.sh \
+  --hand-ip WUJI_IP:PORT \
+  --execute
+```
+
+The camera server cannot grant execution permission. Even with `--execute`,
+the existing move utility reads current robot state, checks IK, prints the
+target, and requires `y/yes` from the operator on the robot computer before
+moving. The service currently supports the calibrated right arm/hand only.
+
+Both computers need the same updated repository checkout. Allow TCP port 5571
+only on the direct control-computer/camera-server link. The protocol checks
+request IDs, timestamps, pose/matrix consistency, conservative EE workspace,
+and the canonical 20-joint contract, but the direct ZMQ connection is not
+encrypted or authenticated.
 
 For a camera-free replay, provide all three offline arguments. The metadata can
 be a calibration `metadata.json` and must contain `color_intrinsics` and

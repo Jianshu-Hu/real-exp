@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -15,7 +16,7 @@ from grasp.common import (
     INFERENCE_RESPONSE_FORMAT,
     validate_command,
 )
-from grasp.control_server import DEFAULT_MOVE_SCRIPT, build_move_command
+from grasp.control_server import DEFAULT_MOVE_SCRIPT
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,7 +28,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--side", choices=("right",), default="right")
     parser.add_argument("--move-script", type=Path, default=DEFAULT_MOVE_SCRIPT)
-    parser.add_argument("--hand-ip", default="", help="Wuji SDK IP:port passed to the move script")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--arm-only",
+        dest="control_mode",
+        action="store_const",
+        const="arm_only",
+        help="Move only the FR3 arm; do not start or command a Wuji hand.",
+    )
+    mode.add_argument(
+        "--arm-with-hand",
+        dest="control_mode",
+        action="store_const",
+        const="arm_with_hand",
+        help="Move the FR3 arm and command the Wuji hand joints.",
+    )
     parser.add_argument("--request-timeout-s", type=float, default=900.0)
     parser.add_argument("--max-command-age-s", type=float, default=120.0)
     parser.add_argument(
@@ -107,13 +122,25 @@ def execute_grasp(args: argparse.Namespace) -> int:
     # Remote data can never grant execution permission. This field is replaced
     # exclusively from the local --execute option after full target validation.
     command["execute"] = bool(args.execute)
-    move_args = argparse.Namespace(
-        move_script=args.move_script,
-        side=args.side,
-        hand_ip=args.hand_ip,
-        allow_execute=bool(args.execute),
-    )
-    move_command = build_move_command(move_args, command)
+    pose = [f"{value:.12g}" for value in command["ee_pose_xyz_rpy"]]
+    move_command = [
+        str(args.move_script),
+        f"--{args.side}",
+        "--hand" if args.control_mode == "arm_with_hand" else "--arm",
+        "--target-ee-pose",
+        *pose,
+    ]
+    if args.control_mode == "arm_with_hand":
+        joints = [f"{value:.12g}" for value in command["hand_joints"]]
+        move_command.extend(("--target-ee-joint", *joints))
+        move_command.extend(
+            (
+                f"--{args.side}-hand-ip",
+                os.environ["GRASP_FIXED_RIGHT_HAND_IP"],
+            )
+        )
+    if not args.execute:
+        move_command.append("--dry-run")
     mode = "execute with local confirmation" if args.execute else "dry-run"
     print(f"Starting local move utility in {mode} mode...", flush=True)
     return subprocess.run(move_command, check=False).returncode
@@ -126,12 +153,22 @@ def main() -> int:
         parser.error("timeouts and maximum command age must be positive")
     if not args.move_script.is_file():
         parser.error(f"move script does not exist: {args.move_script}")
+    if args.control_mode == "arm_with_hand" and not os.environ.get(
+        "GRASP_FIXED_RIGHT_HAND_IP"
+    ):
+        parser.error(
+            "arm-with-hand mode must be started through "
+            "start_grasp_execution_client.sh"
+        )
 
     if args.once:
         return execute_grasp(args)
 
-    mode = "EXECUTE (local confirmation required)" if args.execute else "DRY-RUN"
-    print(f"Grasp execution client connected to {args.server_address}; mode={mode}")
+    execution_mode = "EXECUTE (local confirmation required)" if args.execute else "DRY-RUN"
+    print(
+        f"Grasp execution client connected to {args.server_address}; "
+        f"control={args.control_mode.replace('_', '-')}; mode={execution_mode}"
+    )
     print("Press Enter or type 'g' to request a grasp; type 'q' to quit.")
     while True:
         try:

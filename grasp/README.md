@@ -203,11 +203,11 @@ network and output locations with `GRASP_SERVER_IP`, `GRASP_INFERENCE_PORT`,
 and `GRASP_RUNS_DIR`. Use `GRASP_CONDA_ENV` when the inference environment is
 not named `lerobot`.
 
-On the robot-control computer, first run in the default dry-run mode:
+On the robot-control computer, select exactly one control mode. When the Wuji
+hand is installed, first run in dry-run arm-with-hand mode:
 
 ```bash
-./grasp/start_grasp_execution_client.sh \
-  --hand-ip WUJI_IP:PORT
+./grasp/start_grasp_execution_client.sh --arm-with-hand
 ```
 
 Press Enter or type `g` to request one observation and inference. After the
@@ -216,13 +216,21 @@ response is validated, the client invokes `scripts/move_to_target_ee.sh` with
 angles. Type `q` to stop the client. For a noninteractive connectivity test,
 use `--once`; it still defaults to a hardware-safe dry run.
 
+The right-hand SDK endpoint is fixed near the top of
+`grasp/start_grasp_execution_client.sh`; it is not a command-line parameter.
+When the hand is not installed, use arm-only mode. The server still computes
+and archives the complete grasp, while the control computer passes only the EE
+pose to `move_to_target_ee.sh --right --arm` and never starts a hand worker:
+
+```bash
+./grasp/start_grasp_execution_client.sh --arm-only
+```
+
 Only after a successful dry run and inspection of the saved trial, restart the
 control-side process with local execution permission:
 
 ```bash
-./grasp/start_grasp_execution_client.sh \
-  --hand-ip WUJI_IP:PORT \
-  --execute
+./grasp/start_grasp_execution_client.sh --arm-with-hand --execute
 ```
 
 The camera server cannot grant execution permission. Even with `--execute`,

@@ -4,6 +4,10 @@ set -euo pipefail
 # Robot-control host: request inference and invoke the local guarded move tool.
 grasp_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${grasp_dir}/.." && pwd)"
+# Fixed right Wuji Hand 2 SDK endpoint for this setup. It is used only in
+# --arm-with-hand mode; --arm-only never starts or contacts a hand process.
+readonly right_hand_ip="192.168.1.111:50001"
+export GRASP_FIXED_RIGHT_HAND_IP="${right_hand_ip}"
 client_python="/usr/bin/python3"
 [[ -x "${client_python}" ]] || {
   echo "Error: control-host Python is missing: ${client_python}" >&2

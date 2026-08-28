@@ -248,15 +248,25 @@ No ROS 2, `rclpy`, `franka_msgs`, `pyrealsense2`, Gello, or live robot/camera
 connection is required by either processing script. Those dependencies are only
 needed by `collect_camera_samples.py`, which runs on the camera host.
 
-## Moving the right arm from a world-frame EE pose
+## Moving the right-arm flange from a world-frame pose
 
-`move_right_ee_from_world.sh` converts a world-frame controller-EE target to
-the right FR3 base frame with the matrices in `matrix.md`:
+`move_right_ee_from_world.sh` accepts a world-frame `fr3_link8`/flange target,
+converts it to the right FR3 base frame with the matrices in `matrix.md`, and
+then converts it to the controller-EE pose expected by
+`scripts/move_to_target_ee.sh`:
 
 ```text
 W_T_B_R = W_T_C @ C_T_B_R
-B_R_T_E = inverse(W_T_B_R) @ W_T_E
+B_R_T_F = inverse(W_T_B_R) @ W_T_F
+B_R_T_EE = B_R_T_F @ F_T_EE
 ```
+
+Here `F_T_EE` is the current controller configuration's fixed transform from
+`fr3_link8`/flange to controller EE: translation `[0, 0, 0.1034]` metres and a
+`-pi/4` rotation about flange z. The launcher prints both the right-base flange
+pose and the derived controller-EE pose before invoking the unchanged lower-level
+move script. If the robot's configured `F_T_EE` changes, update the fixed value
+in this launcher to match it.
 
 Both input and output use `x y z roll pitch yaw` in metres/radians, with the
 same `Rz(yaw) @ Ry(pitch) @ Rx(roll)` convention as
@@ -270,14 +280,14 @@ First inspect a conversion without starting the controller:
 
 ```bash
 ./calibration/move_right_ee_from_world.sh \
-  --world-ee-pose 0.20 -0.10 0.30 3.14159 0 0
+  --world-flange-pose 0.20 -0.10 0.30 3.14159 0 0
 ```
 
 Then request the controller's live-state/IK dry run (no movement):
 
 ```bash
 ./calibration/move_right_ee_from_world.sh \
-  --world-ee-pose 0.20 -0.10 0.30 3.14159 0 0 \
+  --world-flange-pose 0.20 -0.10 0.30 3.14159 0 0 \
   --controller-dry-run
 ```
 

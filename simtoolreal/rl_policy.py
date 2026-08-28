@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import tempfile
 import sys
 from pathlib import Path
-import tempfile
+
 import yaml
 
 import numpy as np
@@ -42,7 +43,14 @@ class RlGamesPolicy:
             if not path.exists():
                 raise FileNotFoundError(f"{label} not found: {path}")
         self._validate_checkpoint(checkpoint_path, observation_dim, action_dim)
-        sys.path.insert(0, str(upstream_root.resolve()))
+        upstream_root = upstream_root.resolve()
+        # The repository vendors rl_games one level deeper than the other
+        # Python packages: ``rl_games/rl_games``. Add both roots so imports
+        # work from a source checkout without requiring an editable install.
+        for source_root in (upstream_root, upstream_root / "rl_games"):
+            source_root = str(source_root)
+            if source_root not in sys.path:
+                sys.path.insert(0, source_root)
         # Newer Isaac Sim exports store the rl_games agent under ``agent``;
         # deployment/rl_player.py still reads the legacy ``train`` key. Keep
         # the user's bundle untouched and materialize a compatibility YAML.

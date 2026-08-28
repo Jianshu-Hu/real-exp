@@ -1,0 +1,12 @@
+{
+  "format": "real_exp_ee_to_wuji_v1",
+  "description": "Temporary identity transform: treat the controller EE frame and Wuji wrist/hand-root frame as coincident until the physical mount is measured.",
+  "calibration_status": "temporary_identity_assumption",
+  "source": "Temporary experimental assumption requested before physical mount calibration.",
+  "ee_T_hand": [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}

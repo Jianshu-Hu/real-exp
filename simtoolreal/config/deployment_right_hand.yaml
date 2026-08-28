@@ -1,0 +1,41 @@
+lerobot_data_bridge:
+  ros__parameters:
+    sample_rate_hz: 60.0
+    max_data_age_sec: 0.25
+    camera_max_age_sec: 0.25
+    robot_state_max_age_sec: 0.25
+    hand_data_max_age_sec: 0.5
+    max_camera_skew_sec: 0.067
+    publish_host: "0.0.0.0"
+    publish_port: 5555
+    command_host: "0.0.0.0"
+    command_port: 5556
+    command_max_age_sec: 0.5
+    camera_cache_host: "127.0.0.1"
+    camera_cache_port: 5557
+    task_name: "simtoolreal fr3 wuji right"
+    deployment_mode: true
+    deployment_start_active: true
+    deployment_hold_warmup_sec: 1.0
+    deployment_hold_stability_tolerance: 0.002
+    deployment_state_source: "topics"
+    include_right_arm: false
+    arm_mode: "right"
+    include_gripper: false
+    include_hand: true
+    require_gripper_freshness: false
+    arm_action_source: "robot_state"
+    right_robot_joint_state_topic: "/right/franka/joint_states"
+    right_deployment_joint_command_topic: "/right/deployment/joint_states"
+    right_deployment_enable_service: "/right/deployment_joint_impedance_controller/set_deployment_enabled"
+    hand_telemetry_host: "0.0.0.0"
+    hand_telemetry_port: 5558
+    camera_1_enabled: false
+    camera_1_name: "cam_left"
+    camera_1_topic: "/cameras/cam_left/image_raw"
+    camera_2_enabled: false
+    camera_2_name: "cam_front"
+    camera_2_topic: "/cameras/cam_front/image_raw"
+    camera_3_enabled: false
+    camera_3_name: "cam_right"
+    camera_3_topic: "/cameras/cam_right/image_raw"

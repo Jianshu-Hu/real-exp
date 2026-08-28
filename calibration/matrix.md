@@ -1,5 +1,8 @@
 # Calibration Matrices
 
+The robot-base matrices below were recomputed on 2026-08-28 after correcting
+the hand-eye sample intrinsics to the active 640x480 `cam_front` profile.
+
 Notation: `A_T_B` transforms coordinates from frame `B` into frame `A`:
 
 ```text
@@ -13,6 +16,10 @@ The translation entries are in metres. Frames used below:
 - `B_R`: right Franka base frame
 - `W`: tabletop world frame (`+x` forward, `+y` left, `+z` up)
 
+Both robot-base calibrations use the `cam_front` color profile for serial
+`401622071701` at 640x480: `fx=606.1522`, `fy=605.6415`, `cx=322.8838`,
+`cy=255.9408`, with zero reported distortion coefficients.
+
 ## Left Robot Base to Camera
 
 Direction: `B_L -> C`.
@@ -22,9 +29,9 @@ Source field: `camera_T_base` in
 
 ```text
 C_T_B_L =
-[[ 0.028105207, -0.794041066, -0.607214034, -0.310235811],
- [-0.934696878,  0.194450200, -0.297541367,  0.543971151],
- [ 0.354332955,  0.575923524, -0.736722643,  0.707608360],
+[[ -0.094872488, -0.705592508, -0.702238153, -0.194672067],
+ [ -0.924629912,  0.323839306, -0.200468526,  0.571976021],
+ [  0.368861407,  0.630291454, -0.683135379,  0.898757710],
  [ 0.000000000,  0.000000000,  0.000000000,  1.000000000]]
 
 p_C = C_T_B_L @ p_B_L
@@ -32,10 +39,10 @@ p_C = C_T_B_L @ p_B_L
 
 Calibration quality:
 
-- Valid samples: `20/20`
-- Median Tag reprojection RMSE: `0.226 px`
-- Median hand-eye translation residual: `9.995 mm`
-- Median hand-eye rotation residual: `0.04513 rad` (`2.586 deg`)
+- Used samples: `20/20`
+- Median Tag reprojection RMSE: `0.218 px`
+- Median hand-eye translation residual: `4.839 mm`
+- Median hand-eye rotation residual: `0.03353 rad` (`1.921 deg`)
 
 ## Right Robot Base to Camera
 
@@ -46,9 +53,9 @@ Source field: `camera_T_base` in
 
 ```text
 C_T_B_R =
-[[ 0.064235673, -0.841162479,  0.536953874,  0.249297696],
- [-0.956780317, -0.204838067, -0.206428660,  0.513843229],
- [ 0.283628637, -0.500486814, -0.817965614,  0.782537268],
+[[ 0.061077178, -0.724658647,  0.686395967,  0.162840030],
+ [-0.927423222, -0.295425134, -0.229369041,  0.562456279],
+ [ 0.368992880, -0.622570346, -0.690108991,  0.901632663],
  [ 0.000000000,  0.000000000,  0.000000000,  1.000000000]]
 
 p_C = C_T_B_R @ p_B_R
@@ -56,10 +63,10 @@ p_C = C_T_B_R @ p_B_R
 
 Calibration quality (`sample_000014` excluded as a PnP pose outlier):
 
-- Valid samples: `19/19`
-- Median Tag reprojection RMSE: `0.248 px`
-- Median hand-eye translation residual: `11.152 mm`
-- Median hand-eye rotation residual: `0.06922 rad` (`3.966 deg`)
+- Used samples: `19/20` (`sample_000014` excluded)
+- Median Tag reprojection RMSE: `0.227 px`
+- Median hand-eye translation residual: `4.378 mm`
+- Median hand-eye rotation residual: `0.06000 rad` (`3.438 deg`)
 
 ## Camera to World
 
@@ -99,9 +106,10 @@ p_W = W_T_C @ C_T_B_R @ p_B_R
 As a cross-calibration check, the two hand-eye matrices imply:
 
 ```text
-left_base_T_right_base translation = [0.0704, -0.4070, -0.3860] m
-left_base_T_right_base RPY         = [70.23, -2.10, -4.23] deg
+left_base_T_right_base translation = [-0.0241, -0.2535, -0.2511] m
+left_base_T_right_base RPY         = [87.96, 6.26, -6.40] deg
 ```
 
-The approximately `70 deg` relative roll is consistent with the two robot
-bases being mounted diagonally in opposite directions.
+This derived relation is a useful consistency value, but should be compared
+against an independent measurement of the physical base mounting before it is
+used as a base-to-base calibration.

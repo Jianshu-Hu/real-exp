@@ -161,4 +161,3 @@ def validate_command(command: Any, *, max_age_s: float, expected_side: str) -> d
     normalized["ee_pose_xyz_rpy"] = pose
     normalized["hand_joints"] = canonical_joints
     return normalized
-

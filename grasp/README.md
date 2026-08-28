@@ -32,8 +32,13 @@ transforms embedded in `grasp/inference_client.py`:
 - `world_T_camera` (`W_T_C`) from `calibration/matrix.md`.
 - `camera_T_right_base` (`C_T_B_R`) from `calibration/matrix.md`, inverted to
   obtain the `base_T_camera` transform required by the command path.
-- `ee_T_hand` defaults to `grasp/ee_to_wuji_nominal.json`, the temporary
-  nominal `panda_link8_T_hand_docking` value from `calibration/README.md`.
+- `ee_T_hand` comes from the controller-EE-to-Wuji-root mount calibration.
+
+The bundled `grasp/ee_to_wuji_nominal.json` currently uses a temporary identity
+transform: the controller EE frame and Wuji wrist/hand-root frame are treated as
+coincident. This keeps EE target generation enabled for experiments, but it is
+not a physical mount calibration and must be replaced before relying on the
+absolute EE pose.
 
 The generated pose is `world_T_hand`. The target sent to the controller is:
 
@@ -42,12 +47,12 @@ base_T_world = base_T_camera @ inverse(world_T_camera)
 base_T_ee = base_T_world @ world_T_hand @ inverse(ee_T_hand)
 ```
 
-The bundled nominal mount file has this structure:
+The bundled temporary mount file has this structure:
 
 ```json
 {
   "format": "real_exp_ee_to_wuji_v1",
-  "description": "Measured transform from the controller EE frame to the generator Wuji root",
+  "calibration_status": "temporary_identity_assumption",
   "ee_T_hand": [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],
@@ -57,10 +62,9 @@ The bundled nominal mount file has this structure:
 }
 ```
 
-It assumes controller EE equals `panda_link8`. This is only a temporary CAD
-value; the physical `fr3_link8`, flange, controller EE, and mount must be
-measured and checked before hardware use. Override it with
-`--mount-calibration PATH` after physical mount calibration.
+It temporarily assumes the controller EE and Wuji wrist/hand root are the same
+frame, so `ee_T_hand` is the 4x4 identity matrix. Pass a measured replacement
+with `--mount-calibration PATH` after physical mount calibration.
 
 ## Control host
 
@@ -107,7 +111,8 @@ python -m grasp.inference_client \
 
 The first run is a dry run even if the server allows execution. Add `--execute`
 only after checking `result.json`, `object_points_world.npy`, the reported
-`base_T_ee`, mount direction, Wuji joint order, and the control-host IK output.
+`base_T_ee`, the temporary identity mount assumption, Wuji joint order, and the
+control-host IK output.
 
 ## Camera-only inference
 
@@ -140,10 +145,10 @@ scene point clouds, generator input, `grasp_object_points.ply`, `mano.ply`, and
 retargeted/refined Wuji meshes. No NPY files are written below `world/`.
 `result.json` records the calibration matrices and inference metadata, while
 `poses.json` stores the readable `world_T_hand`, `base_T_hand`, `base_T_ee`, and
-`base_T_ee_xyz_rpy` values for offline experiments. It also stores the final
+`base_T_ee_xyz_rpy` values for offline experiments. With the bundled temporary
+identity mount, `base_T_ee` equals `base_T_hand`. It also stores the final
 refined Wuji target in `hand_joints_rad`, together with the corresponding
-canonical `hand_joint_names` ordering. The pose conversion to the right-arm base
-is retained in JSON even though no right-base mesh directory is created.
+canonical `hand_joint_names` ordering.
 
 For a camera-free replay, provide all three offline arguments. The metadata can
 be a calibration `metadata.json` and must contain `color_intrinsics` and

@@ -18,21 +18,19 @@ import numpy as np
 
 SAMPLE_COUNT = 20
 VIDEO_KEY = "observation.images.cam_front"
+CAMERA_SERIAL = "401622071701"
 COLOR_INTRINSICS = {
     "width": 640,
     "height": 480,
-    "fx": 394.361236572266,
-    "fy": 393.302062988281,
-    "cx": 318.513824462891,
-    "cy": 230.271636962891,
+    # cam_front serial 401622071701, color stream 640x480.  These are the
+    # intrinsics reported by the same live RealSense profile used by the
+    # camera-to-world calibration and grasp inference capture.
+    "fx": 606.1522216796875,
+    "fy": 605.6415405273438,
+    "cx": 322.8837585449219,
+    "cy": 255.94076538085938,
     "model": "distortion.inverse_brown_conrady",
-    "coeffs": [
-        -0.0534335076808929,
-        0.0580953061580658,
-        0.000541441899258643,
-        -0.000415135698858649,
-        -0.019531236961484,
-    ],
+    "coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
 }
 
 
@@ -162,6 +160,7 @@ def export_samples(
             np.save(sample_dir / "rgb.npy", image)
             metadata = {
                 "sample_id": sample_id,
+                "camera_serial": CAMERA_SERIAL,
                 "source": {
                     "dataset": str(dataset),
                     "episode_index": episode,
@@ -179,6 +178,8 @@ def export_samples(
             "source_dataset": str(dataset),
             "episode_index": episode,
             "video_key": VIDEO_KEY,
+            "camera_serial": CAMERA_SERIAL,
+            "color_intrinsics": COLOR_INTRINSICS,
             "sample_count": len(selected),
             "samples": manifest_samples,
         }

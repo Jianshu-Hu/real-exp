@@ -61,6 +61,13 @@ def main() -> int:
     parser.add_argument("--tag-id", type=int, default=0)
     parser.add_argument("--tag-family", choices=("tag36h11", "tag25h9", "tag16h5"), default="tag36h11")
     parser.add_argument("--min-samples", type=int, default=10)
+    parser.add_argument(
+        "--exclude-sample",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="Exclude a sample ID such as 000014; repeat for multiple samples.",
+    )
     args = parser.parse_args()
     if args.tag_size_m <= 0 or args.min_samples < 3:
         parser.error("tag-size-m must be positive and min-samples must be at least 3")
@@ -77,14 +84,25 @@ def main() -> int:
         raise SystemExit(f"no sample_*/sample.json entries found under {args.input}")
     first = json.loads((sample_dirs[0] / "sample.json").read_text(encoding="utf-8"))
     intrinsics = first["color_intrinsics"]
+    camera_serial = first.get("camera_serial")
     camera_matrix = np.asarray([[intrinsics["fx"], 0.0, intrinsics["cx"]], [0.0, intrinsics["fy"], intrinsics["cy"]], [0.0, 0.0, 1.0]], dtype=np.float64)
     distortion = np.asarray(intrinsics.get("coeffs", [0, 0, 0, 0, 0]), dtype=np.float64)
     half = args.tag_size_m / 2.0
     tag_points = np.asarray([[-half, half, 0.0], [half, half, 0.0], [half, -half, 0.0], [-half, -half, 0.0]], dtype=np.float64)
 
     observations: list[dict[str, Any]] = []
+    excluded_samples = set(args.exclude_sample)
+    seen_sample_ids: set[str] = set()
     for sample_dir in sample_dirs:
         sample = json.loads((sample_dir / "sample.json").read_text(encoding="utf-8"))
+        sample_id = str(sample["sample_id"])
+        seen_sample_ids.add(sample_id)
+        if sample.get("color_intrinsics") != intrinsics:
+            raise ValueError(f"{sample_dir} color_intrinsics differ from the first sample")
+        if sample.get("camera_serial") != camera_serial:
+            raise ValueError(f"{sample_dir} camera_serial differs from the first sample")
+        if sample_id in excluded_samples:
+            continue
         image = np.load(sample_dir / "rgb.npy")
         corners = detect_tag(cv2, image, args.tag_family, args.tag_id)
         if corners is None:
@@ -98,7 +116,11 @@ def main() -> int:
         camera_t_tag[:3, 3] = tvec.reshape(3)
         projected, _ = cv2.projectPoints(tag_points, rvec, tvec, camera_matrix, distortion)
         reprojection = float(np.sqrt(np.mean(np.sum((projected.reshape(4, 2) - corners) ** 2, axis=1))))
-        observations.append({"sample_id": sample["sample_id"], "camera_T_tag": camera_t_tag, "base_T_ee": read_matrix(sample["B_T_E"], "B_T_E"), "reprojection_rmse_px": reprojection})
+        observations.append({"sample_id": sample_id, "camera_T_tag": camera_t_tag, "base_T_ee": read_matrix(sample["B_T_E"], "B_T_E"), "reprojection_rmse_px": reprojection})
+
+    unknown_exclusions = excluded_samples - seen_sample_ids
+    if unknown_exclusions:
+        raise ValueError(f"excluded sample IDs were not found: {sorted(unknown_exclusions)}")
 
     if len(observations) < args.min_samples:
         raise SystemExit(f"only {len(observations)} valid Tag observations; need at least {args.min_samples}")
@@ -133,7 +155,7 @@ def main() -> int:
         per_sample.append({"sample_id": item["sample_id"], "reprojection_rmse_px": item["reprojection_rmse_px"], "translation_error_m": float(np.linalg.norm(error[:3])), "rotation_error_rad": float(np.linalg.norm(error[3:])), "camera_T_tag": item["camera_T_tag"].tolist(), "base_T_ee": item["base_T_ee"].tolist()})
 
     output = args.output or (args.input / "camera_to_robot_base.json")
-    result = {"format": "real_exp_camera_to_robot_base_v1", "input": str(args.input), "tag": {"family": args.tag_family, "id": args.tag_id, "size_m": args.tag_size_m}, "camera_T_base": camera_t_base.tolist(), "base_T_camera": invert(camera_t_base).tolist(), "ee_T_tag": ee_t_tag.tolist(), "valid_samples": len(observations), "median_reprojection_rmse_px": float(np.median([item["reprojection_rmse_px"] for item in observations])), "median_translation_residual_m": float(np.median([item["translation_error_m"] for item in per_sample])), "median_rotation_residual_rad": float(np.median([item["rotation_error_rad"] for item in per_sample])), "samples": per_sample}
+    result = {"format": "real_exp_camera_to_robot_base_v1", "input": str(args.input), "camera_serial": camera_serial, "color_intrinsics": intrinsics, "tag": {"family": args.tag_family, "id": args.tag_id, "size_m": args.tag_size_m}, "excluded_samples": sorted(excluded_samples), "camera_T_base": camera_t_base.tolist(), "base_T_camera": invert(camera_t_base).tolist(), "ee_T_tag": ee_t_tag.tolist(), "valid_samples": len(observations), "median_reprojection_rmse_px": float(np.median([item["reprojection_rmse_px"] for item in observations])), "median_translation_residual_m": float(np.median([item["translation_error_m"] for item in per_sample])), "median_rotation_residual_rad": float(np.median([item["rotation_error_rad"] for item in per_sample])), "samples": per_sample}
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(f"saved {output} from {len(observations)} samples")
     return 0

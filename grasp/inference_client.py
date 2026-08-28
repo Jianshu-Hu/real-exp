@@ -47,9 +47,9 @@ CALIBRATED_WORLD_T_CAMERA = np.asarray(
 )
 CALIBRATED_CAMERA_T_RIGHT_BASE = np.asarray(
     [
-        [0.064235673, -0.841162479, 0.536953874, 0.249297696],
-        [-0.956780317, -0.204838067, -0.206428660, 0.513843229],
-        [0.283628637, -0.500486814, -0.817965614, 0.782537268],
+        [0.061077178, -0.724658647, 0.686395967, 0.162840030],
+        [-0.927423222, -0.295425134, -0.229369041, 0.562456279],
+        [0.368992880, -0.622570346, -0.690108991, 0.901632663],
         [0.0, 0.0, 0.0, 1.0],
     ],
     dtype=np.float64,
@@ -84,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mount-calibration",
         type=Path,
         default=DEFAULT_MOUNT_CALIBRATION,
-        help="JSON containing ee_T_hand (default: temporary nominal Wuji CAD transform).",
+        help="JSON containing ee_T_hand (default: temporary identity transform).",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--control-address", default="tcp://127.0.0.1:5570")

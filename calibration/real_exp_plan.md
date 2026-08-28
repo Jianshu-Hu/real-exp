@@ -155,6 +155,12 @@ flange, and controller EE frame. The end-effector AprilTag calibration remains
 the source of truth for the real installed transform and can be used to
 estimate the discrepancy from this URDF value.
 
+The bundled mount currently uses a temporary identity transform: the controller
+EE and Wuji wrist/hand-root frames are treated as coincident, so
+`B_T_E_target = B_T_H_target`. This is an experimental assumption, not a
+physical mount calibration, and must be replaced with a measured
+controller-EE-to-Wuji-root transform later.
+
 ## Verification and safety gates
 
 - First run the complete pipeline in offline/replay mode and inspect saved RGB-D,

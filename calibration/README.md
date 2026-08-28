@@ -46,7 +46,7 @@ Run the separate processing step after installing OpenCV contrib and SciPy:
 ```bash
 python calibration/calibrate_camera_to_world.py \
   --input calibration/runs/table_tag_20260824 \
-  --tag-size-m 0.080 \
+  --tag-size-m 0.094 \
   --tag-family tag36h11 \
   --tag-id 0
 ```
@@ -141,6 +141,12 @@ only the nominal CAD transform; verify it against the physical mount and the
 real FR3 `fr3_link8`/flange/controller EE frame. The end-effector AprilTag
 hand-eye calibration remains the source of truth for the installed transform.
 
+For the current grasp experiment, `grasp/ee_to_wuji_nominal.json` deliberately
+does not use this CAD rotation. It temporarily sets `ee_T_hand` to the 4x4
+identity matrix, treating the Wuji wrist/hand-root frame and controller EE frame
+as coincident. Replace that temporary assumption after measuring the physical
+mount transform.
+
 ## Selecting samples from a LeRobot recording
 
 Recordings made by `scripts/start_data_collection_client.sh` and
@@ -149,9 +155,18 @@ Parquet and `cam_front` images in a video. Use the interactive selector to
 choose exactly 20 frames and convert them to the `sample_######` format expected
 by `calibrate_camera_to_robot_base.py`.
 
-The selector contains the D435 Color 640x480 intrinsics from
-`D435内参表.txt`, including its five Inverse Brown Conrady coefficients. It
-checks that the `cam_front` video is exactly 640x480 before exporting.
+The selector contains the live D435 Color 640x480 intrinsics for `cam_front`
+serial `401622071701`: `fx=606.1522`, `fy=605.6415`, `cx=322.8838`, and
+`cy=255.9408`, with zero reported distortion coefficients. These are the same
+profile values recorded by the camera-to-world collector and grasp inference.
+It checks that the `cam_front` video is exactly 640x480 before exporting and
+writes both the serial number and intrinsics into each sample and the selection
+manifest. If the camera profile, resolution, crop, or resize changes, update
+the intrinsics before exporting samples.
+
+`calibration/runs/D435内参表.txt` is retained as a historical device/profile
+dump, but its 640x480 color entry is not the active profile used for these
+calibration images and must not be copied into the sample metadata.
 
 Run the selector once for each arm:
 
@@ -173,24 +188,30 @@ solver's dependencies remain unchanged.
 Use the timeline or arrow keys to locate a pose, then click **Add frame** (or
 press Space). The interface enables **Export samples** after exactly 20 distinct
 frames have been selected. Each exported `sample.json` records the source
-episode, frame index, timestamp, built-in camera intrinsics, and the synchronized
-`B_T_E` converted from `observation.ee_pose`.
+episode, frame index, timestamp, camera serial, built-in camera intrinsics, and
+the synchronized `B_T_E` converted from `observation.ee_pose`.
 
 After selection, run the existing calibration solver manually:
 
 ```bash
 python calibration/calibrate_camera_to_robot_base.py \
   --input calibration/runs/left_arm_camera_calibration_samples \
-  --tag-size-m 0.080 \
+  --tag-size-m 0.037 \
   --tag-family tag36h11 \
-  --tag-id 0
+  --tag-id 2
 
 python calibration/calibrate_camera_to_robot_base.py \
   --input calibration/runs/right_arm_camera_calibration_samples \
-  --tag-size-m 0.080 \
+  --tag-size-m 0.037 \
   --tag-family tag36h11 \
-  --tag-id 0
+  --tag-id 1 \
+  --exclude-sample 000014
 ```
+
+The right-arm command explicitly excludes `sample_000014`, whose planar PnP
+solution is an outlier. `--exclude-sample` may be repeated when another dataset
+has multiple independently identified outliers; the excluded IDs are stored in
+the output JSON.
 
 The processing script reads the measured `B_T_E` stored in each sample,
 detects the end-effector Tag, and jointly estimates:
@@ -226,6 +247,39 @@ python -m pip install numpy scipy opencv-contrib-python
 No ROS 2, `rclpy`, `franka_msgs`, `pyrealsense2`, Gello, or live robot/camera
 connection is required by either processing script. Those dependencies are only
 needed by `collect_camera_samples.py`, which runs on the camera host.
+
+## Moving the right arm from a world-frame EE pose
+
+`move_right_ee_from_world.py` converts a world-frame controller-EE target to
+the right FR3 base frame with the matrices in `matrix.md`:
+
+```text
+W_T_B_R = W_T_C @ C_T_B_R
+B_R_T_E = inverse(W_T_B_R) @ W_T_E
+```
+
+Both input and output use `x y z roll pitch yaw` in metres/radians, with the
+same `Rz(yaw) @ Ry(pitch) @ Rx(roll)` convention as
+`scripts/move_to_target_ee.sh`. First inspect a conversion without starting the
+controller:
+
+```bash
+python calibration/move_right_ee_from_world.py \
+  --world-ee-pose 0.20 -0.10 0.30 3.14159 0 0
+```
+
+Then request the controller's live-state/IK dry run (no movement):
+
+```bash
+python calibration/move_right_ee_from_world.py \
+  --world-ee-pose 0.20 -0.10 0.30 3.14159 0 0 \
+  --controller-dry-run
+```
+
+Use `--execute` only when the converted target and dry run have been checked.
+It calls `scripts/move_to_target_ee.sh --right --arm`; the existing controller
+utility still prints current/target state and requires an explicit `y`/`yes`
+before commanding real motion.
 
 The input formats differ:
 

@@ -13,3 +13,6 @@
 [submodule "libs/FoundationPose-plus-plus"]
 	path = libs/FoundationPose-plus-plus
 	url = https://github.com/Jianshu-Hu/FoundationPose-plus-plus.git
+[submodule "libs/SimToolReal-Franka-Wuji2"]
+	path = libs/SimToolReal-Franka-Wuji2
+	url = git@github.com:etach-qs/SimToolReal-Franka-Wuji2.git

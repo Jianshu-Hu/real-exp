@@ -22,18 +22,12 @@ def test_single_arm_target_requires_six_pose_values_and_no_joint_target() -> Non
     assert targets[0].end_effector_joint is None
 
 
-def test_duo_gripper_target_is_broadcast_to_left_and_right() -> None:
-    _, targets = parse(
-        "--duo",
-        "--gripper",
-        "--target-ee-pose",
-        "0.4,0.2,0.3,0,0,0",
-        "--target-ee-joint",
-        "0.04",
-    )
-    assert [target.side for target in targets] == ["left", "right"]
-    np.testing.assert_allclose(targets[0].end_effector_joint, [0.04])
-    np.testing.assert_allclose(targets[1].end_effector_joint, [0.04])
+def test_duo_mode_is_not_available_for_independent_single_arm_planning() -> None:
+    parser = move.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--duo", "--arm", "--target-ee-pose", "0.4,0.2,0.3,0,0,0"]
+        )
 
 
 def test_hand_target_requires_twenty_values_per_side() -> None:
@@ -154,52 +148,165 @@ def test_pose_matrix_uses_xyz_and_roll_pitch_yaw() -> None:
     )
 
 
-def test_arm_ramp_bounds_velocity_and_acceleration_without_overshoot() -> None:
-    q = np.zeros(7)
-    velocity = np.zeros(7)
-    target = np.asarray([1.0, -1.0, 0.5, -0.4, 0.3, 0.8, -0.7])
-    dt = move.ARM_PUBLISH_PERIOD_S
-    previous_velocity = velocity.copy()
-    for _ in range(1000):
-        q, velocity = move.ramp_arm_command(q, velocity, target, dt)
-        assert np.max(np.abs(velocity)) <= move.ARM_MAX_VELOCITY_RAD_PER_S + 1e-12
-        assert np.max(np.abs(velocity - previous_velocity)) <= (
-            move.ARM_MAX_ACCELERATION_RAD_PER_S2 * dt + 1e-12
-        )
-        assert np.all(np.abs(q) <= np.abs(target) + 1e-12)
-        previous_velocity = velocity.copy()
-    np.testing.assert_allclose(q, target, atol=1e-9)
+def test_move_group_goal_converts_ee_target_to_flange_pose() -> None:
+    from geometry_msgs.msg import Pose
+    from moveit_msgs.action import MoveGroup
+    from moveit_msgs.msg import Constraints, OrientationConstraint, PositionConstraint
+    from shape_msgs.msg import SolidPrimitive
 
-
-def test_arm_ramp_clamps_delayed_cycle_duration() -> None:
-    q, velocity = move.ramp_arm_command(
-        np.zeros(7), np.zeros(7), np.ones(7), dt=1.0
+    target_ee = move.pose_vector_to_matrix([0.4, -0.2, 0.3, 0.1, -0.2, 0.3])
+    flange_to_ee = move.pose_vector_to_matrix([0.0, 0.0, 0.1034, 0.0, 0.0, -np.pi / 4])
+    goal = move.build_move_group_goal(
+        "right",
+        target_ee,
+        flange_to_ee,
+        {
+            "MoveGroup": MoveGroup,
+            "Constraints": Constraints,
+            "OrientationConstraint": OrientationConstraint,
+            "PositionConstraint": PositionConstraint,
+            "Pose": Pose,
+            "SolidPrimitive": SolidPrimitive,
+        },
+        current_q=np.asarray([0.1, -0.7, 0.2, -2.0, 0.3, 1.5, -0.4]),
     )
-    maximum_dt = 2.0 * move.ARM_PUBLISH_PERIOD_S
+
+    constraints = goal.request.goal_constraints[0]
+    planned_flange = move.pose_message_to_matrix(
+        constraints.position_constraints[0].constraint_region.primitive_poses[0]
+    )
+    expected_flange = target_ee @ np.linalg.inv(flange_to_ee)
+    np.testing.assert_allclose(planned_flange, expected_flange, atol=1e-12)
+    assert goal.request.group_name == "right_fr3_arm"
+    assert goal.request.planner_id == "RRTConnectkConfigDefault"
+    assert goal.request.pipeline_id == ""
+    assert goal.planning_options.plan_only
+    assert constraints.position_constraints[0].header.frame_id == "right_fr3_link0"
+    assert constraints.position_constraints[0].link_name == "right_fr3_link8"
+    assert goal.request.start_state.joint_state.name == [
+        f"right_fr3_joint{index}" for index in range(1, 8)
+    ]
     np.testing.assert_allclose(
-        velocity, np.full(7, move.ARM_MAX_ACCELERATION_RAD_PER_S2 * maximum_dt)
+        goal.request.start_state.joint_state.position,
+        [0.1, -0.7, 0.2, -2.0, 0.3, 1.5, -0.4],
     )
-    np.testing.assert_allclose(q, velocity * maximum_dt)
+    np.testing.assert_allclose(
+        constraints.position_constraints[0].constraint_region.primitives[0].dimensions,
+        [move.MOVEIT_POSITION_TOLERANCE_M],
+    )
 
 
-def test_arm_reached_uses_replay_position_tolerance() -> None:
+def test_trajectory_duration_uses_ros_duration() -> None:
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    trajectory = JointTrajectory()
+    point = JointTrajectoryPoint()
+    point.time_from_start.sec = 3
+    point.time_from_start.nanosec = 250_000_000
+    trajectory.points = [point]
+    assert move.trajectory_duration_s(trajectory) == pytest.approx(3.25)
+
+
+def test_trajectory_joint_positions_reorders_moveit_joint_names() -> None:
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    trajectory = JointTrajectory()
+    trajectory.joint_names = [
+        "right_fr3_joint3",
+        "right_fr3_joint1",
+        "right_fr3_joint7",
+        "right_fr3_joint2",
+        "right_fr3_joint6",
+        "right_fr3_joint4",
+        "right_fr3_joint5",
+    ]
+    point = JointTrajectoryPoint()
+    point.positions = [3.0, 1.0, 7.0, 2.0, 6.0, 4.0, 5.0]
+    trajectory.points = [point]
+
+    np.testing.assert_allclose(
+        move.trajectory_joint_positions("right", trajectory, 0),
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+    )
+
+
+def test_planned_endpoint_verification_uses_final_trajectory_pose() -> None:
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    model, frame_id = move.build_fr3_model()
+    final_q = np.asarray([0.2, 0.6, 0.5, -1.8, -0.5, 1.5, 0.3])
+    flange_to_ee = move.pose_vector_to_matrix([0, 0, 0.1034, 0, 0, -np.pi / 4])
+    target = move.forward_end_effector_pose(model, frame_id, final_q, flange_to_ee)
+    trajectory = JointTrajectory()
+    trajectory.joint_names = [f"right_fr3_joint{index}" for index in range(1, 8)]
+    point = JointTrajectoryPoint()
+    point.positions = final_q.tolist()
+    trajectory.points = [point]
+
+    np.testing.assert_allclose(
+        move.verify_planned_endpoint("right", trajectory, target, flange_to_ee),
+        final_q,
+    )
+
+
+def test_goal_tolerance_result_can_continue_to_cartesian_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Result:
+        SUCCESSFUL = 0
+        GOAL_TOLERANCE_VIOLATED = -5
+        error_code = GOAL_TOLERANCE_VIOLATED
+        error_string = "joint endpoint tolerance missed"
+
+    class ResultWrapper:
+        result = Result()
+
+    class GoalHandle:
+        accepted = True
+
+        def get_result_async(self) -> object:
+            return object()
+
+    class ActionClient:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def wait_for_server(self, timeout_sec: float) -> bool:
+            return timeout_sec > 0.0
+
+        def send_goal_async(self, _goal: object) -> object:
+            return object()
+
+    class Goal:
+        trajectory = None
+
+    class ActionType:
+        pass
+
+    ActionType.Goal = Goal
+
     class Node:
-        arm_q = {"right": np.full(7, 0.044)}
-        arm_dq = {"right": np.zeros(7)}
+        arm_q = {"right": np.zeros(7)}
 
-    assert move.ARM_POSITION_TOLERANCE_RAD == pytest.approx(0.06)
-    assert move.arm_reached(Node(), "right", np.zeros(7))
+    class Duration:
+        sec = 1
+        nanosec = 0
 
-    Node.arm_q["right"] = np.full(7, 0.061)
-    assert not move.arm_reached(Node(), "right", np.zeros(7))
+    class Point:
+        positions = np.zeros(7)
+        time_from_start = Duration()
 
+    class Trajectory:
+        joint_names = [f"right_fr3_joint{index}" for index in range(1, 8)]
+        points = [Point()]
 
-def test_arm_reached_requires_low_velocity_inside_position_tolerance() -> None:
-    class Node:
-        arm_q = {"right": np.full(7, 0.044)}
-        arm_dq = {"right": np.full(7, move.ARM_VELOCITY_TOLERANCE_RAD_PER_S + 0.001)}
+    responses = iter([GoalHandle(), ResultWrapper()])
+    monkeypatch.setattr("rclpy.action.ActionClient", ActionClient)
+    monkeypatch.setattr(move, "spin_until_future", lambda *_args, **_kwargs: next(responses))
 
-    assert not move.arm_reached(Node(), "right", np.zeros(7))
+    assert not move.execute_joint_trajectory(
+        object(), Node(), "right", Trajectory(), ActionType
+    )
 
 
 def test_forward_kinematics_applies_live_flange_to_ee_transform() -> None:
@@ -275,7 +382,7 @@ def test_approval_requires_explicit_yes(monkeypatch: pytest.MonkeyPatch) -> None
         move.require_approval()
 
 
-def test_dry_run_reads_and_prints_current_state(
+def test_move_summary_prints_current_and_target_state(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     args, targets = parse(
@@ -292,11 +399,10 @@ def test_dry_run_reads_and_prints_current_state(
             "joint": np.asarray([0.02]),
         }
     }
-    move.print_dry_run(args, targets, current)
+    move.print_move_summary(args, targets, current)
 
     output = capsys.readouterr().out
     assert "left current ee pose" in output
     assert "left target  ee pose" in output
     assert "left current gripper width [m]" in output
     assert "left target  gripper width [m]" in output
-    assert "Dry run: no hardware motion was commanded." in output

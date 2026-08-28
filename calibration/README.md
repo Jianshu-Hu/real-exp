@@ -250,7 +250,7 @@ needed by `collect_camera_samples.py`, which runs on the camera host.
 
 ## Moving the right arm from a world-frame EE pose
 
-`move_right_ee_from_world.py` converts a world-frame controller-EE target to
+`move_right_ee_from_world.sh` converts a world-frame controller-EE target to
 the right FR3 base frame with the matrices in `matrix.md`:
 
 ```text
@@ -260,18 +260,23 @@ B_R_T_E = inverse(W_T_B_R) @ W_T_E
 
 Both input and output use `x y z roll pitch yaw` in metres/radians, with the
 same `Rz(yaw) @ Ry(pitch) @ Rx(roll)` convention as
-`scripts/move_to_target_ee.sh`. First inspect a conversion without starting the
-controller:
+`scripts/move_to_target_ee.sh`. The launcher performs the NumPy conversion in
+the Conda environment selected by `--conda-env`, `CALIBRATION_CONDA_ENV`, or
+`LEROBOT_CONDA_ENV` (default `lerobot`). It then delegates ROS control to
+`scripts/move_to_target_ee.sh`, which uses system `/usr/bin/python3`; Conda and
+ROS Python dependencies therefore run in separate processes.
+
+First inspect a conversion without starting the controller:
 
 ```bash
-python calibration/move_right_ee_from_world.py \
+./calibration/move_right_ee_from_world.sh \
   --world-ee-pose 0.20 -0.10 0.30 3.14159 0 0
 ```
 
 Then request the controller's live-state/IK dry run (no movement):
 
 ```bash
-python calibration/move_right_ee_from_world.py \
+./calibration/move_right_ee_from_world.sh \
   --world-ee-pose 0.20 -0.10 0.30 3.14159 0 0 \
   --controller-dry-run
 ```

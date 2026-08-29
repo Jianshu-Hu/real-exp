@@ -173,7 +173,9 @@ retargeted/refined Wuji meshes. No NPY files are written below `world/`.
 `base_T_ee_xyz_rpy` values for offline experiments. With the bundled temporary
 identity mount, `base_T_ee` equals `base_T_hand`. It also stores the final
 refined Wuji target in `hand_joints_rad`, together with the corresponding
-canonical `hand_joint_names` ordering.
+canonical `hand_joint_names` ordering. These saved pose fields remain in the
+bundled RoboDex/first-generation Wuji model convention because the saved meshes
+and contact-refinement result use that model.
 
 ## Triggered inference across the two computers
 
@@ -221,17 +223,47 @@ hand is installed, first run in dry-run arm-with-hand mode:
 Before the client enters its existing request loop, the launcher moves the
 right-arm EE to the initial `xyzrpy` recorded in `note.txt` (`0.682977,
 0.154027, 0.452649, -2.134387, 0.498717, -2.334388`) by invoking
-`scripts/move_to_target_ee.sh --right --arm`. The move utility plans and
-previews the initial motion, then asks the local operator for `y/yes`. Declining
-the move or any planning/execution failure stops startup instead of continuing
-with the grasp workflow. Running the launcher with `-h` or `--help` never starts
-this initial motion.
+`scripts/move_to_target_ee.sh`. In arm-with-hand mode, this initial move uses
+`--right --hand`, commands all 20 Wuji joints to zero, and uses the configured
+right-hand SDK endpoint; arm-only mode uses `--right --arm`. The move utility
+plans and previews a collision-checked Cartesian path whose EE translation is a
+straight line and whose orientation uses shortest-path quaternion
+interpolation. It evaluates distinct target IK solutions in short segments,
+constrains each segment to a local joint corridor, and selects the lowest-motion
+valid path. A final cumulative joint-travel check still rejects unnecessary
+redundant-IK rotations before asking the local operator for `y/yes`. Declining
+the move, an incomplete Cartesian path, or any planning/execution failure stops
+startup instead of continuing with the grasp workflow. Running the launcher
+with `-h` or `--help` never starts this initial motion.
 
 Press Enter or type `g` to request one observation and inference. After the
 response is validated, the client invokes `scripts/move_to_target_ee.sh` with
 `--right --hand`, the returned `base_T_ee_xyz_rpy`, and all 20 returned joint
-angles. Type `q` to stop the client. For a noninteractive connectivity test,
-use `--once`; it still defaults to a hardware-safe dry run.
+angles. The server converts the first-generation RoboDex result at this output
+boundary to Wuji Hand 2 SDK firmware order. The four non-thumb lateral joints
+(`right_finger2_joint2`, `right_finger3_joint2`,
+`right_finger4_joint2`, and `right_finger5_joint2`; flat indices 5, 9, 13, and
+17) are negated because their positive axes are opposite between the two
+models. All other joints are passed without a sign change. Commands identify
+the source model, target hand model, joint convention, and conversion version;
+the control client rejects a command without the exact expected contract. This
+is a temporary compatibility conversion: inference meshes, collision/contact
+refinement, thumb geometry, and joint limits still use the first-generation
+model and are not equivalent to a native Wuji Hand 2 inference model.
+
+After each successful grasp move, the client invokes the same script again to
+return the EE to the configured initial pose. In arm-with-hand mode, the return
+uses `--right --hand` and also commands all 20 Wuji joints to zero; arm-only
+mode continues to use `--right --arm`. If a grasp move fails before that
+automatic return—for example, because its final measured EE pose is just
+outside tolerance—the interactive client remains running. Type `r` at the
+`grasp>` prompt to manually run the same reset without making another camera
+inference request. The hand is also reset to 20 zero joint targets in
+arm-with-hand mode. Both grasp and reset moves honor dry-run mode, and each real
+move keeps the utility's local `y/yes` confirmation. A failed manual reset
+returns to the prompt so it can be retried. Type `q` to stop the client. For a
+noninteractive connectivity test, use `--once`; it still defaults to a
+hardware-safe dry run.
 
 The right-hand SDK endpoint is fixed near the top of
 `grasp/start_grasp_execution_client.sh`; it is not a command-line parameter.

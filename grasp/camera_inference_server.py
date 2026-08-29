@@ -20,8 +20,13 @@ from grasp.camera_inference import (
 from grasp.common import (
     COMMAND_FORMAT,
     INFERENCE_RESPONSE_FORMAT,
+    WUJI_COMMAND_CONVERSION,
+    WUJI_COMMAND_HAND_MODEL,
+    WUJI_COMMAND_JOINT_CONVENTION,
+    WUJI_COMMAND_SOURCE_MODEL,
     validate_command,
     validate_inference_request,
+    wuji_v1_model_to_hand2_firmware,
 )
 
 
@@ -60,6 +65,7 @@ def build_grasp_command(
     record: dict[str, Any], *, side: str, output_dir: Path
 ) -> dict[str, Any]:
     poses = record["poses"]
+    firmware_joints = wuji_v1_model_to_hand2_firmware(poses["hand_joints_rad"])
     command = {
         "format": COMMAND_FORMAT,
         "command_id": str(uuid.uuid4()),
@@ -69,8 +75,12 @@ def build_grasp_command(
         "execute": False,
         "base_T_ee": poses["base_T_ee"],
         "ee_pose_xyz_rpy": poses["base_T_ee_xyz_rpy"],
-        "hand_joints": poses["hand_joints_rad"],
+        "hand_joints": firmware_joints.tolist(),
         "hand_joint_names": poses["hand_joint_names"],
+        "hand_model": WUJI_COMMAND_HAND_MODEL,
+        "hand_joint_convention": WUJI_COMMAND_JOINT_CONVENTION,
+        "hand_joint_source_model": WUJI_COMMAND_SOURCE_MODEL,
+        "hand_joint_conversion": WUJI_COMMAND_CONVERSION,
         "world_T_hand": poses["world_T_hand"],
         "base_T_world": record["calibration"]["base_T_world"],
         "ee_T_hand": record["calibration"]["ee_T_hand"],

@@ -28,6 +28,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--side", choices=("right",), default="right")
     parser.add_argument("--move-script", type=Path, default=DEFAULT_MOVE_SCRIPT)
+    parser.add_argument(
+        "--return-ee-pose",
+        nargs=6,
+        type=float,
+        metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+        help=(
+            "After a completed grasp, return to this xyzrpy pose. In "
+            "arm-with-hand mode, also reset all hand joints to zero. The "
+            "launcher supplies its configured initial pose."
+        ),
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument(
         "--arm-only",
@@ -105,6 +116,46 @@ def request_grasp(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def reset_to_initial_pose(args: argparse.Namespace) -> int:
+    """Run the guarded local move that restores the configured initial state."""
+    if args.return_ee_pose is None:
+        raise RuntimeError(
+            "reset is unavailable because no initial EE pose was configured; "
+            "start this client through start_grasp_execution_client.sh"
+        )
+
+    reset_pose = [f"{value:.12g}" for value in args.return_ee_pose]
+    reset_command = [
+        str(args.move_script),
+        f"--{args.side}",
+        "--hand" if args.control_mode == "arm_with_hand" else "--arm",
+        "--target-ee-pose",
+        *reset_pose,
+    ]
+    if args.control_mode == "arm_with_hand":
+        reset_command.extend(("--target-ee-joint", *(["0"] * 20)))
+        reset_command.extend(
+            (
+                f"--{args.side}-hand-ip",
+                os.environ["GRASP_FIXED_RIGHT_HAND_IP"],
+            )
+        )
+    if not args.execute:
+        reset_command.append("--dry-run")
+
+    reset_detail = (
+        " and resetting all hand joints to zero"
+        if args.control_mode == "arm_with_hand"
+        else ""
+    )
+    mode = "execute with local confirmation" if args.execute else "dry-run"
+    print(
+        f"Resetting the arm to the initial pose{reset_detail} in {mode} mode...",
+        flush=True,
+    )
+    return subprocess.run(reset_command, check=False).returncode
+
+
 def execute_grasp(args: argparse.Namespace) -> int:
     print("Request sent; keep the camera and object still during observation.", flush=True)
     command = request_grasp(args)
@@ -143,7 +194,12 @@ def execute_grasp(args: argparse.Namespace) -> int:
         move_command.append("--dry-run")
     mode = "execute with local confirmation" if args.execute else "dry-run"
     print(f"Starting local move utility in {mode} mode...", flush=True)
-    return subprocess.run(move_command, check=False).returncode
+    grasp_returncode = subprocess.run(move_command, check=False).returncode
+    if grasp_returncode != 0 or args.return_ee_pose is None:
+        return grasp_returncode
+
+    print("Grasp completed; starting the configured automatic reset.", flush=True)
+    return reset_to_initial_pose(args)
 
 
 def main() -> int:
@@ -169,7 +225,10 @@ def main() -> int:
         f"Grasp execution client connected to {args.server_address}; "
         f"control={args.control_mode.replace('_', '-')}; mode={execution_mode}"
     )
-    print("Press Enter or type 'g' to request a grasp; type 'q' to quit.")
+    print(
+        "Press Enter or type 'g' to request a grasp; "
+        "type 'r' to reset to the initial pose; type 'q' to quit."
+    )
     while True:
         try:
             action = input("grasp> ").strip().lower()
@@ -178,8 +237,21 @@ def main() -> int:
             return 0
         if action in {"q", "quit", "exit"}:
             return 0
+        if action in {"r", "reset", "home"}:
+            try:
+                returncode = reset_to_initial_pose(args)
+                if returncode != 0:
+                    print(f"Local reset utility failed with exit code {returncode}")
+                else:
+                    print("Reset completed.")
+            except Exception as exc:
+                print(f"Reset failed: {type(exc).__name__}: {exc}")
+            continue
         if action not in {"", "g", "grasp", "infer"}:
-            print("Unknown command. Press Enter/type 'g' to infer, or 'q' to quit.")
+            print(
+                "Unknown command. Press Enter/type 'g' to infer, "
+                "'r' to reset, or 'q' to quit."
+            )
             continue
         try:
             returncode = execute_grasp(args)

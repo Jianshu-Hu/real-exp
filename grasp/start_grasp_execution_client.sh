@@ -8,9 +8,13 @@ initial_move_script="${repository_root}/scripts/move_to_target_ee.sh"
 readonly -a initial_ee_xyzrpy=(
   0.682977 0.154027 0.452649 -2.134387 0.498717 -2.334388
 )
-# Fixed right Wuji Hand 2 SDK endpoint for this setup. It is used only in
+readonly -a initial_hand_joints=(
+  0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+)
+# Fixed right Wuji Hand 2 SDK endpoint for this setup. The hand uses port 7447;
+# port 50001 belongs to the right glove at 192.168.1.101. It is used only in
 # --arm-with-hand mode; --arm-only never starts or contacts a hand process.
-readonly right_hand_ip="192.168.1.111:50001"
+readonly right_hand_ip="192.168.1.111:7447"
 export GRASP_FIXED_RIGHT_HAND_IP="${right_hand_ip}"
 client_python="/usr/bin/python3"
 [[ -x "${client_python}" ]] || {
@@ -70,11 +74,27 @@ PY
   exit 1
 }
 
+initial_end_effector_args=(--arm)
+for argument in "$@"; do
+  if [[ "${argument}" == "--arm-with-hand" ]]; then
+    initial_end_effector_args=(
+      --hand
+      --target-ee-joint "${initial_hand_joints[@]}"
+      --right-hand-ip "${right_hand_ip}"
+    )
+    break
+  fi
+done
+
 echo "Moving the right-arm EE to the configured initial xyzrpy:"
 echo "  ${initial_ee_xyzrpy[*]}"
-"${initial_move_script}" --right --arm \
+if [[ "${initial_end_effector_args[0]}" == "--hand" ]]; then
+  echo "Resetting all right-hand joints to zero during the initial move."
+fi
+"${initial_move_script}" --right "${initial_end_effector_args[@]}" \
   --target-ee-pose "${initial_ee_xyzrpy[@]}"
 
 exec "${client_python}" -m grasp.grasp_execution_client \
   --server-address "tcp://${server_ip}:${server_port}" \
-  "$@"
+  "$@" \
+  --return-ee-pose "${initial_ee_xyzrpy[@]}"

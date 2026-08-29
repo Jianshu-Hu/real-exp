@@ -14,6 +14,10 @@ import numpy as np
 
 from grasp.common import (
     COMMAND_FORMAT,
+    WUJI_COMMAND_CONVERSION,
+    WUJI_COMMAND_HAND_MODEL,
+    WUJI_COMMAND_JOINT_CONVENTION,
+    WUJI_COMMAND_SOURCE_MODEL,
     WUJI_RIGHT_JOINT_NAMES,
     hand_pose_to_ee_pose,
     invert_transform,
@@ -22,6 +26,7 @@ from grasp.common import (
     read_transform,
     reorder_wuji_joints,
     transform_points,
+    wuji_v1_model_to_hand2_firmware,
 )
 
 
@@ -432,7 +437,10 @@ def build_command(
     base_t_ee = hand_pose_to_ee_pose(
         world_t_hand, transforms["base_T_world"], transforms["ee_T_hand"]
     )
-    joints = reorder_wuji_joints(refined.robot_joints, generated.robot_joint_names)
+    model_joints = reorder_wuji_joints(
+        refined.robot_joints, generated.robot_joint_names
+    )
+    firmware_joints = wuji_v1_model_to_hand2_firmware(model_joints)
     command_id = str(uuid.uuid4())
     return {
         "format": COMMAND_FORMAT,
@@ -442,8 +450,12 @@ def build_command(
         "execute": bool(args.execute),
         "base_T_ee": base_t_ee.tolist(),
         "ee_pose_xyz_rpy": matrix_to_xyz_rpy(base_t_ee).tolist(),
-        "hand_joints": joints.tolist(),
+        "hand_joints": firmware_joints.tolist(),
         "hand_joint_names": list(WUJI_RIGHT_JOINT_NAMES),
+        "hand_model": WUJI_COMMAND_HAND_MODEL,
+        "hand_joint_convention": WUJI_COMMAND_JOINT_CONVENTION,
+        "hand_joint_source_model": WUJI_COMMAND_SOURCE_MODEL,
+        "hand_joint_conversion": WUJI_COMMAND_CONVERSION,
         "world_T_hand": world_t_hand.tolist(),
         "base_T_world": transforms["base_T_world"].tolist(),
         "ee_T_hand": transforms["ee_T_hand"].tolist(),

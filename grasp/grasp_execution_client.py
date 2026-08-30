@@ -16,7 +16,10 @@ from grasp.common import (
     INFERENCE_RESPONSE_FORMAT,
     validate_command,
 )
-from grasp.control_server import DEFAULT_MOVE_SCRIPT
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MOVE_SCRIPT = REPOSITORY_ROOT / "scripts" / "move_to_target_ee.sh"
 
 
 def build_parser() -> argparse.ArgumentParser:

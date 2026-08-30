@@ -89,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mount-calibration",
         type=Path,
         default=DEFAULT_MOUNT_CALIBRATION,
-        help="JSON containing ee_T_hand (default: temporary identity transform).",
+        help="JSON containing ee_T_hand (default: bundled measured mount calibration).",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--control-address", default="tcp://127.0.0.1:5570")

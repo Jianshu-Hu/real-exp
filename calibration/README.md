@@ -141,11 +141,9 @@ only the nominal CAD transform; verify it against the physical mount and the
 real FR3 `fr3_link8`/flange/controller EE frame. The end-effector AprilTag
 hand-eye calibration remains the source of truth for the installed transform.
 
-For the current grasp experiment, `grasp/ee_to_wuji_nominal.json` deliberately
-does not use this CAD rotation. It temporarily sets `ee_T_hand` to the 4x4
-identity matrix, treating the Wuji wrist/hand-root frame and controller EE frame
-as coincident. Replace that temporary assumption after measuring the physical
-mount transform.
+For the current grasp experiment, `grasp/ee_to_wuji_nominal.json` does not use
+this nominal CAD rotation. Its `ee_T_hand` transform was obtained through
+experimental measurement on the installed controller EE and Wuji hand mount.
 
 ## Selecting samples from a LeRobot recording
 
@@ -248,17 +246,39 @@ No ROS 2, `rclpy`, `franka_msgs`, `pyrealsense2`, Gello, or live robot/camera
 connection is required by either processing script. Those dependencies are only
 needed by `collect_camera_samples.py`, which runs on the camera host.
 
-## Moving the right-arm flange from a world-frame pose
+## Moving the right-arm flange, controller EE, or hand from a world-frame pose
 
 `move_right_ee_from_world.sh` accepts a world-frame `fr3_link8`/flange target,
-converts it to the right FR3 base frame with the matrices in `matrix.md`, and
-then converts it to the controller-EE pose expected by
-`scripts/move_to_target_ee.sh`:
+a world-frame default controller-EE target, or a world-frame Wuji hand-root
+target. Exactly one of the three options is required. It converts the target to
+the controller-EE pose expected by `scripts/move_to_target_ee.sh` using the
+matrices in `matrix.md`.
+
+For a flange target:
 
 ```text
 W_T_B_R = W_T_C @ C_T_B_R
 B_R_T_F = inverse(W_T_B_R) @ W_T_F
 B_R_T_EE = B_R_T_F @ F_T_EE
+```
+
+For a default controller-EE target, no tool-coordinate transform is applied:
+
+```text
+W_T_EE = input pose
+B_R_T_EE = inverse(W_T_B_R) @ W_T_EE
+```
+
+`F_T_EE` is inverted only to calculate the corresponding flange pose printed
+for diagnostics; it does not change the requested controller-EE target.
+
+For a hand target, it additionally reads `EE_T_H` from
+`grasp/ee_to_wuji_nominal.json` and accounts for both mount transforms:
+
+```text
+W_T_EE = W_T_H @ inverse(EE_T_H)
+W_T_F = W_T_EE @ inverse(F_T_EE)
+B_R_T_EE = inverse(W_T_B_R) @ W_T_EE
 ```
 
 Here `F_T_EE` is the current controller configuration's fixed transform from
@@ -281,6 +301,21 @@ First inspect a conversion without starting the controller:
 ```bash
 ./calibration/move_right_ee_from_world.sh \
   --world-flange-pose 0.20 -0.10 0.30 3.14159 0 0
+```
+
+To specify the desired Wuji hand-root pose instead:
+
+```bash
+./calibration/move_right_ee_from_world.sh \
+  --world-hand-pose 0.20 -0.10 0.30 3.14159 0 0
+```
+
+To specify the default controller EE directly, without applying a hand/tool
+transform:
+
+```bash
+./calibration/move_right_ee_from_world.sh \
+  --world-ee-pose 0.20 -0.10 0.30 3.14159 0 0
 ```
 
 Then request the controller's live-state/IK dry run (no movement):

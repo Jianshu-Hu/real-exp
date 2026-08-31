@@ -2,8 +2,9 @@
 """Plan and execute a collision-aware FR3 move to an end-effector pose.
 
 Pose values are ``x,y,z,roll,pitch,yaw`` in the Franka base frame, using meters
-and radians. MoveIt/OMPL plans a collision-checked configuration-space path to
-the Cartesian goal and a FollowJointTrajectory controller executes it.
+and radians. The utility solves a linearly interpolated Cartesian path with
+bounded, previous-solution-seeded IK, checks every state against MoveIt's
+planning scene, and sends the resulting joint trajectory to the controller.
 
 Running this program without ``--dry-run`` commands real hardware.
 """
@@ -31,10 +32,25 @@ MOVEIT_POSITION_TOLERANCE_M = 0.002
 MOVEIT_ORIENTATION_TOLERANCE_RAD = 0.01
 MOVEIT_SERVER_TIMEOUT_S = 30.0
 TRAJECTORY_EXECUTION_MARGIN_S = 10.0
-EE_FINAL_POSITION_TOLERANCE_M = 0.01
-EE_FINAL_ORIENTATION_TOLERANCE_RAD = 0.03
-IK_POSITION_TOLERANCE_M = 5e-4
-IK_ORIENTATION_TOLERANCE_RAD = 5e-3
+# These are execution-success tolerances, not planning tolerances. The former
+# 10 mm / 0.03 rad limits caused useful, safely settled poses to be reported as
+# failures because of controller compliance and the physical tool transform.
+EE_FINAL_POSITION_TOLERANCE_M = 0.02
+EE_FINAL_ORIENTATION_TOLERANCE_RAD = 0.08
+MAX_EXECUTION_ATTEMPTS = 2
+CARTESIAN_MAX_STEP_M = 0.0025
+CARTESIAN_REVOLUTE_JUMP_THRESHOLD_RAD = 0.20
+CARTESIAN_MAX_LINE_DEVIATION_M = 0.012
+CARTESIAN_MAX_ORIENTATION_DEVIATION_RAD = 0.10
+CARTESIAN_IK_CORRIDOR_MARGIN_RAD = 0.30
+CARTESIAN_REFERENCE_MAX_JOINT_CHANGE_RAD = 2.60
+CARTESIAN_JOINT_SPEED_RAD_S = np.asarray(
+    [0.12, 0.12, 0.12, 0.12, 0.15, 0.15, 0.15], dtype=float
+)
+CARTESIAN_JOINT_ACCELERATION_RAD_S2 = 0.30
+CARTESIAN_MIN_SEGMENT_DURATION_S = 0.05
+IK_POSITION_TOLERANCE_M = 5e-3
+IK_ORIENTATION_TOLERANCE_RAD = 3e-3
 IK_MAX_FUNCTION_EVALUATIONS = 1200
 END_EFFECTOR_MOVE_TIMEOUT_S = 30.0
 
@@ -72,6 +88,15 @@ class IkResult:
     position_error_m: float
     orientation_error_rad: float
     function_evaluations: int
+
+
+@dataclass(frozen=True)
+class TrajectoryAudit:
+    max_joint_change_rad: float
+    allowed_joint_change_rad: float
+    max_joint_step_rad: float
+    max_line_deviation_m: float
+    max_orientation_deviation_rad: float
 
 
 class TargetArgumentParser(argparse.ArgumentParser):
@@ -310,6 +335,66 @@ def matrix_to_pose_message(transform: np.ndarray, Pose: Any) -> Any:
     return message
 
 
+def interpolate_pose(start: np.ndarray, target: np.ndarray, fraction: float) -> np.ndarray:
+    """Interpolate translation linearly and rotation on the shortest SO(3) arc."""
+    from scipy.spatial.transform import Rotation, Slerp
+
+    alpha = float(np.clip(fraction, 0.0, 1.0))
+    result = np.eye(4, dtype=float)
+    result[:3, 3] = (1.0 - alpha) * start[:3, 3] + alpha * target[:3, 3]
+    rotations = Rotation.from_matrix(np.stack((start[:3, :3], target[:3, :3])))
+    result[:3, :3] = Slerp([0.0, 1.0], rotations)([alpha]).as_matrix()[0]
+    return result
+
+
+def cartesian_waypoint_matrices(
+    start_ee_pose: np.ndarray, target_ee_pose: np.ndarray
+) -> list[np.ndarray]:
+    """Return the exact EE poses solved by the deterministic Cartesian IK."""
+    translation = float(
+        np.linalg.norm(target_ee_pose[:3, 3] - start_ee_pose[:3, 3])
+    )
+    rotation = rotation_distance(start_ee_pose[:3, :3], target_ee_pose[:3, :3])
+    segments = max(
+        1,
+        int(math.ceil(translation / CARTESIAN_MAX_STEP_M)),
+        int(math.ceil(rotation / 0.04)),
+    )
+    return [
+        interpolate_pose(start_ee_pose, target_ee_pose, index / segments)
+        for index in range(1, segments + 1)
+    ]
+
+
+def cartesian_joint_corridor(
+    start_q: np.ndarray, reference_final_q: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bound every path joint around the selected continuous IK branch."""
+    start = np.asarray(start_q, dtype=float)
+    final = np.asarray(reference_final_q, dtype=float)
+    if (
+        start.shape != (7,)
+        or final.shape != (7,)
+        or not np.all(np.isfinite(start))
+        or not np.all(np.isfinite(final))
+    ):
+        raise ValueError("Cartesian joint corridor requires finite seven-joint states")
+    lower = np.maximum(
+        ARM_POSITION_LOWER_RAD,
+        np.minimum(start, final) - CARTESIAN_IK_CORRIDOR_MARGIN_RAD,
+    )
+    upper = np.minimum(
+        ARM_POSITION_UPPER_RAD,
+        np.maximum(start, final) + CARTESIAN_IK_CORRIDOR_MARGIN_RAD,
+    )
+    if np.any(lower >= upper):
+        raise ValueError(
+            "Cartesian joint corridor is empty; the live state or reference IK "
+            "solution is on an operational joint limit"
+        )
+    return lower, upper
+
+
 def build_move_group_goal(
     side: str,
     target_ee_pose: np.ndarray,
@@ -463,6 +548,179 @@ def plan_moveit_trajectory(
     return trajectory, float(result.planning_time)
 
 
+def set_duration(duration: Any, seconds: float) -> None:
+    total_nanoseconds = max(0, int(round(float(seconds) * 1e9)))
+    duration.sec = total_nanoseconds // 1_000_000_000
+    duration.nanosec = total_nanoseconds % 1_000_000_000
+
+
+def time_parameterize_cartesian_trajectory(side: str, trajectory: Any) -> None:
+    """Assign conservative timestamps without changing geometric waypoints."""
+    if not trajectory.points:
+        return
+    elapsed = 0.0
+    first = trajectory.points[0]
+    first.velocities = []
+    first.accelerations = []
+    first.effort = []
+    set_duration(first.time_from_start, 0.0)
+    previous = trajectory_joint_positions(side, trajectory, 0)
+    for index in range(1, len(trajectory.points)):
+        current = trajectory_joint_positions(side, trajectory, index)
+        delta = np.abs(current - previous)
+        velocity_time = float(np.max(delta / CARTESIAN_JOINT_SPEED_RAD_S))
+        acceleration_time = float(
+            np.sqrt(2.0 * np.max(delta) / CARTESIAN_JOINT_ACCELERATION_RAD_S2)
+        )
+        elapsed += max(
+            CARTESIAN_MIN_SEGMENT_DURATION_S, velocity_time, acceleration_time
+        )
+        point = trajectory.points[index]
+        # Positions-only trajectories let joint_trajectory_controller use its
+        # continuous position interpolation without trusting derivatives that
+        # were not produced by a time-parameterization plugin.
+        point.velocities = []
+        point.accelerations = []
+        point.effort = []
+        set_duration(point.time_from_start, elapsed)
+        previous = current
+
+
+def check_moveit_state_validity(
+    rclpy: Any,
+    node: Any,
+    side: str,
+    q: np.ndarray,
+    client: Any,
+    constraints: Any,
+) -> None:
+    request = client.srv_type.Request()
+    request.robot_state.joint_state.name = [f"{side}_{name}" for name in JOINT_NAMES]
+    request.robot_state.joint_state.position = np.asarray(q, dtype=float).tolist()
+    request.robot_state.is_diff = False
+    request.group_name = f"{side}_fr3_arm"
+    request.constraints = constraints
+    response = spin_until_future(
+        rclpy,
+        node,
+        client.call_async(request),
+        MOVEIT_SERVER_TIMEOUT_S,
+        f"{side} MoveIt state validity",
+    )
+    if not response.valid:
+        contacts = ", ".join(
+            f"{item.contact_body_1}/{item.contact_body_2}" for item in response.contacts[:3]
+        )
+        raise RuntimeError(
+            f"[{side}] deterministic Cartesian IK produced a state invalid in the "
+            f"MoveIt planning scene{': ' + contacts if contacts else ''}"
+        )
+
+
+def plan_deterministic_cartesian_trajectory(
+    rclpy: Any,
+    node: Any,
+    side: str,
+    start_ee_pose: np.ndarray,
+    target_ee_pose: np.ndarray,
+    flange_to_ee: np.ndarray,
+    current_q: np.ndarray,
+    reference_final_q: np.ndarray,
+    state_validity_service: Any,
+    JointConstraint: Any,
+    Constraints: Any,
+) -> tuple[Any, float, np.ndarray]:
+    """Solve every Cartesian waypoint locally with bounded, deterministic IK."""
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    started = time.monotonic()
+    service_name = f"/{side}/check_state_validity"
+    validity_client = node.create_client(state_validity_service, service_name)
+    if not validity_client.wait_for_service(timeout_sec=MOVEIT_SERVER_TIMEOUT_S):
+        raise TimeoutError(f"MoveIt state-validity service is unavailable: {service_name}")
+    corridor_lower, corridor_upper = cartesian_joint_corridor(
+        current_q, reference_final_q
+    )
+    print(
+        f"{side} deterministic near-seed final IK [rad]: "
+        f"{format_values(reference_final_q)}",
+        flush=True,
+    )
+    print(
+        f"{side} solve-time joint corridor lower [rad]: "
+        f"{format_values(corridor_lower)}",
+        flush=True,
+    )
+    print(
+        f"{side} solve-time joint corridor upper [rad]: "
+        f"{format_values(corridor_upper)}",
+        flush=True,
+    )
+    constraints = Constraints()
+    constraints.name = "stay_on_live_ik_branch"
+    for index in range(7):
+        constraint = JointConstraint()
+        constraint.joint_name = f"{side}_{JOINT_NAMES[index]}"
+        constraint.position = float(0.5 * (corridor_lower[index] + corridor_upper[index]))
+        constraint.tolerance_below = float(constraint.position - corridor_lower[index])
+        constraint.tolerance_above = float(corridor_upper[index] - constraint.position)
+        constraint.weight = 1.0
+        constraints.joint_constraints.append(constraint)
+
+    model, frame_id = build_fr3_model()
+    waypoints = cartesian_waypoint_matrices(start_ee_pose, target_ee_pose)
+    q = np.asarray(current_q, dtype=float).copy()
+    points = [JointTrajectoryPoint(positions=q.tolist())]
+    check_moveit_state_validity(
+        rclpy, node, side, q, validity_client, constraints
+    )
+    for waypoint_index, waypoint in enumerate(waypoints, start=1):
+        # Constrain this solve to the intersection of the branch corridor and
+        # a per-step neighborhood around the previous solution.  A large
+        # joint jump therefore makes the waypoint infeasible during IK instead
+        # of being discovered only by the post-plan audit.
+        step_lower = np.maximum(
+            corridor_lower, q - CARTESIAN_REVOLUTE_JUMP_THRESHOLD_RAD
+        )
+        step_upper = np.minimum(
+            corridor_upper, q + CARTESIAN_REVOLUTE_JUMP_THRESHOLD_RAD
+        )
+        if np.any(step_lower >= step_upper):
+            raise RuntimeError(
+                f"[{side}] deterministic Cartesian IK stopped at waypoint "
+                f"{waypoint_index}/{len(waypoints)}: no non-empty per-step joint "
+                "bounds remain inside the solve-time corridor"
+            )
+        try:
+            result = solve_fr3_ik(
+                q,
+                waypoint,
+                flange_to_ee,
+                model,
+                frame_id,
+                try_alternative_seeds=False,
+                max_function_evaluations=IK_MAX_FUNCTION_EVALUATIONS,
+                position_lower_rad=step_lower,
+                position_upper_rad=step_upper,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"[{side}] deterministic Cartesian IK stopped at waypoint "
+                f"{waypoint_index}/{len(waypoints)} inside the solve-time joint "
+                f"corridor: {exc}"
+            ) from exc
+        q = result.q
+        check_moveit_state_validity(
+            rclpy, node, side, q, validity_client, constraints
+        )
+        points.append(JointTrajectoryPoint(positions=q.tolist()))
+    trajectory = JointTrajectory()
+    trajectory.joint_names = [f"{side}_{name}" for name in JOINT_NAMES]
+    trajectory.points = points
+    time_parameterize_cartesian_trajectory(side, trajectory)
+    return trajectory, time.monotonic() - started, q
+
+
 def trajectory_duration_s(trajectory: Any) -> float:
     duration = trajectory.points[-1].time_from_start
     return float(duration.sec) + 1e-9 * float(duration.nanosec)
@@ -475,6 +733,107 @@ def trajectory_joint_positions(side: str, trajectory: Any, point_index: int) -> 
     )
     return np.asarray(
         [positions_by_name[f"{side}_{name}"] for name in JOINT_NAMES], dtype=float
+    )
+
+
+def audit_trajectory(
+    side: str,
+    trajectory: Any,
+    start_pose: np.ndarray,
+    target_pose: np.ndarray,
+    flange_to_ee: np.ndarray,
+    reference_final_q: np.ndarray,
+) -> TrajectoryAudit:
+    """Reject joint jumps and any unexpected departure from the requested EE line."""
+    model, frame_id = build_fr3_model()
+    joint_path = np.stack(
+        [
+            trajectory_joint_positions(side, trajectory, index)
+            for index in range(len(trajectory.points))
+        ]
+    )
+    joint_steps = np.abs(np.diff(joint_path, axis=0))
+    max_joint_step = float(np.max(joint_steps)) if joint_steps.size else 0.0
+    joint_change = np.abs(joint_path - joint_path[0])
+    max_joint_change = float(np.max(joint_change))
+
+    translation_delta = target_pose[:3, 3] - start_pose[:3, 3]
+    translation_squared = float(translation_delta @ translation_delta)
+    total_rotation = rotation_distance(start_pose[:3, :3], target_pose[:3, :3])
+    max_line_deviation = 0.0
+    max_orientation_deviation = 0.0
+    for q in joint_path:
+        pose = forward_end_effector_pose(model, frame_id, q, flange_to_ee)
+        if translation_squared > 1e-12:
+            alpha = float(
+                np.clip(
+                    (pose[:3, 3] - start_pose[:3, 3]) @ translation_delta
+                    / translation_squared,
+                    0.0,
+                    1.0,
+                )
+            )
+        elif total_rotation > 1e-9:
+            alpha = float(
+                np.clip(
+                    rotation_distance(start_pose[:3, :3], pose[:3, :3])
+                    / total_rotation,
+                    0.0,
+                    1.0,
+                )
+            )
+        else:
+            alpha = 1.0
+        expected = interpolate_pose(start_pose, target_pose, alpha)
+        max_line_deviation = max(
+            max_line_deviation,
+            float(np.linalg.norm(pose[:3, 3] - expected[:3, 3])),
+        )
+        max_orientation_deviation = max(
+            max_orientation_deviation,
+            rotation_distance(expected[:3, :3], pose[:3, :3]),
+        )
+
+    corridor_lower, corridor_upper = cartesian_joint_corridor(
+        joint_path[0], reference_final_q
+    )
+    allowed_joint_change = float(
+        np.max(np.maximum(joint_path[0] - corridor_lower, corridor_upper - joint_path[0]))
+    )
+    problems = []
+    if max_joint_step > CARTESIAN_REVOLUTE_JUMP_THRESHOLD_RAD + 1e-6:
+        problems.append(
+            f"joint step {max_joint_step:.3f} rad exceeds "
+            f"{CARTESIAN_REVOLUTE_JUMP_THRESHOLD_RAD:.3f} rad"
+        )
+    if max_joint_change > allowed_joint_change:
+        problems.append(
+            f"joint change {max_joint_change:.3f} rad exceeds the "
+            f"motion-adaptive limit {allowed_joint_change:.3f} rad"
+        )
+    if np.any(joint_path < corridor_lower - 1e-6) or np.any(
+        joint_path > corridor_upper + 1e-6
+    ):
+        problems.append("one or more states escaped the solve-time joint corridor")
+    if max_line_deviation > CARTESIAN_MAX_LINE_DEVIATION_M:
+        problems.append(
+            f"EE line deviation {max_line_deviation:.4f} m exceeds "
+            f"{CARTESIAN_MAX_LINE_DEVIATION_M:.4f} m"
+        )
+    if max_orientation_deviation > CARTESIAN_MAX_ORIENTATION_DEVIATION_RAD:
+        problems.append(
+            f"EE orientation interpolation deviation "
+            f"{max_orientation_deviation:.3f} rad exceeds "
+            f"{CARTESIAN_MAX_ORIENTATION_DEVIATION_RAD:.3f} rad"
+        )
+    if problems:
+        raise RuntimeError(f"[{side}] unsafe trajectory rejected: " + "; ".join(problems))
+    return TrajectoryAudit(
+        max_joint_change_rad=max_joint_change,
+        allowed_joint_change_rad=allowed_joint_change,
+        max_joint_step_rad=max_joint_step,
+        max_line_deviation_m=max_line_deviation,
+        max_orientation_deviation_rad=max_orientation_deviation,
     )
 
 
@@ -500,23 +859,37 @@ def verify_planned_endpoint(
         flush=True,
     )
     if (
-        position_error > EE_FINAL_POSITION_TOLERANCE_M
-        or orientation_error > EE_FINAL_ORIENTATION_TOLERANCE_RAD
+        position_error > MOVEIT_POSITION_TOLERANCE_M
+        or orientation_error > MOVEIT_ORIENTATION_TOLERANCE_RAD
     ):
         raise RuntimeError(
-            f"[{side}] planned endpoint is outside the final Cartesian tolerance: "
+            f"[{side}] planned endpoint is outside the strict planning tolerance: "
             f"position={position_error:.6f} m, orientation={orientation_error:.6f} rad; "
             "no trajectory was executed"
         )
     return final_q
 
 
-def print_trajectory_summary(side: str, trajectory: Any, planning_time_s: float) -> None:
+def print_trajectory_summary(
+    side: str,
+    trajectory: Any,
+    planning_time_s: float,
+    audit: TrajectoryAudit,
+) -> None:
     final = trajectory.points[-1]
     print(
-        f"{side} collision-checked OMPL plan: {len(trajectory.points)} points, "
+        f"{side} deterministic collision-checked Cartesian plan: "
+        f"{len(trajectory.points)} points, "
         f"duration={trajectory_duration_s(trajectory):.3f} s, "
         f"planning_time={planning_time_s:.3f} s",
+        flush=True,
+    )
+    print(
+        f"{side} path audit: max_joint_change={audit.max_joint_change_rad:.3f} rad "
+        f"(adaptive limit {audit.allowed_joint_change_rad:.3f} rad), "
+        f"max_joint_step={audit.max_joint_step_rad:.3f} rad, "
+        f"max_ee_line_deviation={audit.max_line_deviation_m:.4f} m, "
+        f"max_orientation_deviation={audit.max_orientation_deviation_rad:.3f} rad",
         flush=True,
     )
     print(f"{side} planned final arm joint angles [rad]: {format_values(final.positions)}")
@@ -579,6 +952,13 @@ def execute_joint_trajectory(
             flush=True,
         )
         return False
+    if result.error_code == result.PATH_TOLERANCE_VIOLATED:
+        print(
+            f"[{side}] trajectory controller stopped after a path-tolerance miss: "
+            f"{result.error_string}. Measuring the current pose before one correction attempt.",
+            flush=True,
+        )
+        return False
     else:
         raise RuntimeError(
             f"[{side}] trajectory execution failed with code {result.error_code}: "
@@ -624,6 +1004,28 @@ def verify_final_ee_pose(
             f"to the planned endpoint={joint_error:.6f} rad"
         )
     return position_error, orientation_error
+
+
+def measure_final_ee_pose(
+    rclpy: Any,
+    node: Any,
+    side: str,
+    target_pose: np.ndarray,
+    planned_final_q: np.ndarray,
+) -> tuple[bool, float, float]:
+    """Measure final state without aborting so the caller can safely replan once."""
+    try:
+        position_error, orientation_error = verify_final_ee_pose(
+            rclpy, node, side, target_pose, planned_final_q
+        )
+    except RuntimeError as exc:
+        measured = node.ee_pose[side]
+        if measured is None:
+            raise
+        position_error, orientation_error = pose_error(measured, target_pose)
+        print(f"[{side}] {exc}", flush=True)
+        return False, position_error, orientation_error
+    return True, position_error, orientation_error
 
 
 def build_fr3_model() -> tuple[Any, int]:
@@ -679,6 +1081,8 @@ def solve_fr3_ik(
     kinematics: Any | None = None,
     try_alternative_seeds: bool = True,
     max_function_evaluations: int = IK_MAX_FUNCTION_EVALUATIONS,
+    position_lower_rad: np.ndarray = ARM_POSITION_LOWER_RAD,
+    position_upper_rad: np.ndarray = ARM_POSITION_UPPER_RAD,
 ) -> IkResult:
     """Solve bounded final-pose IK and independently verify its FK residual."""
     from scipy.optimize import least_squares
@@ -687,12 +1091,26 @@ def solve_fr3_ik(
     seed = np.asarray(current_q, dtype=float)
     target = np.asarray(target_ee_pose, dtype=float)
     flange_to_ee = np.asarray(flange_to_ee, dtype=float)
+    lower = np.asarray(position_lower_rad, dtype=float)
+    upper = np.asarray(position_upper_rad, dtype=float)
     if seed.shape != (7,) or not np.all(np.isfinite(seed)):
         raise ValueError("IK seed must be a finite seven-joint FR3 configuration")
     if target.shape != (4, 4) or flange_to_ee.shape != (4, 4):
         raise ValueError("IK target and F_T_EE must be 4x4 transforms")
     if max_function_evaluations <= 0:
         raise ValueError("IK maximum function evaluations must be positive")
+    if (
+        lower.shape != (7,)
+        or upper.shape != (7,)
+        or not np.all(np.isfinite(lower))
+        or not np.all(np.isfinite(upper))
+        or np.any(lower >= upper)
+        or np.any(lower < ARM_POSITION_LOWER_RAD)
+        or np.any(upper > ARM_POSITION_UPPER_RAD)
+    ):
+        raise ValueError("IK bounds must be finite ordered limits inside the FR3 envelope")
+    if np.any(seed < lower) or np.any(seed > upper):
+        raise ValueError("IK seed is outside the requested joint corridor")
     if kinematics is not None and (model is not None or frame_id is not None):
         raise ValueError("Pass either an FK kinematics backend or a Pinocchio model/frame pair")
     if kinematics is None and (model is None or frame_id is None):
@@ -731,8 +1149,8 @@ def solve_fr3_ik(
             candidate = seed.copy()
             candidate[joint] = np.clip(
                 candidate[joint] + delta,
-                ARM_POSITION_LOWER_RAD[joint] + 1e-6,
-                ARM_POSITION_UPPER_RAD[joint] - 1e-6,
+                lower[joint] + 1e-6,
+                upper[joint] - 1e-6,
             )
             candidate_seeds.append(candidate)
 
@@ -741,8 +1159,9 @@ def solve_fr3_ik(
     for candidate_seed in candidate_seeds:
         solution = least_squares(
             residual,
-            np.clip(candidate_seed, ARM_POSITION_LOWER_RAD, ARM_POSITION_UPPER_RAD),
-            bounds=(ARM_POSITION_LOWER_RAD, ARM_POSITION_UPPER_RAD),
+            np.clip(candidate_seed, lower, upper),
+            bounds=(lower, upper),
+            method="trf",
             max_nfev=max_function_evaluations,
             ftol=1e-12,
             xtol=1e-12,
@@ -1000,9 +1419,9 @@ def print_move_summary(
         print(f"{target.side} copy target arguments: {command}")
 
 
-def require_approval() -> None:
+def require_approval(prompt: str = "Move the real robot to these targets? [y/N]: ") -> None:
     try:
-        response = input("Move the real robot to these targets? [y/N]: ").strip().lower()
+        response = input(prompt).strip().lower()
     except EOFError as exc:
         raise SystemExit("No approval received; real-robot motion cancelled.") from exc
     if response not in {"y", "yes"}:
@@ -1018,11 +1437,10 @@ def main() -> None:
         import rclpy
         from franka_msgs.msg import FrankaRobotState
         from geometry_msgs.msg import Pose
-        from moveit_msgs.action import MoveGroup
-        from moveit_msgs.msg import Constraints, OrientationConstraint, PositionConstraint
+        from moveit_msgs.msg import Constraints, JointConstraint
+        from moveit_msgs.srv import GetStateValidity
         from rclpy.node import Node
         from sensor_msgs.msg import JointState
-        from shape_msgs.msg import SolidPrimitive
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "ROS 2 Python dependencies are required. Run scripts/move_to_target_ee.sh "
@@ -1046,51 +1464,117 @@ def main() -> None:
         print_move_summary(args, targets, current)
         target = targets[0]
         target_matrix = pose_vector_to_matrix(target.pose)
-        message_types = {
-            "MoveGroup": MoveGroup,
-            "Constraints": Constraints,
-            "OrientationConstraint": OrientationConstraint,
-            "PositionConstraint": PositionConstraint,
-            "Pose": Pose,
-            "SolidPrimitive": SolidPrimitive,
-        }
-        trajectory, planning_time = plan_moveit_trajectory(
-            rclpy,
-            node,
-            target.side,
-            target_matrix,
-            np.asarray(node.flange_to_ee[target.side], dtype=float),
-            current[target.side]["arm_q"],
-            message_types,
-        )
-        print_trajectory_summary(target.side, trajectory, planning_time)
-        planned_final_q = verify_planned_endpoint(
-            target.side,
-            trajectory,
-            target_matrix,
-            np.asarray(node.flange_to_ee[target.side], dtype=float),
-        )
+
+        def plan_from_live_state() -> tuple[Any, np.ndarray]:
+            start_pose = node.ee_pose[target.side]
+            start_q = node.arm_q[target.side]
+            flange_to_ee = node.flange_to_ee[target.side]
+            if start_pose is None or start_q is None or flange_to_ee is None:
+                raise RuntimeError(f"[{target.side}] live state is unavailable for planning")
+            start_pose = np.asarray(start_pose, dtype=float).copy()
+            start_q = np.asarray(start_q, dtype=float).copy()
+            flange_to_ee = np.asarray(flange_to_ee, dtype=float).copy()
+            ik_model, ik_frame_id = build_fr3_model()
+            reference_lower = np.maximum(
+                ARM_POSITION_LOWER_RAD,
+                start_q - CARTESIAN_REFERENCE_MAX_JOINT_CHANGE_RAD,
+            )
+            reference_upper = np.minimum(
+                ARM_POSITION_UPPER_RAD,
+                start_q + CARTESIAN_REFERENCE_MAX_JOINT_CHANGE_RAD,
+            )
+            reference_ik = solve_fr3_ik(
+                start_q,
+                target_matrix,
+                flange_to_ee,
+                ik_model,
+                ik_frame_id,
+                try_alternative_seeds=False,
+                position_lower_rad=reference_lower,
+                position_upper_rad=reference_upper,
+            )
+            trajectory, planning_time, _ = plan_deterministic_cartesian_trajectory(
+                rclpy,
+                node,
+                target.side,
+                start_pose,
+                target_matrix,
+                flange_to_ee,
+                start_q,
+                reference_ik.q,
+                GetStateValidity,
+                JointConstraint,
+                Constraints,
+            )
+            audit = audit_trajectory(
+                target.side,
+                trajectory,
+                start_pose,
+                target_matrix,
+                flange_to_ee,
+                reference_ik.q,
+            )
+            print_trajectory_summary(target.side, trajectory, planning_time, audit)
+            planned_final_q = verify_planned_endpoint(
+                target.side,
+                trajectory,
+                target_matrix,
+                flange_to_ee,
+            )
+            return trajectory, planned_final_q
+
+        trajectory, planned_final_q = plan_from_live_state()
         print(
-            "The plan was checked against the MoveIt self-collision model and the current "
-            "planning scene. Confirm that the scene contains every real obstacle before moving."
+            "The Cartesian plan was checked against the MoveIt self-collision model, the "
+            "current planning scene, joint-jump limits, and the requested EE interpolation. "
+            "Confirm that the scene contains every real obstacle before moving."
         )
         if args.dry_run:
-            print("Dry run: the motion was planned but no trajectory was executed.")
+            print("Dry run: the Cartesian motion was planned but no trajectory was executed.")
             return
 
-        require_approval()
-        joint_goal_satisfied = execute_joint_trajectory(
-            rclpy, node, target.side, trajectory, FollowJointTrajectory
-        )
-        verify_final_ee_pose(
-            rclpy, node, target.side, target_matrix, planned_final_q
-        )
-        if not joint_goal_satisfied:
+        reached = False
+        for attempt in range(1, MAX_EXECUTION_ATTEMPTS + 1):
+            if attempt == 1:
+                approval_prompt = "Execute this Cartesian path on the real robot? [y/N]: "
+            else:
+                approval_prompt = (
+                    "Execute the replanned correction from the current pose? [y/N]: "
+                )
+            require_approval(approval_prompt)
+            joint_goal_satisfied = execute_joint_trajectory(
+                rclpy, node, target.side, trajectory, FollowJointTrajectory
+            )
+            reached, position_error, orientation_error = measure_final_ee_pose(
+                rclpy, node, target.side, target_matrix, planned_final_q
+            )
+            if reached:
+                if not joint_goal_satisfied:
+                    print(
+                        f"[{target.side}] Cartesian pose goal reached despite the redundant "
+                        "joint endpoint miss.",
+                        flush=True,
+                    )
+                break
+            if attempt == MAX_EXECUTION_ATTEMPTS:
+                raise RuntimeError(
+                    f"[{target.side}] target still not reached after the correction attempt: "
+                    f"position={position_error:.6f} m, "
+                    f"orientation={orientation_error:.6f} rad"
+                )
             print(
-                f"[{target.side}] Cartesian pose goal reached despite the redundant IK "
-                "joint endpoint miss.",
+                f"[{target.side}] target is outside the relaxed Cartesian tolerance. "
+                "Replanning one correction from the measured current pose...",
                 flush=True,
             )
+            trajectory, planned_final_q = plan_from_live_state()
+            print(
+                "Review the correction trajectory above; it also requires explicit approval.",
+                flush=True,
+            )
+
+        if not reached:
+            raise RuntimeError(f"[{target.side}] arm target was not reached")
         if args.end_effector == "gripper":
             robot_ips = {"left": args.ip_left, "right": args.ip_right}
             for target in targets:

@@ -9,11 +9,27 @@ from typing import Any, Sequence
 import numpy as np
 
 
-COMMAND_FORMAT = "real_exp_wuji_grasp_command_v1"
+COMMAND_FORMAT = "real_exp_wuji_grasp_command_v2"
+INFERENCE_REQUEST_FORMAT = "real_exp_camera_grasp_request_v1"
+INFERENCE_RESPONSE_FORMAT = "real_exp_camera_grasp_response_v1"
 WUJI_RIGHT_JOINT_NAMES = tuple(
     f"right_finger{finger}_joint{joint}"
     for finger in range(1, 6)
     for joint in range(1, 5)
+)
+WUJI_COMMAND_HAND_MODEL = "wuji_hand_2"
+WUJI_COMMAND_JOINT_CONVENTION = "wuji_sdk_firmware_order"
+WUJI_COMMAND_SOURCE_MODEL = "wuji_hand_v1_robodex"
+WUJI_COMMAND_CONVERSION = "wuji_hand_v1_robodex_to_wuji_hand_2_lateral_sign_v1"
+# The first-generation RoboDex model and the Wuji Hand 2 firmware use opposite
+# positive axes for the MCP abduction/adduction joint of the four non-thumb
+# fingers. Their remaining joint axes do not require a sign change. This is a
+# temporary model-boundary conversion until grasp inference uses Hand 2 geometry.
+WUJI_V1_TO_HAND2_NEGATED_JOINT_NAMES = (
+    "right_finger2_joint2",
+    "right_finger3_joint2",
+    "right_finger4_joint2",
+    "right_finger5_joint2",
 )
 EE_POSITION_LOWER_M = np.asarray([-0.40, -1.00, -0.60], dtype=np.float64)
 EE_POSITION_UPPER_M = np.asarray([1.00, 1.00, 1.20], dtype=np.float64)
@@ -130,6 +146,21 @@ def reorder_wuji_joints(joints: np.ndarray, names: Sequence[str]) -> np.ndarray:
     return ordered
 
 
+def wuji_v1_model_to_hand2_firmware(joints: np.ndarray) -> np.ndarray:
+    """Convert canonical RoboDex/Wuji-v1 angles to Hand 2 SDK firmware angles.
+
+    Input and output both use finger-major ``finger1..5 x joint1..4`` ordering.
+    Only the four non-thumb lateral joints change sign.
+    """
+    converted = np.asarray(joints, dtype=np.float64).reshape(-1).copy()
+    if converted.shape != (20,) or not np.all(np.isfinite(converted)):
+        raise ValueError("Wuji v1-to-Hand-2 conversion requires 20 finite joint angles")
+    name_to_index = {name: index for index, name in enumerate(WUJI_RIGHT_JOINT_NAMES)}
+    for name in WUJI_V1_TO_HAND2_NEGATED_JOINT_NAMES:
+        converted[name_to_index[name]] *= -1.0
+    return converted
+
+
 def validate_command(command: Any, *, max_age_s: float, expected_side: str) -> dict[str, Any]:
     if not isinstance(command, dict) or command.get("format") != COMMAND_FORMAT:
         raise ValueError(f"command format must be {COMMAND_FORMAT!r}")
@@ -138,6 +169,17 @@ def validate_command(command: Any, *, max_age_s: float, expected_side: str) -> d
         raise ValueError("command_id must be a non-empty string of at most 128 characters")
     if command.get("side") != expected_side:
         raise ValueError(f"server only accepts side={expected_side!r}")
+    expected_contract = {
+        "hand_model": WUJI_COMMAND_HAND_MODEL,
+        "hand_joint_convention": WUJI_COMMAND_JOINT_CONVENTION,
+        "hand_joint_source_model": WUJI_COMMAND_SOURCE_MODEL,
+        "hand_joint_conversion": WUJI_COMMAND_CONVERSION,
+    }
+    for field, expected in expected_contract.items():
+        if command.get(field) != expected:
+            raise ValueError(
+                f"command {field} must be {expected!r}, got {command.get(field)!r}"
+            )
     created = float(command.get("created_unix_s", float("nan")))
     age = time.time() - created
     if not math.isfinite(created) or age < -5.0 or age > max_age_s:
@@ -161,3 +203,23 @@ def validate_command(command: Any, *, max_age_s: float, expected_side: str) -> d
     normalized["ee_pose_xyz_rpy"] = pose
     normalized["hand_joints"] = canonical_joints
     return normalized
+
+
+def validate_inference_request(
+    request: Any, *, max_age_s: float, expected_side: str
+) -> dict[str, Any]:
+    """Validate a control-host request to start one camera inference."""
+    if not isinstance(request, dict) or request.get("format") != INFERENCE_REQUEST_FORMAT:
+        raise ValueError(f"request format must be {INFERENCE_REQUEST_FORMAT!r}")
+    request_id = request.get("request_id")
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+        raise ValueError("request_id must be a non-empty string of at most 128 characters")
+    if request.get("action") != "infer_grasp":
+        raise ValueError("request action must be 'infer_grasp'")
+    if request.get("side") != expected_side:
+        raise ValueError(f"inference server only accepts side={expected_side!r}")
+    created = float(request.get("created_unix_s", float("nan")))
+    age = time.time() - created
+    if not math.isfinite(created) or age < -5.0 or age > max_age_s:
+        raise ValueError(f"request timestamp is stale or invalid (age={age:.3f}s)")
+    return dict(request)

@@ -30,9 +30,18 @@ Examples:
   ./scripts/move_to_target_ee.sh --right --gripper \
     --target-ee-pose 0.45 -0.20 0.35 3.14 0 0 --target-ee-joint 0.06
 
-The utility uses MoveIt/OMPL to produce a self-collision- and planning-scene-
-checked joint trajectory, previews the plan, and then requires explicit y/yes
-confirmation before FollowJointTrajectory execution.
+The utility deterministically solves a collision-checked Cartesian path: EE
+translation is linearly interpolated and orientation follows the shortest rotation. It
+rejects partial paths, large joint jumps, excessive joint travel, and paths
+that depart from the requested EE interpolation. Joint travel is constrained
+during bounded, previous-solution-seeded Cartesian IK relative to the live
+configuration. Every generated state is checked against MoveIt's planning scene,
+then independently audited afterward. It previews the plan and requires explicit
+y/yes confirmation before FollowJointTrajectory execution.
+
+Measured execution succeeds within 20 mm and 0.08 rad. If the first execution
+does not reach that tolerance, the utility replans once from the measured
+current pose, previews the correction, and requires a second confirmation.
 
 Only obstacles already published into the selected arm's MoveIt planning scene
 are checked. This launcher does not infer tables, fixtures, people, or the other

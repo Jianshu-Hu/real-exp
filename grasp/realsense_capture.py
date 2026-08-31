@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Capture one aligned D435 RGB-D frame for the lerobot inference process."""
+"""Capture and temporally fuse aligned D435 RGB-D frames for inference."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,26 @@ def _intrinsics_dict(profile: Any) -> dict[str, Any]:
     }
 
 
+def _fuse_depth_frames(
+    depth_frames: list[np.ndarray], min_valid_depth_ratio: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a per-pixel valid-only median and its temporal support count."""
+    if not depth_frames:
+        raise ValueError("at least one depth frame is required")
+    stack = np.stack(depth_frames, axis=0)
+    if stack.ndim != 3:
+        raise ValueError(f"depth frames must be 2-D and equally shaped, got {stack.shape}")
+
+    valid = stack != 0
+    valid_count = valid.sum(axis=0)
+    required_count = math.ceil(len(depth_frames) * min_valid_depth_ratio)
+    masked = np.ma.array(stack, mask=~valid)
+    fused = np.ma.median(masked, axis=0).filled(0)
+    fused = np.rint(fused).astype(stack.dtype, copy=False)
+    fused[valid_count < required_count] = 0
+    return fused, valid_count
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -33,7 +54,17 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--warmup-frames", type=int, default=30)
+    parser.add_argument("--observation-frames", type=int, default=15)
+    parser.add_argument("--min-valid-depth-ratio", type=float, default=0.5)
     args = parser.parse_args()
+    if args.width <= 0 or args.height <= 0 or args.fps <= 0:
+        parser.error("camera width, height, and fps must be positive")
+    if args.warmup_frames < 0:
+        parser.error("warmup-frames must be non-negative")
+    if args.observation_frames <= 0:
+        parser.error("observation-frames must be positive")
+    if not 0.0 < args.min_valid_depth_ratio <= 1.0:
+        parser.error("min-valid-depth-ratio must be in (0, 1]")
 
     try:
         import pyrealsense2 as rs
@@ -53,19 +84,50 @@ def main() -> int:
     try:
         for _ in range(args.warmup_frames):
             pipeline.wait_for_frames()
-        aligned = align.process(pipeline.wait_for_frames())
-        color_frame = aligned.get_color_frame()
-        depth_frame = aligned.get_depth_frame()
-        if not color_frame or not depth_frame:
-            raise RuntimeError("D435 returned an incomplete aligned RGB-D frame")
-        rgb = np.asanyarray(color_frame.get_data()).copy()
-        depth = np.asanyarray(depth_frame.get_data()).copy()
+        depth_frames: list[np.ndarray] = []
+        color_timestamps_ms: list[float] = []
+        depth_timestamps_ms: list[float] = []
+        rgb: np.ndarray | None = None
+        color_frame = None
+        while len(depth_frames) < args.observation_frames:
+            aligned = align.process(pipeline.wait_for_frames())
+            color_frame = aligned.get_color_frame()
+            depth_frame = aligned.get_depth_frame()
+            if not color_frame or not depth_frame:
+                continue
+            rgb = np.asanyarray(color_frame.get_data()).copy()
+            depth_frames.append(np.asanyarray(depth_frame.get_data()).copy())
+            color_timestamps_ms.append(float(color_frame.get_timestamp()))
+            depth_timestamps_ms.append(float(depth_frame.get_timestamp()))
+
+        if rgb is None or color_frame is None:
+            raise RuntimeError("D435 returned no complete aligned RGB-D frames")
+        depth, valid_count = _fuse_depth_frames(
+            depth_frames, args.min_valid_depth_ratio
+        )
+        required_valid_frames = math.ceil(
+            args.observation_frames * args.min_valid_depth_ratio
+        )
         metadata = {
             "intrinsics": _intrinsics_dict(color_frame.profile.as_video_stream_profile()),
             "depth_scale_m": float(profile.get_device().first_depth_sensor().get_depth_scale()),
             "camera_serial": str(profile.get_device().get_info(rs.camera_info.serial_number)),
-            "color_timestamp_ms": float(color_frame.get_timestamp()),
-            "depth_timestamp_ms": float(depth_frame.get_timestamp()),
+            "color_timestamp_ms": color_timestamps_ms[-1],
+            "depth_timestamp_ms": depth_timestamps_ms[-1],
+            "observation": {
+                "frame_count": args.observation_frames,
+                "aggregation": "per_pixel_nonzero_median",
+                "min_valid_depth_ratio": args.min_valid_depth_ratio,
+                "required_valid_frames": required_valid_frames,
+                "retained_depth_pixels": int(np.count_nonzero(depth)),
+                "pixels_valid_in_all_frames": int(
+                    np.count_nonzero(valid_count == args.observation_frames)
+                ),
+                "first_depth_timestamp_ms": depth_timestamps_ms[0],
+                "last_depth_timestamp_ms": depth_timestamps_ms[-1],
+                "duration_ms": depth_timestamps_ms[-1] - depth_timestamps_ms[0],
+                "rgb_frame": "last_observation_frame",
+            },
             "source": "system_python_realsense",
         }
         np.save(args.output_dir / "rgb.npy", rgb)

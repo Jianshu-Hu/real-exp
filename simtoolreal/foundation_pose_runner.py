@@ -33,6 +33,18 @@ def _make_mask(frame_shape: tuple[int, int], roi: tuple[int, int, int, int]) -> 
     return mask
 
 
+def _normalize_estimator_geometry(estimator: Any) -> None:
+    """Keep FoundationPose crop projection inputs in the runtime's float32 dtype."""
+    # FoundationPose derives ``diameter`` from trimesh vertices as a NumPy
+    # float64. Its crop routine embeds that scalar in a torch tensor, which
+    # otherwise promotes the float32 pose candidates to float64 and makes the
+    # projection fail against the float32 RealSense intrinsics.
+    estimator.diameter = float(estimator.diameter)
+    if estimator.mesh is not None:
+        estimator.mesh._data["vertices"] = np.asarray(estimator.mesh.vertices, dtype=np.float32)
+        estimator.mesh._cache.clear()
+
+
 def _select_and_register(estimator: Any, K: np.ndarray, rgb: np.ndarray, depth: np.ndarray,
                          refine_iter: int, roi: tuple[int, int, int, int] | None) -> tuple[Any, np.ndarray | None]:
     import cv2
@@ -123,9 +135,7 @@ def _run_realsense(socket: Any, args: argparse.Namespace, stop: list[bool]) -> N
     scorer, refiner = ScorePredictor(), PoseRefinePredictor()
     estimator = FoundationPose(model_pts=mesh.vertices, model_normals=mesh.vertex_normals, mesh=mesh,
                                 scorer=scorer, refiner=refiner, glctx=dr.RasterizeCudaContext(), debug=0)
-    if estimator.mesh is not None:
-        estimator.mesh._data["vertices"] = np.asarray(estimator.mesh.vertices, dtype=np.float32)
-        estimator.mesh._cache.clear()
+    _normalize_estimator_geometry(estimator)
     pipeline, config = rs.pipeline(), rs.config()
     config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
     config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)

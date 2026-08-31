@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Move selected FR3 end effectors and optional grippers/Wuji hands to targets.
+"""Plan and execute a collision-aware FR3 move to an end-effector pose.
 
 Pose values are ``x,y,z,roll,pitch,yaw`` in the Franka base frame, using meters
-and radians. The same six-value target is sent to every selected side in duo
-mode. End-effector targets are one width or 20 hand joints and are likewise
-broadcast to every selected side.
+and radians. MoveIt/OMPL plans a collision-checked configuration-space path to
+the Cartesian goal and a FollowJointTrajectory controller executes it.
 
 Running this program without ``--dry-run`` commands real hardware.
 """
@@ -24,18 +23,14 @@ import numpy as np
 DEFAULT_LEFT_ROBOT_IP = "172.16.0.3"
 DEFAULT_RIGHT_ROBOT_IP = "172.16.0.2"
 JOINT_NAMES = [f"fr3_joint{index}" for index in range(1, 8)]
-ARM_PUBLISH_PERIOD_S = 0.02
-ARM_PRIME_DURATION_S = 0.5
-ARM_MAX_VELOCITY_RAD_PER_S = 0.10
-ARM_MAX_ACCELERATION_RAD_PER_S2 = 0.20
-ARM_TRACKING_GAIN_PER_S = 1.5
-# Keep this aligned with replay_lerobot_episode's first-phase gate. The ROS
-# joint-impedance controller can intentionally settle a few hundredths of a
-# radian from the published target while the measured velocity is already low.
-ARM_POSITION_TOLERANCE_RAD = 0.06
-ARM_VELOCITY_TOLERANCE_RAD_PER_S = 0.05
-ARM_STABLE_SAMPLES = 5
-ARM_MOVE_TIMEOUT_S = 120.0
+MOVEIT_PLANNING_TIME_S = 10.0
+MOVEIT_PLANNING_ATTEMPTS = 5
+MOVEIT_VELOCITY_SCALING = 0.20
+MOVEIT_ACCELERATION_SCALING = 0.15
+MOVEIT_POSITION_TOLERANCE_M = 0.002
+MOVEIT_ORIENTATION_TOLERANCE_RAD = 0.01
+MOVEIT_SERVER_TIMEOUT_S = 30.0
+TRAJECTORY_EXECUTION_MARGIN_S = 10.0
 EE_FINAL_POSITION_TOLERANCE_M = 0.01
 EE_FINAL_ORIENTATION_TOLERANCE_RAD = 0.03
 IK_POSITION_TOLERANCE_M = 5e-4
@@ -118,7 +113,6 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     side_group = parser.add_mutually_exclusive_group(required=True)
-    side_group.add_argument("--duo", dest="arm_mode", action="store_const", const="duo")
     side_group.add_argument("--left", dest="arm_mode", action="store_const", const="left")
     side_group.add_argument("--right", dest="arm_mode", action="store_const", const="right")
 
@@ -137,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="X,Y,Z,ROLL,PITCH,YAW",
         help=(
             "Target pose in meters/radians. Pass exactly 6 comma- or space-separated "
-            "values; in duo mode the target is sent to both sides."
+            "values. The pose is expressed in the selected FR3 base frame."
         ),
     )
     parser.add_argument(
@@ -148,7 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="VALUES",
         help=(
             "Target physical gripper width (1 value) or Wuji joint angles "
-            "(20 values). Omit with --arm. In duo mode the target is sent to both sides."
+            "(20 values). Omit with --arm."
         ),
     )
     parser.add_argument("--ip-left", default=DEFAULT_LEFT_ROBOT_IP)
@@ -171,10 +165,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def selected_sides(arm_mode: str) -> list[str]:
-    return ["left", "right"] if arm_mode == "duo" else [arm_mode]
-
-
 def resolve_targets(args: argparse.Namespace, parser: argparse.ArgumentParser) -> list[SideTarget]:
     pose_values = parse_target_values(args.target_ee_pose, "--target-ee-pose", parser)
     joint_values = (
@@ -182,7 +172,6 @@ def resolve_targets(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         if args.target_ee_joint is None
         else parse_target_values(args.target_ee_joint, "--target-ee-joint", parser)
     )
-    sides = selected_sides(args.arm_mode)
     expected_pose_values = 6
     if len(pose_values) != expected_pose_values:
         parser.error(
@@ -213,24 +202,12 @@ def resolve_targets(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             parser.error(
                 f"gripper target widths must be at most {MAX_FRANKA_GRIPPER_WIDTH_M:g} m"
             )
-    if args.end_effector == "hand" and args.arm_mode == "duo":
-        if not args.left_hand_ip or not args.right_hand_ip:
-            parser.error(
-                "--hand --duo requires both --left-hand-ip and --right-hand-ip "
-                "(or WUJI_LEFT_HAND_IP and WUJI_RIGHT_HAND_IP)"
-            )
-        if args.left_hand_ip == args.right_hand_ip:
-            parser.error("left and right Wuji hand addresses must differ")
-
-    targets: list[SideTarget] = []
     pose = np.asarray(pose_values, dtype=float)
-    for side in sides:
-        validate_pose(pose, side, parser)
-        joint = None
-        if joints_per_side:
-            joint = np.asarray(resolved_joint_values, dtype=float)
-        targets.append(SideTarget(side=side, pose=pose.copy(), end_effector_joint=joint))
-    return targets
+    validate_pose(pose, args.arm_mode, parser)
+    joint = None
+    if joints_per_side:
+        joint = np.asarray(resolved_joint_values, dtype=float)
+    return [SideTarget(side=args.arm_mode, pose=pose, end_effector_joint=joint)]
 
 
 def validate_pose(pose: np.ndarray, side: str, parser: argparse.ArgumentParser) -> None:
@@ -314,6 +291,339 @@ def pose_message_to_matrix(pose: Any) -> np.ndarray:
         [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
     ).as_matrix()
     return transform
+
+
+def matrix_to_pose_message(transform: np.ndarray, Pose: Any) -> Any:
+    """Convert a homogeneous transform to geometry_msgs/Pose."""
+    from scipy.spatial.transform import Rotation
+
+    matrix = np.asarray(transform, dtype=float).reshape(4, 4)
+    quaternion = Rotation.from_matrix(matrix[:3, :3]).as_quat()
+    message = Pose()
+    message.position.x, message.position.y, message.position.z = matrix[:3, 3].tolist()
+    (
+        message.orientation.x,
+        message.orientation.y,
+        message.orientation.z,
+        message.orientation.w,
+    ) = quaternion.tolist()
+    return message
+
+
+def build_move_group_goal(
+    side: str,
+    target_ee_pose: np.ndarray,
+    flange_to_ee: np.ndarray,
+    message_types: dict[str, Any],
+    current_q: np.ndarray | None = None,
+) -> Any:
+    """Create a plan-only OMPL request for the flange pose behind an EE goal."""
+    MoveGroup = message_types["MoveGroup"]
+    Constraints = message_types["Constraints"]
+    OrientationConstraint = message_types["OrientationConstraint"]
+    PositionConstraint = message_types["PositionConstraint"]
+    Pose = message_types["Pose"]
+    SolidPrimitive = message_types["SolidPrimitive"]
+
+    target_flange = np.asarray(target_ee_pose, dtype=float) @ np.linalg.inv(
+        np.asarray(flange_to_ee, dtype=float)
+    )
+    frame_id = f"{side}_fr3_link0"
+    link_name = f"{side}_fr3_link8"
+    target_pose = matrix_to_pose_message(target_flange, Pose)
+
+    primitive = SolidPrimitive()
+    primitive.type = SolidPrimitive.SPHERE
+    primitive.dimensions = [MOVEIT_POSITION_TOLERANCE_M]
+
+    position = PositionConstraint()
+    position.header.frame_id = frame_id
+    position.link_name = link_name
+    position.constraint_region.primitives = [primitive]
+    position.constraint_region.primitive_poses = [target_pose]
+    position.weight = 1.0
+
+    orientation = OrientationConstraint()
+    orientation.header.frame_id = frame_id
+    orientation.link_name = link_name
+    orientation.orientation = target_pose.orientation
+    orientation.absolute_x_axis_tolerance = MOVEIT_ORIENTATION_TOLERANCE_RAD
+    orientation.absolute_y_axis_tolerance = MOVEIT_ORIENTATION_TOLERANCE_RAD
+    orientation.absolute_z_axis_tolerance = MOVEIT_ORIENTATION_TOLERANCE_RAD
+    orientation.weight = 1.0
+
+    constraints = Constraints()
+    constraints.name = "target_end_effector_pose"
+    constraints.position_constraints = [position]
+    constraints.orientation_constraints = [orientation]
+
+    goal = MoveGroup.Goal()
+    goal.request.group_name = f"{side}_fr3_arm"
+    # Leave this empty to select the launch-configured OMPL pipeline.  MoveIt
+    # names the default pipeline from its parameter namespace on ROS 2 Humble.
+    goal.request.pipeline_id = ""
+    goal.request.planner_id = "RRTConnectkConfigDefault"
+    goal.request.num_planning_attempts = MOVEIT_PLANNING_ATTEMPTS
+    goal.request.allowed_planning_time = MOVEIT_PLANNING_TIME_S
+    goal.request.max_velocity_scaling_factor = MOVEIT_VELOCITY_SCALING
+    goal.request.max_acceleration_scaling_factor = MOVEIT_ACCELERATION_SCALING
+    goal.request.goal_constraints = [constraints]
+    if current_q is not None:
+        measured_q = np.asarray(current_q, dtype=float)
+        if measured_q.shape != (7,) or not np.all(np.isfinite(measured_q)):
+            raise ValueError("MoveIt start state must be a finite seven-joint configuration")
+        goal.request.start_state.joint_state.name = [
+            f"{side}_{name}" for name in JOINT_NAMES
+        ]
+        goal.request.start_state.joint_state.position = measured_q.tolist()
+        goal.request.start_state.is_diff = False
+    goal.planning_options.plan_only = True
+    goal.planning_options.look_around = False
+    goal.planning_options.replan = False
+    return goal
+
+
+def spin_until_future(rclpy: Any, node: Any, future: Any, timeout_s: float, description: str) -> Any:
+    """Wait for an rclpy future with a bounded, descriptive timeout."""
+    rclpy.spin_until_future_complete(node, future, timeout_sec=timeout_s)
+    if not future.done():
+        raise TimeoutError(f"Timed out after {timeout_s:g} s waiting for {description}")
+    exception = future.exception()
+    if exception is not None:
+        raise RuntimeError(f"{description} failed: {exception}") from exception
+    return future.result()
+
+
+def cancel_action_goal(rclpy: Any, node: Any, goal_handle: Any, description: str) -> None:
+    """Best-effort cancellation used when planning or execution times out."""
+    if not rclpy.ok():
+        return
+    cancel_future = goal_handle.cancel_goal_async()
+    rclpy.spin_until_future_complete(node, cancel_future, timeout_sec=2.0)
+    if not cancel_future.done():
+        node.get_logger().error(f"Timed out cancelling {description}")
+
+
+def plan_moveit_trajectory(
+    rclpy: Any,
+    node: Any,
+    side: str,
+    target_ee_pose: np.ndarray,
+    flange_to_ee: np.ndarray,
+    current_q: np.ndarray,
+    message_types: dict[str, Any],
+) -> tuple[Any, float]:
+    """Request a collision-checked, time-parameterized joint trajectory."""
+    from rclpy.action import ActionClient
+
+    MoveGroup = message_types["MoveGroup"]
+    action_name = f"/{side}/move_action"
+    client = ActionClient(node, MoveGroup, action_name)
+    if not client.wait_for_server(timeout_sec=MOVEIT_SERVER_TIMEOUT_S):
+        raise TimeoutError(f"MoveIt action server is unavailable: {action_name}")
+    goal = build_move_group_goal(
+        side, target_ee_pose, flange_to_ee, message_types, current_q=current_q
+    )
+    goal_handle = spin_until_future(
+        rclpy,
+        node,
+        client.send_goal_async(goal),
+        MOVEIT_SERVER_TIMEOUT_S,
+        f"{side} MoveIt plan acceptance",
+    )
+    if not goal_handle.accepted:
+        raise RuntimeError(f"[{side}] MoveIt rejected the pose-goal planning request")
+    try:
+        result_wrapper = spin_until_future(
+            rclpy,
+            node,
+            goal_handle.get_result_async(),
+            MOVEIT_PLANNING_TIME_S * MOVEIT_PLANNING_ATTEMPTS
+            + MOVEIT_SERVER_TIMEOUT_S,
+            f"{side} MoveIt plan",
+        )
+    except TimeoutError:
+        cancel_action_goal(rclpy, node, goal_handle, f"{side} MoveIt plan")
+        raise
+    result = result_wrapper.result
+    if result.error_code.val != result.error_code.SUCCESS:
+        raise RuntimeError(
+            f"[{side}] MoveIt/OMPL planning failed with error code {result.error_code.val}; "
+            "no trajectory was executed"
+        )
+    trajectory = result.planned_trajectory.joint_trajectory
+    if not trajectory.points:
+        raise RuntimeError(f"[{side}] MoveIt returned an empty trajectory")
+    expected_names = {f"{side}_{name}" for name in JOINT_NAMES}
+    if set(trajectory.joint_names) != expected_names:
+        raise RuntimeError(
+            f"[{side}] MoveIt trajectory joints {trajectory.joint_names} do not match "
+            f"the controlled arm joints {sorted(expected_names)}"
+        )
+    return trajectory, float(result.planning_time)
+
+
+def trajectory_duration_s(trajectory: Any) -> float:
+    duration = trajectory.points[-1].time_from_start
+    return float(duration.sec) + 1e-9 * float(duration.nanosec)
+
+
+def trajectory_joint_positions(side: str, trajectory: Any, point_index: int) -> np.ndarray:
+    """Return one trajectory point in canonical FR3 joint order."""
+    positions_by_name = dict(
+        zip(trajectory.joint_names, trajectory.points[point_index].positions, strict=True)
+    )
+    return np.asarray(
+        [positions_by_name[f"{side}_{name}"] for name in JOINT_NAMES], dtype=float
+    )
+
+
+def verify_planned_endpoint(
+    side: str,
+    trajectory: Any,
+    target_pose: np.ndarray,
+    flange_to_ee: np.ndarray,
+) -> np.ndarray:
+    """Verify the selected IK goal before allowing trajectory execution."""
+    final_q = trajectory_joint_positions(side, trajectory, -1)
+    model, frame_id = build_fr3_model()
+    planned_pose = forward_end_effector_pose(model, frame_id, final_q, flange_to_ee)
+    position_error, orientation_error = pose_error(planned_pose, target_pose)
+    print(
+        f"{side} planned final ee pose [x, y, z, roll, pitch, yaw]: "
+        f"{format_values(matrix_to_pose_vector(planned_pose))}",
+        flush=True,
+    )
+    print(
+        f"{side} planned Cartesian residual: position={position_error:.6f} m, "
+        f"orientation={orientation_error:.6f} rad",
+        flush=True,
+    )
+    if (
+        position_error > EE_FINAL_POSITION_TOLERANCE_M
+        or orientation_error > EE_FINAL_ORIENTATION_TOLERANCE_RAD
+    ):
+        raise RuntimeError(
+            f"[{side}] planned endpoint is outside the final Cartesian tolerance: "
+            f"position={position_error:.6f} m, orientation={orientation_error:.6f} rad; "
+            "no trajectory was executed"
+        )
+    return final_q
+
+
+def print_trajectory_summary(side: str, trajectory: Any, planning_time_s: float) -> None:
+    final = trajectory.points[-1]
+    print(
+        f"{side} collision-checked OMPL plan: {len(trajectory.points)} points, "
+        f"duration={trajectory_duration_s(trajectory):.3f} s, "
+        f"planning_time={planning_time_s:.3f} s",
+        flush=True,
+    )
+    print(f"{side} planned final arm joint angles [rad]: {format_values(final.positions)}")
+
+
+def execute_joint_trajectory(
+    rclpy: Any, node: Any, side: str, trajectory: Any, action_type: Any
+) -> bool:
+    """Execute a trajectory; return whether its joint goal tolerance passed.
+
+    A pose-goal command still measures and enforces its Cartesian residual when
+    the controller narrowly misses the particular redundant IK joint endpoint.
+    All other controller errors remain hard execution failures.
+    """
+    from rclpy.action import ActionClient
+
+    action_name = f"/{side}/fr3_arm_controller/follow_joint_trajectory"
+    current_q = node.arm_q[side]
+    if current_q is None:
+        raise RuntimeError(f"[{side}] measured joint state is unavailable before execution")
+    planned_start = trajectory_joint_positions(side, trajectory, 0)
+    start_error = float(np.max(np.abs(np.asarray(current_q, dtype=float) - planned_start)))
+    if start_error > 0.03:
+        raise RuntimeError(
+            f"[{side}] robot moved {start_error:.4f} rad away from the approved plan start; "
+            "replan before execution"
+        )
+    client = ActionClient(node, action_type, action_name)
+    if not client.wait_for_server(timeout_sec=MOVEIT_SERVER_TIMEOUT_S):
+        raise TimeoutError(f"Trajectory controller action server is unavailable: {action_name}")
+    goal = action_type.Goal()
+    goal.trajectory = trajectory
+    goal_handle = spin_until_future(
+        rclpy,
+        node,
+        client.send_goal_async(goal),
+        MOVEIT_SERVER_TIMEOUT_S,
+        f"{side} trajectory acceptance",
+    )
+    if not goal_handle.accepted:
+        raise RuntimeError(f"[{side}] trajectory controller rejected the planned trajectory")
+    try:
+        result_wrapper = spin_until_future(
+            rclpy,
+            node,
+            goal_handle.get_result_async(),
+            trajectory_duration_s(trajectory) + TRAJECTORY_EXECUTION_MARGIN_S,
+            f"{side} trajectory execution",
+        )
+    except TimeoutError:
+        cancel_action_goal(rclpy, node, goal_handle, f"{side} trajectory execution")
+        raise
+    result = result_wrapper.result
+    if result.error_code == result.SUCCESSFUL:
+        return True
+    if result.error_code == result.GOAL_TOLERANCE_VIOLATED:
+        print(
+            f"[{side}] trajectory controller missed its joint endpoint tolerance: "
+            f"{result.error_string}. Measuring the authoritative Cartesian pose goal.",
+            flush=True,
+        )
+        return False
+    else:
+        raise RuntimeError(
+            f"[{side}] trajectory execution failed with code {result.error_code}: "
+            f"{result.error_string}"
+        )
+
+
+def verify_final_ee_pose(
+    rclpy: Any,
+    node: Any,
+    side: str,
+    target_pose: np.ndarray,
+    planned_final_q: np.ndarray,
+) -> tuple[float, float]:
+    """Refresh robot state and enforce the final measured Cartesian tolerance."""
+    deadline = time.monotonic() + 2.0
+    while rclpy.ok() and time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.05)
+    measured = node.ee_pose[side]
+    if measured is None:
+        raise RuntimeError(f"[{side}] final measured EE pose is unavailable")
+    position_error, orientation_error = pose_error(measured, target_pose)
+    measured_q = node.arm_q[side]
+    if measured_q is None:
+        raise RuntimeError(f"[{side}] final measured joint state is unavailable")
+    joint_error = float(
+        np.max(np.abs(np.asarray(measured_q, dtype=float) - planned_final_q))
+    )
+    print(
+        f"{side} final measured Cartesian residual: position={position_error:.6f} m, "
+        f"orientation={orientation_error:.6f} rad",
+        flush=True,
+    )
+    print(f"{side} final maximum joint residual: {joint_error:.6f} rad", flush=True)
+    if (
+        position_error > EE_FINAL_POSITION_TOLERANCE_M
+        or orientation_error > EE_FINAL_ORIENTATION_TOLERANCE_RAD
+    ):
+        raise RuntimeError(
+            f"[{side}] final EE pose is outside tolerance: position={position_error:.6f} m "
+            f"(limit {EE_FINAL_POSITION_TOLERANCE_M:g}), orientation={orientation_error:.6f} "
+            f"rad (limit {EE_FINAL_ORIENTATION_TOLERANCE_RAD:g}); maximum joint residual "
+            f"to the planned endpoint={joint_error:.6f} rad"
+        )
+    return position_error, orientation_error
 
 
 def build_fr3_model() -> tuple[Any, int]:
@@ -468,37 +778,6 @@ def solve_fr3_ik(
     return min(valid, key=lambda item: float(np.linalg.norm(item.q - seed)))
 
 
-def ramp_arm_command(
-    commanded_q: np.ndarray,
-    commanded_velocity: np.ndarray,
-    target_q: np.ndarray,
-    dt: float,
-    max_velocity: float = ARM_MAX_VELOCITY_RAD_PER_S,
-    max_acceleration: float = ARM_MAX_ACCELERATION_RAD_PER_S2,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Replay's bounded 50 Hz first-phase arm ramp."""
-    dt = min(max(float(dt), 1e-6), 2.0 * ARM_PUBLISH_PERIOD_S)
-    position_error = target_q - commanded_q
-    target_velocity = np.clip(
-        ARM_TRACKING_GAIN_PER_S * position_error, -max_velocity, max_velocity
-    )
-    velocity_delta = np.clip(
-        target_velocity - commanded_velocity,
-        -max_acceleration * dt,
-        max_acceleration * dt,
-    )
-    next_velocity = np.clip(
-        commanded_velocity + velocity_delta, -max_velocity, max_velocity
-    )
-    position_step = next_velocity * dt
-    position_step = np.where(
-        np.abs(position_step) > np.abs(position_error), position_error, position_step
-    )
-    next_q = commanded_q + position_step
-    next_velocity = np.where(position_step == position_error, 0.0, next_velocity)
-    return next_q, next_velocity
-
-
 def move_gripper(robot_ip: str, side: str, target_width: float) -> None:
     """Move a Franka Hand after the ROS-controlled arm has settled."""
     import pylibfranka
@@ -533,18 +812,13 @@ def build_move_node_class(Node: Any, JointState: Any, FrankaRobotState: Any) -> 
     class MoveToTargetNode(Node):  # type: ignore[misc, valid-type]
         def __init__(self, args: argparse.Namespace) -> None:
             super().__init__("move_to_target_ee")
-            self.active_sides = selected_sides(args.arm_mode)
+            self.active_sides = [args.arm_mode]
             self.arm_q: dict[str, np.ndarray | None] = {side: None for side in self.active_sides}
-            self.arm_dq: dict[str, np.ndarray | None] = {side: None for side in self.active_sides}
             self.ee_pose: dict[str, np.ndarray | None] = {side: None for side in self.active_sides}
             self.flange_to_ee: dict[str, np.ndarray | None] = {
                 side: None for side in self.active_sides
             }
-            self.arm_publishers: dict[str, Any] = {}
             for side in self.active_sides:
-                self.arm_publishers[side] = self.create_publisher(
-                    JointState, f"/{side}/gello/raw_joint_states", 10
-                )
                 self.create_subscription(
                     JointState,
                     f"/{side}/franka/joint_states",
@@ -562,20 +836,10 @@ def build_move_node_class(Node: Any, JointState: Any, FrankaRobotState: Any) -> 
             q = ordered_joint_values(message, "position")
             if q is not None and np.all(np.isfinite(q)):
                 self.arm_q[side] = q
-            dq = ordered_joint_values(message, "velocity")
-            if dq is not None and np.all(np.isfinite(dq)):
-                self.arm_dq[side] = dq
 
         def _store_robot_state(self, side: str, message: Any) -> None:
             self.ee_pose[side] = pose_message_to_matrix(message.o_t_ee.pose)
             self.flange_to_ee[side] = pose_message_to_matrix(message.f_t_ee.pose)
-
-        def publish_arm(self, side: str, q: np.ndarray) -> None:
-            message = JointState()
-            message.header.stamp = self.get_clock().now().to_msg()
-            message.name = JOINT_NAMES
-            message.position = np.asarray(q, dtype=float).tolist()
-            self.arm_publishers[side].publish(message)
 
     return MoveToTargetNode
 
@@ -589,7 +853,7 @@ def wait_until(rclpy: Any, node: Any, predicate: Any, timeout_s: float, descript
     raise TimeoutError(f"Timed out after {timeout_s:g} s waiting for {description}")
 
 
-def wait_for_robot_state(rclpy: Any, node: Any, args: argparse.Namespace) -> None:
+def wait_for_robot_state(rclpy: Any, node: Any) -> None:
     def ready() -> bool:
         for side in node.active_sides:
             if (
@@ -601,108 +865,6 @@ def wait_for_robot_state(rclpy: Any, node: Any, args: argparse.Namespace) -> Non
         return True
 
     wait_until(rclpy, node, ready, 30.0, "FR3 state topics")
-
-
-def arm_reached(node: Any, side: str, target_q: np.ndarray) -> bool:
-    actual_q = node.arm_q[side]
-    if actual_q is None or np.max(np.abs(actual_q - target_q)) > ARM_POSITION_TOLERANCE_RAD:
-        return False
-    actual_dq = node.arm_dq[side]
-    return actual_dq is None or np.max(np.abs(actual_dq)) <= ARM_VELOCITY_TOLERANCE_RAD_PER_S
-
-
-def move_arms_with_replay_transport(
-    rclpy: Any, node: Any, ik_results: dict[str, IkResult]
-) -> None:
-    commands = {
-        side: np.asarray(node.arm_q[side], dtype=float).copy() for side in node.active_sides
-    }
-    velocities = {side: np.zeros(7, dtype=float) for side in node.active_sides}
-    targets = {side: ik_results[side].q for side in node.active_sides}
-    print(
-        "Moving arm(s) through the replay transport "
-        f"(50 Hz, max {ARM_MAX_VELOCITY_RAD_PER_S:g} rad/s, "
-        f"{ARM_MAX_ACCELERATION_RAD_PER_S2:g} rad/s^2)...",
-        flush=True,
-    )
-
-    start = time.monotonic()
-    deadline = start + ARM_MOVE_TIMEOUT_S
-    next_publish = start
-    while time.monotonic() < min(start + ARM_PRIME_DURATION_S, deadline):
-        for side in node.active_sides:
-            node.publish_arm(side, commands[side])
-        next_publish += ARM_PUBLISH_PERIOD_S
-        while time.monotonic() < next_publish:
-            rclpy.spin_once(node, timeout_sec=min(0.01, next_publish - time.monotonic()))
-
-    last_command = time.monotonic()
-    next_publish = last_command
-    stable_samples = 0
-    next_status = last_command
-    while rclpy.ok() and time.monotonic() < deadline:
-        now = time.monotonic()
-        dt = now - last_command
-        for side in node.active_sides:
-            commands[side], velocities[side] = ramp_arm_command(
-                commands[side], velocities[side], targets[side], dt
-            )
-            node.publish_arm(side, commands[side])
-        last_command = now
-        next_publish += ARM_PUBLISH_PERIOD_S
-        while time.monotonic() < next_publish:
-            rclpy.spin_once(node, timeout_sec=min(0.01, next_publish - time.monotonic()))
-
-        if all(arm_reached(node, side, targets[side]) for side in node.active_sides):
-            stable_samples += 1
-            if stable_samples >= ARM_STABLE_SAMPLES:
-                cartesian_status: list[str] = []
-                cartesian_outside_tolerance: list[str] = []
-                for side in node.active_sides:
-                    measured = node.ee_pose[side]
-                    expected = ik_results[side].achieved_pose
-                    if measured is None:
-                        cartesian_status.append(f"{side}=unavailable")
-                        continue
-                    position_error, orientation_error = pose_error(measured, expected)
-                    status = (
-                        f"{side}: position={position_error:.6f} m, "
-                        f"orientation={orientation_error:.6f} rad"
-                    )
-                    cartesian_status.append(status)
-                    if (
-                        position_error > EE_FINAL_POSITION_TOLERANCE_M
-                        or orientation_error > EE_FINAL_ORIENTATION_TOLERANCE_RAD
-                    ):
-                        cartesian_outside_tolerance.append(status)
-                print(
-                    "Final measured Cartesian residual: " + "; ".join(cartesian_status),
-                    flush=True,
-                )
-                if cartesian_outside_tolerance:
-                    print(
-                        "Warning: the final Cartesian residual exceeds the diagnostic "
-                        f"threshold ({EE_FINAL_POSITION_TOLERANCE_M:g} m, "
-                        f"{EE_FINAL_ORIENTATION_TOLERANCE_RAD:g} rad). Continuing because "
-                        "the replay-compatible joint/velocity gate is satisfied.",
-                        flush=True,
-                    )
-                print("All selected arms reached the replay-compatible initial-state gate.", flush=True)
-                return
-        else:
-            stable_samples = 0
-        if now >= next_status:
-            status = ", ".join(
-                f"{side}={np.max(np.abs(targets[side] - node.arm_q[side])):.4f} rad"
-                for side in node.active_sides
-            )
-            print(f"Arm max joint error: {status}", flush=True)
-            next_status = now + 1.0
-    errors = {
-        side: float(np.max(np.abs(targets[side] - node.arm_q[side])))
-        for side in node.active_sides
-    }
-    raise TimeoutError(f"Arms did not settle within {ARM_MOVE_TIMEOUT_S:g} s; errors={errors}")
 
 
 def request_hand_status(socket: Any, request: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -775,9 +937,8 @@ def read_current_targets(
 ) -> dict[str, dict[str, np.ndarray]]:
     """Read all values displayed to the operator before an actual move.
 
-    Arm pose and joint state are intentionally read from ROS, the same state
-    stream that the replay transport uses. ``node`` is optional only for unit
-    tests and legacy callers; hardware execution always supplies it.
+    Arm pose and joint state are intentionally read from the ROS controller
+    state streams. Hardware execution always supplies ``node``.
     """
     current: dict[str, dict[str, np.ndarray]] = {}
     for target in targets:
@@ -848,24 +1009,20 @@ def require_approval() -> None:
         raise SystemExit("Real-robot motion cancelled.")
 
 
-def print_dry_run(
-    args: argparse.Namespace,
-    targets: list[SideTarget],
-    current: dict[str, dict[str, np.ndarray]],
-) -> None:
-    print_move_summary(args, targets, current)
-    print("Dry run: no hardware motion was commanded.")
-
-
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     targets = resolve_targets(args, parser)
     try:
+        from control_msgs.action import FollowJointTrajectory
         import rclpy
         from franka_msgs.msg import FrankaRobotState
+        from geometry_msgs.msg import Pose
+        from moveit_msgs.action import MoveGroup
+        from moveit_msgs.msg import Constraints, OrientationConstraint, PositionConstraint
         from rclpy.node import Node
         from sensor_msgs.msg import JointState
+        from shape_msgs.msg import SolidPrimitive
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "ROS 2 Python dependencies are required. Run scripts/move_to_target_ee.sh "
@@ -878,47 +1035,62 @@ def main() -> None:
     hand_context = None
     hand_sockets: dict[str, Any] = {}
     try:
-        wait_for_robot_state(rclpy, node, args)
+        wait_for_robot_state(rclpy, node)
         hand_states = None
         if args.end_effector == "hand":
             hand_context, hand_sockets = open_hand_status_sockets(node.active_sides)
             hand_states = read_hand_states(hand_sockets)
         current = read_current_targets(args, targets, node, hand_states)
 
-        # Solve IK before asking for approval so the operator sees the exact
-        # joint-space command that will be sent through the ROS controller.
-        model, frame_id = build_fr3_model()
-        ik_results: dict[str, IkResult] = {}
-        for target in targets:
-            flange_to_ee = np.asarray(node.flange_to_ee[target.side], dtype=float)
-            result = solve_fr3_ik(
-                current[target.side]["arm_q"],
-                pose_vector_to_matrix(target.pose),
-                flange_to_ee,
-                model,
-                frame_id,
-            )
-            ik_results[target.side] = result
-
+        # Preserve these diagnostics even when the planner cannot find a path.
         print_move_summary(args, targets, current)
-        for target in targets:
-            result = ik_results[target.side]
-            print(f"{target.side} IK target arm joint angles [rad]: {format_values(result.q)}")
-            print(
-                f"{target.side} IK FK residual: position={result.position_error_m:.6f} m, "
-                f"orientation={result.orientation_error_rad:.6f} rad"
-            )
+        target = targets[0]
+        target_matrix = pose_vector_to_matrix(target.pose)
+        message_types = {
+            "MoveGroup": MoveGroup,
+            "Constraints": Constraints,
+            "OrientationConstraint": OrientationConstraint,
+            "PositionConstraint": PositionConstraint,
+            "Pose": Pose,
+            "SolidPrimitive": SolidPrimitive,
+        }
+        trajectory, planning_time = plan_moveit_trajectory(
+            rclpy,
+            node,
+            target.side,
+            target_matrix,
+            np.asarray(node.flange_to_ee[target.side], dtype=float),
+            current[target.side]["arm_q"],
+            message_types,
+        )
+        print_trajectory_summary(target.side, trajectory, planning_time)
+        planned_final_q = verify_planned_endpoint(
+            target.side,
+            trajectory,
+            target_matrix,
+            np.asarray(node.flange_to_ee[target.side], dtype=float),
+        )
         print(
-            "Safety note: this is final-pose IK plus a joint-space transport, not a "
-            "Cartesian straight-line or collision-planned path. Confirm only if the "
-            "joint-space route has clear workspace."
+            "The plan was checked against the MoveIt self-collision model and the current "
+            "planning scene. Confirm that the scene contains every real obstacle before moving."
         )
         if args.dry_run:
-            print("Dry run: no hardware motion was commanded.")
+            print("Dry run: the motion was planned but no trajectory was executed.")
             return
 
         require_approval()
-        move_arms_with_replay_transport(rclpy, node, ik_results)
+        joint_goal_satisfied = execute_joint_trajectory(
+            rclpy, node, target.side, trajectory, FollowJointTrajectory
+        )
+        verify_final_ee_pose(
+            rclpy, node, target.side, target_matrix, planned_final_q
+        )
+        if not joint_goal_satisfied:
+            print(
+                f"[{target.side}] Cartesian pose goal reached despite the redundant IK "
+                "joint endpoint miss.",
+                flush=True,
+            )
         if args.end_effector == "gripper":
             robot_ips = {"left": args.ip_left, "right": args.ip_right}
             for target in targets:

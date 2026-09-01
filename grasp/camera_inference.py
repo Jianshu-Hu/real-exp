@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -22,6 +23,7 @@ from typing import Any
 import numpy as np
 
 from grasp.inference_client import (
+    CALIBRATED_L515_SERIAL,
     DEFAULT_CAMERA_SERIAL,
     DEFAULT_GENERATOR_CHECKPOINT,
     DEFAULT_MANO_ROOT,
@@ -43,6 +45,18 @@ from grasp.common import (
 )
 
 
+DEFAULT_L515_CAMERA_PYTHON = os.environ.get(
+    "GRASP_L515_CAMERA_PYTHON",
+    str(Path.home() / "miniconda3" / "envs" / "pose" / "bin" / "python"),
+)
+DEFAULT_L515_PYTHONPATH = Path(
+    os.environ.get(
+        "GRASP_L515_PYTHONPATH",
+        str(Path(__file__).resolve().parent.parent / ".vendor" / "l515_realsense"),
+    )
+)
+
+
 def add_camera_inference_arguments(
     parser: argparse.ArgumentParser, *, include_output_dir: bool = True
 ) -> argparse.ArgumentParser:
@@ -51,16 +65,28 @@ def add_camera_inference_arguments(
         parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--generator-checkpoint", type=Path, default=DEFAULT_GENERATOR_CHECKPOINT)
     parser.add_argument("--mount-calibration", type=Path, default=Path(__file__).resolve().parent / "ee_to_wuji_nominal.json")
-    parser.add_argument("--camera-serial", default=DEFAULT_CAMERA_SERIAL)
+    parser.add_argument(
+        "--camera-serial",
+        default=DEFAULT_CAMERA_SERIAL,
+        help="Calibrated D435i serial used by D435i-only and merged modes.",
+    )
     parser.add_argument(
         "--secondary-camera-serial",
         default=None,
-        help="Enable a second RealSense (for example an L515) with this serial.",
+        help="Enable merged D435i+L515 capture using this calibrated L515 serial.",
     )
     parser.add_argument(
         "--l515-only",
         action="store_true",
-        help="Capture and infer from only the calibrated L515 camera.",
+        help=(
+            "Capture and infer from only the calibrated L515 camera (default "
+            "mode; compatibility alias)."
+        ),
+    )
+    parser.add_argument(
+        "--d435i-only",
+        action="store_true",
+        help="Capture and infer from only the primary calibrated D435i camera.",
     )
     parser.add_argument("--secondary-width", type=int, default=1280)
     parser.add_argument("--secondary-height", type=int, default=720)
@@ -69,8 +95,12 @@ def add_camera_inference_arguments(
     parser.add_argument("--secondary-fps", type=int, default=30)
     parser.add_argument(
         "--camera-python",
-        default="/usr/bin/python3",
-        help="Python interpreter containing pyrealsense2 (default: /usr/bin/python3).",
+        default=None,
+        help=(
+            "Python interpreter containing pyrealsense2. If omitted, the "
+            "L515-compatible pose environment is used for L515/merged modes "
+            "and /usr/bin/python3 for D435i-only."
+        ),
     )
     parser.add_argument(
         "--camera-pythonpath",
@@ -129,6 +159,25 @@ def add_camera_inference_arguments(
             "sampling; set to 0 to disable (default: 0.003 m)."
         ),
     )
+    parser.add_argument(
+        "--fusion-mode",
+        choices=("l515_priority", "union"),
+        default="l515_priority",
+        help=(
+            "Merge policy for dual-camera clouds. l515_priority keeps the L515 "
+            "surface in overlapping regions and adds only novel D435i points; "
+            "union preserves the legacy raw union (default: l515_priority)."
+        ),
+    )
+    parser.add_argument(
+        "--fusion-overlap-threshold-m",
+        type=float,
+        default=0.015,
+        help=(
+            "In l515_priority mode, D435i points nearer than this distance to "
+            "an L515 point are treated as overlapping and omitted (default: 0.015 m)."
+        ),
+    )
     parser.add_argument("--world-z-segmentation-min-m", type=float, default=0.002)
     parser.add_argument("--generator-weights", choices=("ema", "model"), default="ema")
     parser.add_argument(
@@ -168,8 +217,13 @@ def validate_camera_inference_args(
         parser.error("secondary camera width, height, and fps must be positive")
     if args.secondary_camera_serial == args.camera_serial:
         parser.error("primary and secondary camera serials must differ")
-    if args.l515_only and args.secondary_camera_serial is not None:
-        parser.error("--l515-only cannot be combined with --secondary-camera-serial")
+    if args.l515_only and args.d435i_only:
+        parser.error("--l515-only and --d435i-only are mutually exclusive")
+    if (args.l515_only or args.d435i_only) and args.secondary_camera_serial is not None:
+        parser.error(
+            "--l515-only/--d435i-only cannot be combined with "
+            "--secondary-camera-serial"
+        )
     if args.warmup_frames < 0:
         parser.error("warmup-frames must be non-negative")
     if args.observation_frames <= 0:
@@ -184,6 +238,8 @@ def validate_camera_inference_args(
         parser.error("point counts must be positive")
     if args.fusion_voxel_size_m < 0:
         parser.error("fusion-voxel-size-m must be non-negative")
+    if args.fusion_overlap_threshold_m < 0:
+        parser.error("fusion-overlap-threshold-m must be non-negative")
     if args.semantic_refine_steps < 0 or args.max_penetration_m < 0:
         parser.error("refinement steps and penetration limit must be non-negative")
     for path, name in (
@@ -196,6 +252,15 @@ def validate_camera_inference_args(
     ):
         if not path.is_file():
             parser.error(f"bundled {name} is missing: {path}")
+
+
+def _camera_mode(args: argparse.Namespace) -> str:
+    """Resolve the requested camera arrangement after argument validation."""
+    if args.secondary_camera_serial is not None:
+        return "merged"
+    if args.d435i_only:
+        return "d435i_only"
+    return "l515_only"
 
 
 def _world_hand_pose(refined: Any) -> np.ndarray:
@@ -218,9 +283,17 @@ def _capture_with_system_python(
     depth_height: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """Capture RGB-D in a separate interpreter that has pyrealsense2 installed."""
-    camera_python = shutil.which(str(args.camera_python)) or str(args.camera_python)
+    camera_mode = _camera_mode(args)
+    camera_python_value = args.camera_python
+    if camera_python_value is None:
+        camera_python_value = (
+            "/usr/bin/python3"
+            if camera_mode == "d435i_only"
+            else DEFAULT_L515_CAMERA_PYTHON
+        )
+    camera_python = shutil.which(str(camera_python_value)) or str(camera_python_value)
     if not Path(camera_python).is_file():
-        raise FileNotFoundError(f"camera Python interpreter does not exist: {args.camera_python}")
+        raise FileNotFoundError(f"camera Python interpreter does not exist: {camera_python_value}")
     if not args.capture_script.is_file():
         raise FileNotFoundError(f"camera capture helper does not exist: {args.capture_script}")
     with tempfile.TemporaryDirectory(prefix="real_exp_camera_") as temp_dir:
@@ -249,17 +322,22 @@ def _capture_with_system_python(
             command.extend(("--depth-width", str(depth_width)))
         if depth_height is not None:
             command.extend(("--depth-height", str(depth_height)))
+        camera_pythonpath = args.camera_pythonpath
+        if (
+            camera_pythonpath is None
+            and camera_mode != "d435i_only"
+            and camera_python_value == DEFAULT_L515_CAMERA_PYTHON
+        ):
+            camera_pythonpath = DEFAULT_L515_PYTHONPATH
         capture_environment = None
-        if args.camera_pythonpath is not None:
-            if not args.camera_pythonpath.is_dir():
+        if camera_pythonpath is not None:
+            if not camera_pythonpath.is_dir():
                 raise FileNotFoundError(
-                    f"camera Python package directory does not exist: {args.camera_pythonpath}"
+                    f"camera Python package directory does not exist: {camera_pythonpath}"
                 )
-            import os
-
             capture_environment = os.environ.copy()
             existing_pythonpath = capture_environment.get("PYTHONPATH")
-            capture_environment["PYTHONPATH"] = str(args.camera_pythonpath) + (
+            capture_environment["PYTHONPATH"] = str(camera_pythonpath) + (
                 f":{existing_pythonpath}" if existing_pythonpath else ""
             )
         completed = subprocess.run(
@@ -331,6 +409,55 @@ def _voxel_deduplicate(points: np.ndarray, voxel_size_m: float) -> np.ndarray:
     voxels = np.floor(points / voxel_size_m).astype(np.int64)
     _, indices = np.unique(voxels, axis=0, return_index=True)
     return points[np.sort(indices)]
+
+
+def _fuse_world_clouds(
+    cloud_by_role: dict[str, np.ndarray], args: argparse.Namespace
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Fuse calibrated clouds while making the L515 source preference explicit."""
+    if not cloud_by_role:
+        raise ValueError("at least one camera cloud is required")
+    if len(cloud_by_role) == 1:
+        merged = next(iter(cloud_by_role.values()))
+        return _voxel_deduplicate(merged, args.fusion_voxel_size_m), {
+            "mode": "single_camera",
+            "l515_priority": False,
+            "d435i_novel_points": 0,
+        }
+    l515 = cloud_by_role.get("secondary_l515")
+    d435i = cloud_by_role.get("primary_d435i")
+    if l515 is None or d435i is None:
+        merged = np.concatenate(list(cloud_by_role.values()), axis=0)
+        return _voxel_deduplicate(merged, args.fusion_voxel_size_m), {
+            "mode": args.fusion_mode,
+            "l515_priority": False,
+            "d435i_novel_points": 0,
+        }
+    if args.fusion_mode == "union":
+        merged = np.concatenate((d435i, l515), axis=0)
+        return _voxel_deduplicate(merged, args.fusion_voxel_size_m), {
+            "mode": "union",
+            "l515_priority": False,
+            "d435i_novel_points": int(d435i.shape[0]),
+        }
+    l515_base = _voxel_deduplicate(l515, args.fusion_voxel_size_m)
+    d435i_base = _voxel_deduplicate(d435i, args.fusion_voxel_size_m)
+    from scipy.spatial import cKDTree
+
+    nearest_l515_m = cKDTree(l515_base).query(d435i_base, workers=1)[0]
+    novel = d435i_base[nearest_l515_m > args.fusion_overlap_threshold_m]
+    merged = np.concatenate((l515_base, novel), axis=0)
+    return _voxel_deduplicate(merged, args.fusion_voxel_size_m), {
+        "mode": "l515_priority",
+        "l515_priority": True,
+        "overlap_threshold_m": args.fusion_overlap_threshold_m,
+        "l515_voxel_points": int(l515_base.shape[0]),
+        "d435i_voxel_points": int(d435i_base.shape[0]),
+        "d435i_novel_points": int(novel.shape[0]),
+        "d435i_overlapping_points_omitted": int(
+            d435i_base.shape[0] - novel.shape[0]
+        ),
+    }
 
 
 def _write_coordinate_outputs(
@@ -422,7 +549,12 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
         stage = "calibration"
         _write_run_status(args.output_dir, status="running", stage=stage)
         transforms = load_calibration_transforms(args.mount_calibration)
-        l515_t = load_l515_calibration("f1480539") if args.l515_only else None
+        camera_mode = _camera_mode(args)
+        l515_t = (
+            load_l515_calibration(CALIBRATED_L515_SERIAL)
+            if camera_mode != "d435i_only"
+            else None
+        )
         d435i_t_l515 = (
             load_l515_calibration(args.secondary_camera_serial)
             if args.secondary_camera_serial is not None
@@ -431,11 +563,11 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
 
         stage = "camera_capture"
         _write_run_status(args.output_dir, status="running", stage=stage)
-        if args.l515_only:
+        if camera_mode == "l515_only":
             assert l515_t is not None
             rgb, depth, camera = _capture_with_system_python(
                 args,
-                camera_serial="f1480539",
+                camera_serial=CALIBRATED_L515_SERIAL,
                 width=args.secondary_width,
                 height=args.secondary_height,
                 fps=args.secondary_fps,
@@ -463,7 +595,7 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
                 "depth": depth,
             }
         ]
-        if args.secondary_camera_serial is not None:
+        if camera_mode == "merged":
             assert d435i_t_l515 is not None
             secondary_world_t_camera = (
                 transforms["world_T_camera"] @ d435i_t_l515
@@ -503,6 +635,7 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
         _write_run_status(args.output_dir, status="running", stage=stage)
         unfiltered_clouds: list[np.ndarray] = []
         filtered_clouds: list[np.ndarray] = []
+        filtered_clouds_by_role: dict[str, np.ndarray] = {}
         camera_filter_records: list[dict[str, Any]] = []
         for item in cameras:
             valid_world, camera_filtered_world = _camera_world_cloud(
@@ -513,6 +646,7 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
             )
             unfiltered_clouds.append(valid_world)
             filtered_clouds.append(camera_filtered_world)
+            filtered_clouds_by_role[item["role"]] = camera_filtered_world
             camera_filter_records.append(
                 {
                     "role": item["role"],
@@ -527,8 +661,8 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
             )
         unfiltered_world = np.concatenate(unfiltered_clouds, axis=0)
         filtered_world_raw = np.concatenate(filtered_clouds, axis=0)
-        filtered_world = _voxel_deduplicate(
-            filtered_world_raw, args.fusion_voxel_size_m
+        filtered_world, fusion_record = _fuse_world_clouds(
+            filtered_clouds_by_role, args
         )
         sampled_world = _sample_merged_world_points(filtered_world, args)
         filter_record = {
@@ -541,6 +675,7 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
             "filtered_world_points": int(filtered_world.shape[0]),
             "generator_input_points": int(sampled_world.shape[0]),
             "fusion_voxel_size_m": args.fusion_voxel_size_m,
+            "fusion": fusion_record,
             "cameras": camera_filter_records,
         }
         _write_json(args.output_dir / "filter.json", filter_record)

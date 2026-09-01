@@ -26,7 +26,6 @@ from grasp.common import (
     read_transform,
     reorder_wuji_joints,
     transform_points,
-    wuji_v1_model_to_hand2_firmware,
 )
 
 
@@ -35,7 +34,7 @@ FINGER_NAMES = ("thumb", "index", "middle", "ring", "pinky")
 ASSETS_ROOT = Path(__file__).resolve().parent / "assets"
 DEFAULT_GENERATOR_CHECKPOINT = ASSETS_ROOT / "checkpoints" / "generator_best.pt"
 DEFAULT_MANO_ROOT = ASSETS_ROOT / "mano"
-DEFAULT_ROBODEX_ROOT = ASSETS_ROOT / "RoboDex"
+DEFAULT_WUJI_HAND2_ROOT = ASSETS_ROOT / "Wuji_hand2"
 DEFAULT_MOUNT_CALIBRATION = Path(__file__).resolve().parent / "ee_to_wuji_nominal.json"
 
 # Calibrated transforms from calibration/matrix.md.  The right-arm matrix is
@@ -159,8 +158,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         (args.generator_checkpoint, "generator checkpoint"),
         (DEFAULT_MANO_ROOT / "models" / "MANO_RIGHT.pkl", "MANO right-hand model"),
         (
-            DEFAULT_ROBODEX_ROOT / "task/assets/urdf/panda_wuji_hand_right_handonly.urdf",
-            "Wuji hand-only URDF",
+            DEFAULT_WUJI_HAND2_ROOT / "hand2_beta1/body/urdf/right.urdf",
+            "Wuji Hand 2 Beta 1 URDF",
         ),
     ):
         if not path.is_file():
@@ -367,7 +366,7 @@ def run_model(scene_points_world: np.ndarray, args: argparse.Namespace) -> tuple
         SemanticContactRefinementConfig,
         SemanticContactRefiner,
     )
-    from grasp.runtime.retargeting.wuji import create_wuji_hand_right_spec
+    from grasp.runtime.retargeting.wuji_hand2 import create_wuji_hand2_beta1_right_spec
     runtime = GeneratorRuntime(
         config=GeneratorRuntimeConfig(
             generator_checkpoint=args.generator_checkpoint,
@@ -376,7 +375,7 @@ def run_model(scene_points_world: np.ndarray, args: argparse.Namespace) -> tuple
             posterior_conditioning=args.posterior_conditioning,
             world_z_segmentation_min_m=args.world_z_segmentation_min_m,
             mano_root=DEFAULT_MANO_ROOT,
-            robodex_root=DEFAULT_ROBODEX_ROOT,
+            hand_assets_root=DEFAULT_WUJI_HAND2_ROOT,
             diffusion_steps=args.diffusion_steps,
             retarget_landmark_fit_steps=args.retarget_landmark_fit_steps,
             device=args.device,
@@ -391,7 +390,7 @@ def run_model(scene_points_world: np.ndarray, args: argparse.Namespace) -> tuple
         runtime.mano_model.finger_vertex_indices(("proximal", "middle", "distal", "fingertip")),
         args,
     )
-    robot_spec = create_wuji_hand_right_spec(robodex_root=DEFAULT_ROBODEX_ROOT)
+    robot_spec = create_wuji_hand2_beta1_right_spec(hand_root=DEFAULT_WUJI_HAND2_ROOT)
     refiner = SemanticContactRefiner(
         robot_spec=robot_spec,
         config=SemanticContactRefinementConfig(
@@ -440,7 +439,6 @@ def build_command(
     model_joints = reorder_wuji_joints(
         refined.robot_joints, generated.robot_joint_names
     )
-    firmware_joints = wuji_v1_model_to_hand2_firmware(model_joints)
     command_id = str(uuid.uuid4())
     return {
         "format": COMMAND_FORMAT,
@@ -450,7 +448,7 @@ def build_command(
         "execute": bool(args.execute),
         "base_T_ee": base_t_ee.tolist(),
         "ee_pose_xyz_rpy": matrix_to_xyz_rpy(base_t_ee).tolist(),
-        "hand_joints": firmware_joints.tolist(),
+        "hand_joints": model_joints.tolist(),
         "hand_joint_names": list(WUJI_RIGHT_JOINT_NAMES),
         "hand_model": WUJI_COMMAND_HAND_MODEL,
         "hand_joint_convention": WUJI_COMMAND_JOINT_CONVENTION,
@@ -538,9 +536,14 @@ def _posed_wuji_mesh(
     robot_global_orient: np.ndarray,
     robot_joints: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    from grasp.runtime.retargeting import RobotHandModel, create_wuji_hand_right_spec
+    from grasp.runtime.retargeting import (
+        RobotHandModel,
+        create_wuji_hand2_beta1_right_spec,
+    )
 
-    model = RobotHandModel(create_wuji_hand_right_spec(robodex_root=DEFAULT_ROBODEX_ROOT))
+    model = RobotHandModel(
+        create_wuji_hand2_beta1_right_spec(hand_root=DEFAULT_WUJI_HAND2_ROOT)
+    )
     meshes = model.collision_meshes(
         trans=robot_trans,
         global_orient=robot_global_orient,

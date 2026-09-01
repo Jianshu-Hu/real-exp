@@ -106,8 +106,7 @@ changes.
 
 Every accepted request gets a unique timestamped directory below
 `grasp/runs`, containing raw/fused RGB-D data, `poses.json`, `result.json`, and
-world-frame point clouds and hand meshes. The server converts the bundled
-first-generation RoboDex hand result to the Wuji Hand 2 firmware convention at
-the command boundary; the four non-thumb lateral joints (indices 5, 9, 13,
-and 17) have their signs reversed. The archived inference meshes and refined
-joints remain in the source RoboDex model convention.
+world-frame point clouds and hand meshes. Retargeting, contact refinement,
+archived meshes, and commands all use the bundled right Wuji Hand 2 Beta 1
+model. Its 20 joints already follow the SDK firmware order, so no model-boundary
+sign conversion is applied.

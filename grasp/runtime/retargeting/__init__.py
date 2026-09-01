@@ -4,4 +4,4 @@ from .mano_to_robot import (
     ManoToRobotRetargeter,
 )
 from .robot_hand_model import RobotHandModel, RobotHandSpec
-from .wuji import create_wuji_hand_right_spec
+from .wuji_hand2 import create_wuji_hand2_beta1_right_spec

@@ -26,7 +26,6 @@ from grasp.common import (
     WUJI_COMMAND_SOURCE_MODEL,
     validate_command,
     validate_inference_request,
-    wuji_v1_model_to_hand2_firmware,
 )
 
 
@@ -65,7 +64,6 @@ def build_grasp_command(
     record: dict[str, Any], *, side: str, output_dir: Path
 ) -> dict[str, Any]:
     poses = record["poses"]
-    firmware_joints = wuji_v1_model_to_hand2_firmware(poses["hand_joints_rad"])
     command = {
         "format": COMMAND_FORMAT,
         "command_id": str(uuid.uuid4()),
@@ -75,7 +73,7 @@ def build_grasp_command(
         "execute": False,
         "base_T_ee": poses["base_T_ee"],
         "ee_pose_xyz_rpy": poses["base_T_ee_xyz_rpy"],
-        "hand_joints": firmware_joints.tolist(),
+        "hand_joints": poses["hand_joints_rad"],
         "hand_joint_names": poses["hand_joint_names"],
         "hand_model": WUJI_COMMAND_HAND_MODEL,
         "hand_joint_convention": WUJI_COMMAND_JOINT_CONVENTION,

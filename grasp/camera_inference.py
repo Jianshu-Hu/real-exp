@@ -25,7 +25,7 @@ from grasp.inference_client import (
     DEFAULT_CAMERA_SERIAL,
     DEFAULT_GENERATOR_CHECKPOINT,
     DEFAULT_MANO_ROOT,
-    DEFAULT_ROBODEX_ROOT,
+    DEFAULT_WUJI_HAND2_ROOT,
     _posed_wuji_mesh,
     _write_ply_mesh,
     _write_ply_points,
@@ -138,8 +138,8 @@ def validate_camera_inference_args(
         (args.generator_checkpoint, "generator checkpoint"),
         (DEFAULT_MANO_ROOT / "models" / "MANO_RIGHT.pkl", "MANO right-hand model"),
         (
-            DEFAULT_ROBODEX_ROOT / "task/assets/urdf/panda_wuji_hand_right_handonly.urdf",
-            "Wuji hand-only URDF",
+            DEFAULT_WUJI_HAND2_ROOT / "hand2_beta1/body/urdf/right.urdf",
+            "Wuji Hand 2 Beta 1 URDF",
         ),
     ):
         if not path.is_file():

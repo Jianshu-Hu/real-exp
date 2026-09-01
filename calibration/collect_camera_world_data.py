@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect D435 data for later camera-to-world AprilTag calibration.
+"""Collect RealSense data for later camera-to-world AprilTag calibration.
 
 This program deliberately does not estimate an extrinsic transform. It records
 the raw RGB-D observations, the intrinsics/extrinsics reported by RealSense,
@@ -72,15 +72,39 @@ def _extrinsics(extr: Any) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--camera-serial",
+        default=None,
+        help=(
+            "RealSense serial to open. Required when more than one camera is "
+            "connected; use `rs-enumerate-devices -s` to list serials."
+        ),
+    )
     parser.add_argument("--frames", type=int, default=100)
     parser.add_argument("--warmup-frames", type=int, default=30)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
+    parser.add_argument(
+        "--depth-width",
+        type=int,
+        default=None,
+        help="Native depth width (default: --width).",
+    )
+    parser.add_argument(
+        "--depth-height",
+        type=int,
+        default=None,
+        help="Native depth height (default: --height).",
+    )
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--max-frame-gap-ms", type=float, default=100.0)
     args = parser.parse_args()
     if args.frames <= 0 or args.warmup_frames < 0:
         parser.error("frames must be positive and warmup-frames non-negative")
+    depth_width = args.depth_width or args.width
+    depth_height = args.depth_height or args.height
+    if min(args.width, args.height, depth_width, depth_height, args.fps) <= 0:
+        parser.error("color/depth dimensions and fps must be positive")
 
     try:
         import pyrealsense2 as rs
@@ -95,8 +119,10 @@ def main() -> int:
     (args.output / "depth").mkdir()
     pipeline = rs.pipeline()
     config = rs.config()
+    if args.camera_serial:
+        config.enable_device(args.camera_serial)
     config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
-    config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
+    config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, args.fps)
     profile = pipeline.start(config)
     align = rs.align(rs.stream.color)
     color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
@@ -110,7 +136,10 @@ def main() -> int:
             "serial": str(profile.get_device().get_info(rs.camera_info.serial_number)),
             "firmware": str(profile.get_device().get_info(rs.camera_info.firmware_version)),
         },
-        "stream": {"color": [args.width, args.height, args.fps], "depth": [args.width, args.height, args.fps]},
+        "stream": {
+            "color": [args.width, args.height, args.fps],
+            "depth": [depth_width, depth_height, args.fps],
+        },
         "coordinate_frames": {
             "world": "+x forward, +y left, +z up",
             "apriltag": "+x right, +y backward, +z down",

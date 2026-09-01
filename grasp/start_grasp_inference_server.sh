@@ -20,8 +20,28 @@ echo "Using Conda environment '${inference_env}' for grasp inference."
 
 server_ip="${GRASP_SERVER_IP:-${DATA_COLLECTION_SERVER_IP:-192.168.50.13}}"
 server_port="${GRASP_INFERENCE_PORT:-5571}"
+declare -a camera_args=()
+if [[ -n "${GRASP_SECONDARY_CAMERA_SERIAL:-}" ]]; then
+  l515_python="${GRASP_L515_CAMERA_PYTHON:-${HOME}/miniconda3/envs/pose/bin/python}"
+  l515_pythonpath="${GRASP_L515_PYTHONPATH:-${repository_root}/.vendor/l515_realsense}"
+  [[ -x "${l515_python}" ]] || {
+    echo "Error: L515-compatible Python is missing: ${l515_python}" >&2
+    exit 1
+  }
+  [[ -d "${l515_pythonpath}" ]] || {
+    echo "Error: L515-compatible pyrealsense2 directory is missing: ${l515_pythonpath}" >&2
+    echo "Install pyrealsense2 2.54.2 as described in calibration/README.md." >&2
+    exit 1
+  }
+  camera_args=(
+    --secondary-camera-serial "${GRASP_SECONDARY_CAMERA_SERIAL}"
+    --camera-python "${l515_python}"
+    --camera-pythonpath "${l515_pythonpath}"
+  )
+fi
 cd -- "${repository_root}"
 exec "${inference_python[@]}" -m grasp.camera_inference_server \
   --bind "tcp://${server_ip}:${server_port}" \
   --runs-dir "${GRASP_RUNS_DIR:-${repository_root}/grasp/runs}" \
+  "${camera_args[@]}" \
   "$@"

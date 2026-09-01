@@ -90,7 +90,15 @@ def add_camera_inference_arguments(
     parser.add_argument("--world-min", type=float, nargs=3, default=(-0.50, -0.50, 0.005))
     parser.add_argument("--world-max", type=float, nargs=3, default=(0.50, 0.50, 0.50))
     parser.add_argument("--min-filtered-points", type=int, default=300)
-    parser.add_argument("--num-points", type=int, default=8192)
+    parser.add_argument(
+        "--num-points",
+        type=int,
+        default=2048,
+        help=(
+            "Filtered object points passed to the generator. Sparse clouds are "
+            "filled along local point-to-point edges (default: 2048)."
+        ),
+    )
     parser.add_argument("--world-z-segmentation-min-m", type=float, default=0.002)
     parser.add_argument("--generator-weights", choices=("ema", "model"), default="ema")
     parser.add_argument(

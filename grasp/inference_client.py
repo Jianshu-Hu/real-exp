@@ -108,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--world-min", type=float, nargs=3, default=(-0.50, -0.50, 0.005))
     parser.add_argument("--world-max", type=float, nargs=3, default=(0.50, 0.50, 0.50))
     parser.add_argument("--min-filtered-points", type=int, default=300)
-    parser.add_argument("--num-points", type=int, default=8192)
+    parser.add_argument("--num-points", type=int, default=2048)
     parser.add_argument("--world-z-segmentation-min-m", type=float, default=0.002)
     parser.add_argument("--generator-weights", choices=("ema", "model"), default="ema")
     parser.add_argument(
@@ -303,24 +303,30 @@ def filter_and_sample_points(
 def _interpolate_local_points(
     points: np.ndarray, target_count: int, rng: np.random.Generator
 ) -> np.ndarray:
-    """Fill a sparse cloud with points linearly interpolated to local neighbours."""
+    """Resize a cloud using the same local-edge interpolation as simulation."""
     if points.shape[0] >= target_count:
         return points
-    if points.shape[0] < 2:
-        raise ValueError("at least two points are required for point-cloud interpolation")
+    if points.shape[0] == 1:
+        return np.repeat(points, target_count, axis=0)
 
     from scipy.spatial import cKDTree
 
     interpolation_count = target_count - points.shape[0]
-    anchor_indices = rng.integers(points.shape[0], size=interpolation_count)
-    neighbour_count = min(8, points.shape[0])
+    anchor_order = rng.permutation(points.shape[0])
+    anchor_indices = np.tile(
+        anchor_order,
+        (interpolation_count + points.shape[0] - 1) // points.shape[0],
+    )[:interpolation_count]
+    neighbour_count = min(8, points.shape[0] - 1)
     _, neighbour_indices = cKDTree(points).query(
-        points[anchor_indices], k=neighbour_count
+        points[anchor_indices], k=neighbour_count + 1
     )
-    if neighbour_count == 2:
+    if neighbour_count == 1:
         selected_neighbours = neighbour_indices[:, 1]
     else:
-        neighbour_columns = rng.integers(1, neighbour_count, size=interpolation_count)
+        neighbour_columns = rng.integers(
+            1, neighbour_count + 1, size=interpolation_count
+        )
         selected_neighbours = neighbour_indices[
             np.arange(interpolation_count), neighbour_columns
         ]

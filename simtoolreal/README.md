@@ -10,11 +10,11 @@ On the server computer:
 
 ```bash
 ./simtoolreal/scripts/start_server.sh \
-  --config /path/to/config.yaml \
-  --checkpoint /path/to/model.pth \
-  --foundationpose-mesh /path/to/object.stl \
-  --foundationpose-roi 220 120 160 180 \
-  --foundationpose-no-display \
+  --config libs/SimToolReal-Franka-Wuji2/pretrained_policy/config.yaml \
+  --checkpoint libs/SimToolReal-Franka-Wuji2/pretrained_policy/model.pth \
+  --foundationpose-mesh ./libs/FoundationPose-plus-plus/test/mesh/hammer.stl \
+  # --foundationpose-roi 220 120 160 180 \
+  # --foundationpose-no-display \
   --device cuda
 ```
 
@@ -44,7 +44,7 @@ On the client (robot) computer, in a separate terminal:
 
 ```bash
 ./simtoolreal/scripts/start_client.sh \
-  --server-ip SERVER_IP \
+  --server-ip 192.168.50.13 \
   --right-hand-ip HAND_IP
 ```
 

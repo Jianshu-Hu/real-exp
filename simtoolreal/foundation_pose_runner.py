@@ -120,7 +120,7 @@ def _run_realsense(socket: Any, args: argparse.Namespace, stop: list[bool]) -> N
     import sys
     sys.path.insert(0, str(repo)); sys.path.insert(0, str(repo / "FoundationPose"))
     from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
-    from Utils import dr, trimesh_add_pure_colored_texture
+    from Utils import draw_posed_3d_box, draw_xyz_axis, dr, trimesh_add_pure_colored_texture
     if not torch.cuda.is_available():
         raise SystemExit("FoundationPose++ live mode requires a CUDA-enabled PyTorch")
     mesh = trimesh.load(str(args.mesh), force="mesh")
@@ -130,6 +130,11 @@ def _run_realsense(socket: Any, args: argparse.Namespace, stop: list[bool]) -> N
     # its public setter, so update the tracked data buffer directly.
     mesh._data["vertices"] = np.asarray(mesh.vertices, dtype=np.float32)
     mesh._cache.clear()
+    # FoundationPose reports poses in its centered-object frame.  Keep the
+    # mesh centering transform and oriented bounds so the current 6D pose can
+    # be visualized as a projected 3D box, matching live_realsense_pose.py.
+    to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
+    bbox = np.stack((-extents / 2.0, extents / 2.0), axis=0).reshape(2, 3)
     try: mesh = trimesh_add_pure_colored_texture(mesh, color=np.asarray((0, 159, 237), dtype=np.uint8), resolution=10)
     except Exception as exc: logging.warning("mesh texture fallback failed: %s", exc)
     scorer, refiner = ScorePredictor(), PoseRefinePredictor()
@@ -159,7 +164,26 @@ def _run_realsense(socket: Any, args: argparse.Namespace, stop: list[bool]) -> N
                 pose = estimator.track_one(rgb=rgb, depth=depth_m, K=K, iteration=args.track_refine_iter)
             if pose is not None: _publish(socket, pose, "foundationpose++", args.object_id)
             if not args.no_display:
-                cv2.imshow("FoundationPose++", bgr)
+                preview = bgr.copy()
+                if pose is not None:
+                    center_pose = pose @ np.linalg.inv(to_origin)
+                    vis_rgb = draw_posed_3d_box(
+                        K,
+                        img=cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
+                        ob_in_cam=center_pose,
+                        bbox=bbox,
+                    )
+                    vis_rgb = draw_xyz_axis(
+                        vis_rgb,
+                        ob_in_cam=center_pose,
+                        scale=0.1,
+                        K=K,
+                        thickness=3,
+                        transparency=0,
+                        is_input_rgb=True,
+                    )
+                    preview = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
+                cv2.imshow("FoundationPose++", preview)
                 if cv2.waitKey(1) & 0xFF in (ord("q"), 27): break
     finally:
         pipeline.stop(); cv2.destroyAllWindows()

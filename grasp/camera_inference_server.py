@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve trigger-based D435 grasp inference to the robot-control computer."""
+"""Serve trigger-based calibrated RealSense grasp inference to the robot host."""
 
 from __future__ import annotations
 

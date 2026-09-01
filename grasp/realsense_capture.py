@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture and temporally fuse aligned D435 RGB-D frames for inference."""
+"""Capture and temporally fuse aligned RealSense RGB-D frames for inference."""
 
 from __future__ import annotations
 
@@ -52,12 +52,16 @@ def main() -> int:
     parser.add_argument("--camera-serial", default="401622071701")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--depth-width", type=int, default=None)
+    parser.add_argument("--depth-height", type=int, default=None)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--warmup-frames", type=int, default=30)
     parser.add_argument("--observation-frames", type=int, default=15)
     parser.add_argument("--min-valid-depth-ratio", type=float, default=0.5)
     args = parser.parse_args()
-    if args.width <= 0 or args.height <= 0 or args.fps <= 0:
+    depth_width = args.depth_width or args.width
+    depth_height = args.depth_height or args.height
+    if min(args.width, args.height, depth_width, depth_height, args.fps) <= 0:
         parser.error("camera width, height, and fps must be positive")
     if args.warmup_frames < 0:
         parser.error("warmup-frames must be non-negative")
@@ -78,7 +82,7 @@ def main() -> int:
     config = rs.config()
     config.enable_device(args.camera_serial)
     config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
-    config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
+    config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, args.fps)
     profile = pipeline.start(config)
     align = rs.align(rs.stream.color)
     try:
@@ -101,7 +105,9 @@ def main() -> int:
             depth_timestamps_ms.append(float(depth_frame.get_timestamp()))
 
         if rgb is None or color_frame is None:
-            raise RuntimeError("D435 returned no complete aligned RGB-D frames")
+            raise RuntimeError(
+                f"RealSense {args.camera_serial} returned no complete aligned RGB-D frames"
+            )
         depth, valid_count = _fuse_depth_frames(
             depth_frames, args.min_valid_depth_ratio
         )
@@ -112,6 +118,11 @@ def main() -> int:
             "intrinsics": _intrinsics_dict(color_frame.profile.as_video_stream_profile()),
             "depth_scale_m": float(profile.get_device().first_depth_sensor().get_depth_scale()),
             "camera_serial": str(profile.get_device().get_info(rs.camera_info.serial_number)),
+            "camera_name": str(profile.get_device().get_info(rs.camera_info.name)),
+            "native_streams": {
+                "color": [args.width, args.height, args.fps],
+                "depth": [depth_width, depth_height, args.fps],
+            },
             "color_timestamp_ms": color_timestamps_ms[-1],
             "depth_timestamp_ms": depth_timestamps_ms[-1],
             "observation": {

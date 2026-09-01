@@ -64,6 +64,31 @@ def matrix_to_list(transform: np.ndarray) -> list[list[float]]:
     return np.asarray(transform, dtype=np.float64).tolist()
 
 
+def dominant_pose_cluster(
+    transforms: np.ndarray,
+    rotation_type: Any,
+    *,
+    translation_threshold_m: float,
+    rotation_threshold_rad: float,
+) -> np.ndarray:
+    """Return indices in the largest deterministic pairwise SE(3) cluster."""
+    translations = transforms[:, :3, 3]
+    rotations = rotation_type.from_matrix(transforms[:, :3, :3])
+    translation_distance = np.linalg.norm(
+        translations[:, None, :] - translations[None, :, :], axis=2
+    )
+    rotation_distance = np.empty((len(transforms), len(transforms)), dtype=np.float64)
+    for index, rotation in enumerate(rotations):
+        rotation_distance[index] = (rotation.inv() * rotations).magnitude()
+    compatible = (
+        (translation_distance <= translation_threshold_m)
+        & (rotation_distance <= rotation_threshold_rad)
+    )
+    counts = compatible.sum(axis=1)
+    center = int(np.flatnonzero(counts == counts.max())[0])
+    return np.flatnonzero(compatible[center])
+
+
 def detect_tag(cv2: Any, image: np.ndarray, family: str, tag_id: int) -> np.ndarray | None:
     aruco = cv2.aruco
     image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -95,8 +120,15 @@ def main() -> int:
     parser.add_argument("--tag-id", type=int, default=0)
     parser.add_argument("--tag-family", choices=("tag36h11", "tag25h9", "tag16h5"), default="tag36h11")
     parser.add_argument("--min-detections", type=int, default=10)
+    parser.add_argument("--pose-cluster-translation-m", type=float, default=0.010)
+    parser.add_argument("--pose-cluster-rotation-deg", type=float, default=1.0)
     args = parser.parse_args()
-    if args.tag_size_m <= 0 or args.min_detections <= 0:
+    if (
+        args.tag_size_m <= 0
+        or args.min_detections <= 0
+        or args.pose_cluster_translation_m <= 0
+        or args.pose_cluster_rotation_deg <= 0
+    ):
         parser.error("tag-size-m and min-detections must be positive")
 
     try:
@@ -142,8 +174,22 @@ def main() -> int:
 
     if len(records) < args.min_detections:
         raise SystemExit(f"Only {len(records)} valid tag detections; need at least {args.min_detections}")
-    translations = np.asarray([record["world_T_camera"] for record in records], dtype=np.float64)[:, :3, 3]
-    rotations = Rotation.from_matrix(np.asarray([record["world_T_camera"] for record in records])[:, :3, :3])
+    transforms = np.asarray(
+        [record["world_T_camera"] for record in records], dtype=np.float64
+    )
+    cluster_indices = dominant_pose_cluster(
+        transforms,
+        Rotation,
+        translation_threshold_m=args.pose_cluster_translation_m,
+        rotation_threshold_rad=np.deg2rad(args.pose_cluster_rotation_deg),
+    )
+    if len(cluster_indices) < args.min_detections:
+        raise SystemExit(
+            f"Dominant pose cluster has only {len(cluster_indices)} frames; "
+            f"need at least {args.min_detections}"
+        )
+    translations = transforms[cluster_indices, :3, 3]
+    rotations = Rotation.from_matrix(transforms[cluster_indices, :3, :3])
     median_translation = np.median(translations, axis=0)
     mean_rotation = Rotation.from_quat(rotations.as_quat()).mean()
     estimate = np.eye(4, dtype=np.float64)
@@ -152,11 +198,24 @@ def main() -> int:
     result = {
         "format": "real_exp_camera_to_world_v1",
         "input": str(args.input),
+        "device": metadata.get("device"),
+        "color_intrinsics": intrinsics,
         "tag": {"family": args.tag_family, "id": args.tag_id, "size_m": args.tag_size_m},
         "world_T_tag": matrix_to_list(world_t_tag),
         "physical_tag_T_pnp_tag": matrix_to_list(PHYSICAL_TAG_T_PNP_TAG),
         "world_T_camera": matrix_to_list(estimate),
         "valid_detections": len(records),
+        "dominant_pose_cluster": {
+            "frame_count": int(len(cluster_indices)),
+            "frame_indices": [int(records[index]["index"]) for index in cluster_indices],
+            "excluded_frame_indices": [
+                int(record["index"])
+                for index, record in enumerate(records)
+                if index not in set(cluster_indices.tolist())
+            ],
+            "translation_threshold_m": args.pose_cluster_translation_m,
+            "rotation_threshold_deg": args.pose_cluster_rotation_deg,
+        },
         "reprojection_rmse_px_median": float(
             np.median([record["reprojection_rmse_px"] for record in records])
         ),
@@ -164,7 +223,11 @@ def main() -> int:
     }
     output = args.output or (args.input / "camera_to_world.json")
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    print(f"saved {output} from {len(records)} detections; median reprojection RMSE={result['reprojection_rmse_px_median']:.3f}px")
+    print(
+        f"saved {output} from {len(records)} detections "
+        f"({len(cluster_indices)} in dominant pose cluster); median reprojection "
+        f"RMSE={result['reprojection_rmse_px_median']:.3f}px"
+    )
     return 0
 
 

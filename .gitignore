@@ -206,6 +206,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+.vendor
+
 .codex
 .hf-cache
 

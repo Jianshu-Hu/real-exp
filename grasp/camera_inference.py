@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run RGB-D grasp inference using only the connected D435 camera.
+"""Run RGB-D grasp inference using one or two calibrated RealSense cameras.
 
 The script fuses consecutive aligned depth frames, transforms the valid depth
 points into the calibrated world frame, runs generator/retargeting/refinement,
@@ -30,8 +30,8 @@ from grasp.inference_client import (
     _write_ply_mesh,
     _write_ply_points,
     backproject_depth,
-    filter_and_sample_points,
     load_calibration_transforms,
+    load_l515_calibration,
     run_model,
 )
 from grasp.common import (
@@ -53,9 +53,30 @@ def add_camera_inference_arguments(
     parser.add_argument("--mount-calibration", type=Path, default=Path(__file__).resolve().parent / "ee_to_wuji_nominal.json")
     parser.add_argument("--camera-serial", default=DEFAULT_CAMERA_SERIAL)
     parser.add_argument(
+        "--secondary-camera-serial",
+        default=None,
+        help="Enable a second RealSense (for example an L515) with this serial.",
+    )
+    parser.add_argument(
+        "--l515-only",
+        action="store_true",
+        help="Capture and infer from only the calibrated L515 camera.",
+    )
+    parser.add_argument("--secondary-width", type=int, default=1280)
+    parser.add_argument("--secondary-height", type=int, default=720)
+    parser.add_argument("--secondary-depth-width", type=int, default=640)
+    parser.add_argument("--secondary-depth-height", type=int, default=480)
+    parser.add_argument("--secondary-fps", type=int, default=30)
+    parser.add_argument(
         "--camera-python",
         default="/usr/bin/python3",
         help="Python interpreter containing pyrealsense2 (default: /usr/bin/python3).",
+    )
+    parser.add_argument(
+        "--camera-pythonpath",
+        type=Path,
+        default=None,
+        help="Optional directory prepended to PYTHONPATH for the capture helper.",
     )
     parser.add_argument(
         "--capture-script",
@@ -99,6 +120,15 @@ def add_camera_inference_arguments(
             "filled along local point-to-point edges (default: 2048)."
         ),
     )
+    parser.add_argument(
+        "--fusion-voxel-size-m",
+        type=float,
+        default=0.003,
+        help=(
+            "Deduplicate the merged world cloud on this voxel grid before "
+            "sampling; set to 0 to disable (default: 0.003 m)."
+        ),
+    )
     parser.add_argument("--world-z-segmentation-min-m", type=float, default=0.002)
     parser.add_argument("--generator-weights", choices=("ema", "model"), default="ema")
     parser.add_argument(
@@ -128,6 +158,18 @@ def validate_camera_inference_args(
 ) -> None:
     if args.width <= 0 or args.height <= 0 or args.fps <= 0:
         parser.error("camera width, height, and fps must be positive")
+    if min(
+        args.secondary_width,
+        args.secondary_height,
+        args.secondary_depth_width,
+        args.secondary_depth_height,
+        args.secondary_fps,
+    ) <= 0:
+        parser.error("secondary camera width, height, and fps must be positive")
+    if args.secondary_camera_serial == args.camera_serial:
+        parser.error("primary and secondary camera serials must differ")
+    if args.l515_only and args.secondary_camera_serial is not None:
+        parser.error("--l515-only cannot be combined with --secondary-camera-serial")
     if args.warmup_frames < 0:
         parser.error("warmup-frames must be non-negative")
     if args.observation_frames <= 0:
@@ -140,6 +182,8 @@ def validate_camera_inference_args(
         parser.error("every --world-max value must exceed --world-min")
     if min(args.num_points, args.min_filtered_points) <= 0:
         parser.error("point counts must be positive")
+    if args.fusion_voxel_size_m < 0:
+        parser.error("fusion-voxel-size-m must be non-negative")
     if args.semantic_refine_steps < 0 or args.max_penetration_m < 0:
         parser.error("refinement steps and penetration limit must be non-negative")
     for path, name in (
@@ -163,7 +207,16 @@ def _world_hand_pose(refined: Any) -> np.ndarray:
     return pose
 
 
-def _capture_with_system_python(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+def _capture_with_system_python(
+    args: argparse.Namespace,
+    *,
+    camera_serial: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    fps: int | None = None,
+    depth_width: int | None = None,
+    depth_height: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """Capture RGB-D in a separate interpreter that has pyrealsense2 installed."""
     camera_python = shutil.which(str(args.camera_python)) or str(args.camera_python)
     if not Path(camera_python).is_file():
@@ -178,13 +231,13 @@ def _capture_with_system_python(args: argparse.Namespace) -> tuple[np.ndarray, n
             "--output-dir",
             str(capture_dir),
             "--camera-serial",
-            str(args.camera_serial),
+            str(camera_serial or args.camera_serial),
             "--width",
-            str(args.width),
+            str(width or args.width),
             "--height",
-            str(args.height),
+            str(height or args.height),
             "--fps",
-            str(args.fps),
+            str(fps or args.fps),
             "--warmup-frames",
             str(args.warmup_frames),
             "--observation-frames",
@@ -192,7 +245,29 @@ def _capture_with_system_python(args: argparse.Namespace) -> tuple[np.ndarray, n
             "--min-valid-depth-ratio",
             str(args.min_valid_depth_ratio),
         ]
-        completed = subprocess.run(command, text=True, capture_output=True)
+        if depth_width is not None:
+            command.extend(("--depth-width", str(depth_width)))
+        if depth_height is not None:
+            command.extend(("--depth-height", str(depth_height)))
+        capture_environment = None
+        if args.camera_pythonpath is not None:
+            if not args.camera_pythonpath.is_dir():
+                raise FileNotFoundError(
+                    f"camera Python package directory does not exist: {args.camera_pythonpath}"
+                )
+            import os
+
+            capture_environment = os.environ.copy()
+            existing_pythonpath = capture_environment.get("PYTHONPATH")
+            capture_environment["PYTHONPATH"] = str(args.camera_pythonpath) + (
+                f":{existing_pythonpath}" if existing_pythonpath else ""
+            )
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            env=capture_environment,
+        )
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise RuntimeError(
@@ -203,6 +278,59 @@ def _capture_with_system_python(args: argparse.Namespace) -> tuple[np.ndarray, n
         depth = np.load(capture_dir / "depth.npy")
         metadata = json.loads((capture_dir / "metadata.json").read_text(encoding="utf-8"))
     return rgb, depth, metadata
+
+
+def _camera_world_cloud(
+    depth: np.ndarray,
+    camera: dict[str, Any],
+    world_t_camera: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Back-project one camera and return valid and workspace-cropped world points."""
+    camera_points, depth_m = backproject_depth(
+        depth, camera["intrinsics"], camera["depth_scale_m"]
+    )
+    valid_depth = (
+        np.isfinite(depth_m)
+        & (depth_m >= args.min_depth_m)
+        & (depth_m <= args.max_depth_m)
+    )
+    valid_world = transform_points(world_t_camera, camera_points[valid_depth])
+    lower = np.asarray(args.world_min, dtype=np.float32)
+    upper = np.asarray(args.world_max, dtype=np.float32)
+    keep = np.all((valid_world >= lower) & (valid_world <= upper), axis=1)
+    return valid_world, valid_world[keep]
+
+
+def _sample_merged_world_points(
+    filtered_world: np.ndarray, args: argparse.Namespace
+) -> np.ndarray:
+    if filtered_world.shape[0] < args.min_filtered_points:
+        raise ValueError(
+            f"only {filtered_world.shape[0]} points remain after filtering; "
+            f"need at least {args.min_filtered_points}"
+        )
+    rng = np.random.default_rng(args.seed)
+    if filtered_world.shape[0] >= args.num_points:
+        indices = rng.choice(
+            filtered_world.shape[0], size=args.num_points, replace=False
+        )
+        return filtered_world[indices].astype(np.float32)
+    # Reuse the established local-neighbour interpolation behavior for sparse clouds.
+    from grasp.inference_client import _interpolate_local_points
+
+    return _interpolate_local_points(
+        filtered_world, args.num_points, rng
+    ).astype(np.float32)
+
+
+def _voxel_deduplicate(points: np.ndarray, voxel_size_m: float) -> np.ndarray:
+    """Retain one deterministic representative per world-aligned voxel."""
+    if voxel_size_m <= 0 or points.shape[0] == 0:
+        return points
+    voxels = np.floor(points / voxel_size_m).astype(np.int64)
+    _, indices = np.unique(voxels, axis=0, return_index=True)
+    return points[np.sort(indices)]
 
 
 def _write_coordinate_outputs(
@@ -294,33 +422,126 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
         stage = "calibration"
         _write_run_status(args.output_dir, status="running", stage=stage)
         transforms = load_calibration_transforms(args.mount_calibration)
+        l515_t = load_l515_calibration("f1480539") if args.l515_only else None
+        d435i_t_l515 = (
+            load_l515_calibration(args.secondary_camera_serial)
+            if args.secondary_camera_serial is not None
+            else None
+        )
 
         stage = "camera_capture"
         _write_run_status(args.output_dir, status="running", stage=stage)
-        rgb, depth, camera = _capture_with_system_python(args)
+        if args.l515_only:
+            assert l515_t is not None
+            rgb, depth, camera = _capture_with_system_python(
+                args,
+                camera_serial="f1480539",
+                width=args.secondary_width,
+                height=args.secondary_height,
+                fps=args.secondary_fps,
+                depth_width=args.secondary_depth_width,
+                depth_height=args.secondary_depth_height,
+            )
+            primary_role = "l515_only"
+            primary_world_t_camera = transforms["world_T_camera"] @ l515_t
+        else:
+            rgb, depth, camera = _capture_with_system_python(args)
+            primary_role = "primary_d435i"
+            primary_world_t_camera = transforms["world_T_camera"]
         if rgb.shape[:2] != depth.shape:
             raise ValueError("RGB and aligned depth image dimensions differ")
         np.save(args.output_dir / "rgb_bgr.npy", rgb)
         np.save(args.output_dir / "depth_raw.npy", depth)
         _write_json(args.output_dir / "camera.json", camera)
 
+        cameras: list[dict[str, Any]] = [
+            {
+                "role": primary_role,
+                "metadata": camera,
+                "world_T_camera": primary_world_t_camera,
+                "rgb": rgb,
+                "depth": depth,
+            }
+        ]
+        if args.secondary_camera_serial is not None:
+            assert d435i_t_l515 is not None
+            secondary_world_t_camera = (
+                transforms["world_T_camera"] @ d435i_t_l515
+            )
+            secondary_rgb, secondary_depth, secondary_camera = (
+                _capture_with_system_python(
+                    args,
+                    camera_serial=args.secondary_camera_serial,
+                    width=args.secondary_width,
+                    height=args.secondary_height,
+                    fps=args.secondary_fps,
+                    depth_width=args.secondary_depth_width,
+                    depth_height=args.secondary_depth_height,
+                )
+            )
+            if secondary_rgb.shape[:2] != secondary_depth.shape:
+                raise ValueError("secondary RGB and aligned depth dimensions differ")
+            cameras.append(
+                {
+                    "role": "secondary_l515",
+                    "metadata": secondary_camera,
+                    "world_T_camera": secondary_world_t_camera,
+                    "rgb": secondary_rgb,
+                    "depth": secondary_depth,
+                }
+            )
+
+        camera_root = args.output_dir / "cameras"
+        for item in cameras:
+            camera_dir = camera_root / item["role"]
+            camera_dir.mkdir(parents=True, exist_ok=True)
+            np.save(camera_dir / "rgb_bgr.npy", item["rgb"])
+            np.save(camera_dir / "depth_raw.npy", item["depth"])
+            _write_json(camera_dir / "camera.json", item["metadata"])
+
         stage = "point_cloud_filtering"
         _write_run_status(args.output_dir, status="running", stage=stage)
-        camera_points, depth_m = backproject_depth(
-            depth, camera["intrinsics"], camera["depth_scale_m"]
+        unfiltered_clouds: list[np.ndarray] = []
+        filtered_clouds: list[np.ndarray] = []
+        camera_filter_records: list[dict[str, Any]] = []
+        for item in cameras:
+            valid_world, camera_filtered_world = _camera_world_cloud(
+                item["depth"],
+                item["metadata"],
+                item["world_T_camera"],
+                args,
+            )
+            unfiltered_clouds.append(valid_world)
+            filtered_clouds.append(camera_filtered_world)
+            camera_filter_records.append(
+                {
+                    "role": item["role"],
+                    "camera_serial": item["metadata"].get("camera_serial"),
+                    "valid_depth_points": int(valid_world.shape[0]),
+                    "filtered_world_points": int(camera_filtered_world.shape[0]),
+                }
+            )
+            _write_ply_points(
+                camera_root / item["role"] / "points_world_filtered.ply",
+                camera_filtered_world,
+            )
+        unfiltered_world = np.concatenate(unfiltered_clouds, axis=0)
+        filtered_world_raw = np.concatenate(filtered_clouds, axis=0)
+        filtered_world = _voxel_deduplicate(
+            filtered_world_raw, args.fusion_voxel_size_m
         )
-        valid_camera, filtered_world, sampled_world = filter_and_sample_points(
-            camera_points, depth_m, transforms["world_T_camera"], args
-        )
-        unfiltered_world = transform_points(transforms["world_T_camera"], valid_camera)
+        sampled_world = _sample_merged_world_points(filtered_world, args)
         filter_record = {
             "min_depth_m": args.min_depth_m,
             "max_depth_m": args.max_depth_m,
             "world_min": args.world_min,
             "world_max": args.world_max,
-            "valid_depth_points": int(valid_camera.shape[0]),
+            "valid_depth_points": int(unfiltered_world.shape[0]),
+            "filtered_world_points_before_voxel_fusion": int(filtered_world_raw.shape[0]),
             "filtered_world_points": int(filtered_world.shape[0]),
             "generator_input_points": int(sampled_world.shape[0]),
+            "fusion_voxel_size_m": args.fusion_voxel_size_m,
+            "cameras": camera_filter_records,
         }
         _write_json(args.output_dir / "filter.json", filter_record)
         world_dir = args.output_dir / "world"
@@ -383,6 +604,14 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
             "status": "completed" if penetration_accepted else "rejected",
             "rejection_reason": rejection_reason,
             "camera": camera,
+            "cameras": [
+                {
+                    "role": item["role"],
+                    "metadata": item["metadata"],
+                    "world_T_camera": item["world_T_camera"].tolist(),
+                }
+                for item in cameras
+            ],
             "calibration": {
                 "world_T_camera": transforms["world_T_camera"].tolist(),
                 "base_T_camera": transforms["base_T_camera"].tolist(),

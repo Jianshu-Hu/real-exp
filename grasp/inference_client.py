@@ -30,6 +30,16 @@ from grasp.common import (
 
 
 DEFAULT_CAMERA_SERIAL = "401622071701"
+CALIBRATED_L515_SERIAL: str | None = "f1480539"
+CALIBRATED_D435I_T_L515: np.ndarray | None = np.asarray(
+    [
+        [-0.997594459, 0.068617076, 0.009848427, 0.023147317],
+        [-0.000304589, -0.146409000, 0.989224096, -0.728169935],
+        [0.069319564, 0.986841477, 0.146077708, 0.980355134],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
 FINGER_NAMES = ("thumb", "index", "middle", "ring", "pinky")
 ASSETS_ROOT = Path(__file__).resolve().parent / "assets"
 DEFAULT_GENERATOR_CHECKPOINT = ASSETS_ROOT / "checkpoints" / "generator_best.pt"
@@ -37,9 +47,11 @@ DEFAULT_MANO_ROOT = ASSETS_ROOT / "mano"
 DEFAULT_WUJI_HAND2_ROOT = ASSETS_ROOT / "Wuji_hand2"
 DEFAULT_MOUNT_CALIBRATION = Path(__file__).resolve().parent / "ee_to_wuji_nominal.json"
 
-# Calibrated transforms from calibration/matrix.md.  The right-arm matrix is
+# Calibrated transforms from calibration/matrix.md. The right-arm matrix is
 # recorded as C_T_B_R (right robot base -> camera), while the command path
-# needs B_R_T_C; it is inverted when the transform bundle is built below.
+# needs B_R_T_C; it is inverted when the transform bundle is built below. The
+# L515 matrix is D435I_T_L515 and is composed with WORLD_T_D435I by dual-camera
+# inference.
 CALIBRATED_WORLD_T_CAMERA = np.asarray(
     [
         [0.016116505, -0.947169025, 0.320329670, -0.394891761],
@@ -79,6 +91,23 @@ def load_calibration_transforms(mount_path: Path) -> dict[str, np.ndarray]:
         "base_T_world": read_transform(base_t_world, "base_T_world"),
         "ee_T_hand": ee_t_hand,
     }
+
+
+def load_l515_calibration(l515_serial: str) -> np.ndarray:
+    """Return the documented D435i_T_L515 transform for the installed L515."""
+    if CALIBRATED_L515_SERIAL is None or CALIBRATED_D435I_T_L515 is None:
+        raise ValueError(
+            "L515 extrinsic calibration is not installed: add the measured "
+            "D435I_T_L515 and L515 serial to calibration/matrix.md, then copy "
+            "them into CALIBRATED_D435I_T_L515 and CALIBRATED_L515_SERIAL in "
+            "grasp/inference_client.py"
+        )
+    if str(l515_serial) != CALIBRATED_L515_SERIAL:
+        raise ValueError(
+            f"requested L515 serial {l515_serial!r} does not match calibrated "
+            f"serial {CALIBRATED_L515_SERIAL!r}"
+        )
+    return read_transform(CALIBRATED_D435I_T_L515, "D435I_T_L515")
 
 
 def build_parser() -> argparse.ArgumentParser:

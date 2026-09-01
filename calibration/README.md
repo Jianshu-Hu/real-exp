@@ -1,5 +1,111 @@
 # Calibration Data Collection
 
+## D435i + L515 pair calibration for grasp fusion
+
+The RealSense devices already contain factory-calibrated intrinsics and
+depth-to-color extrinsics. The calibration needed for two-camera point-cloud
+fusion is the rigid transform between the installed D435i and L515. Re-run
+this calibration whenever either camera mount moves.
+
+Keep both cameras mounted in their final grasping positions. Place the same
+flat AprilTag where both color cameras see it clearly. The tag may be tilted
+or raised and does not need to be at the robot world origin, but the tag and
+both cameras must remain completely fixed throughout both captures. Use a
+large rigidly backed tag, measure its black-square side length accurately, and
+avoid a nearly edge-on view.
+
+First list the devices and note the L515 serial (the D435i serial used by the
+grasp pipeline is `401622071701`):
+
+```bash
+rs-enumerate-devices -s
+```
+
+The L515 is discontinued and is not exposed by the system's current
+librealsense 2.58 SDK even though `lsusb` sees it. This installation uses the
+last L500-compatible Python binding, 2.54.2, isolated from the system SDK:
+
+```bash
+conda run -n pose python -m pip install \
+  --target "$PWD/.vendor/l515_realsense" \
+  pyrealsense2==2.54.2.5684
+```
+
+On this computer, that binding reports L515 serial `f1480539`, firmware
+`1.5.4.1`. It supports `1280x720@30` color and `640x480@30` depth; aligned
+depth is saved at the color resolution. Do not request native `640x480` color
+from this L515 firmware.
+
+Capture 100 frames from each device. Replace `L515_SERIAL` and use a new
+output directory name on every attempt because the collector refuses to
+overwrite calibration evidence:
+
+```bash
+PYTHONPATH="$PWD/.vendor/l515_realsense" \
+conda run --no-capture-output -n pose python \
+  calibration/collect_camera_world_data.py \
+  --camera-serial 401622071701 \
+  --output calibration/runs/pair_d435i \
+  --frames 100 --width 640 --height 480 --fps 30
+
+PYTHONPATH="$PWD/.vendor/l515_realsense" \
+conda run --no-capture-output -n pose python \
+  calibration/collect_camera_world_data.py \
+  --camera-serial f1480539 \
+  --output calibration/runs/pair_l515 \
+  --frames 100 --width 1280 --height 720 \
+  --depth-width 640 --depth-height 480 --fps 30
+```
+
+Process both captures with identical tag parameters. The example below is for
+the repository's 94 mm tag36h11 marker, ID 0; use the measured size and actual
+ID of your marker:
+
+```bash
+conda run -n wjh_grasp python calibration/calibrate_camera_to_world.py \
+  --input calibration/runs/pair_d435i \
+  --tag-size-m 0.094 --tag-family tag36h11 --tag-id 0
+
+conda run -n wjh_grasp python calibration/calibrate_camera_to_world.py \
+  --input calibration/runs/pair_l515 \
+  --tag-size-m 0.094 --tag-family tag36h11 --tag-id 0
+```
+
+Inspect both solver summaries. Require many detections spread over the capture
+and a small reprojection RMSE (less than about 0.5 px is a useful starting
+criterion). Read `world_T_camera` from each generated `camera_to_world.json`
+and compose the required relative transform using:
+
+```text
+D435I_T_L515 = inverse(WORLD_T_D435I_PAIR) @ WORLD_T_L515_PAIR
+```
+
+Here both `WORLD_T_*_PAIR` matrices are estimates against the same unmoved tag
+and therefore share an arbitrary calibration-target frame; this composition
+cancels that frame. Record the result in the L515 section of
+`calibration/matrix.md`, then copy the same serial and matrix into
+`CALIBRATED_L515_SERIAL` and `CALIBRATED_D435I_T_L515` in
+`grasp/inference_client.py`:
+
+```python
+CALIBRATED_L515_SERIAL = "L515_SERIAL"
+CALIBRATED_D435I_T_L515 = np.asarray(
+    [
+        [r11, r12, r13, tx],
+        [r21, r22, r23, ty],
+        [r31, r32, r33, tz],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+```
+
+Inference validates the requested serial against that constant and validates
+the matrix as a rigid transform before opening either camera. Reprojection
+error checks image fitting, not final 3-D alignment, so always perform the
+fused-cloud check described in `grasp/README.md` before allowing robot
+execution.
+
 `collect_camera_world_data.py` records the inputs needed for a later
 camera-to-world AprilTag pose solve. It does not estimate or apply any
 transform.
@@ -9,6 +115,7 @@ installed:
 
 ```bash
 python calibration/collect_camera_world_data.py \
+  --camera-serial 401622071701 \
   --output calibration/runs/table_tag_20260824 \
   --frames 100 \
   --fps 30

@@ -39,6 +39,23 @@ wait_for_tcp_listener() {
   die "${label} did not open local TCP port ${port} within 5 seconds"
 }
 
+wait_for_fr3_state() {
+  local controller_pid="$1"
+  local attempt
+  local topic_output
+  for ((attempt = 0; attempt < 150; attempt += 1)); do
+    if ! kill -0 "${controller_pid}" 2>/dev/null; then
+      wait "${controller_pid}" 2>/dev/null || true
+      die "FR3 controller exited before receiving robot state. Enable FCI mode in Desk and verify the robot IP/network."
+    fi
+    if topic_output="$(timeout 0.2s ros2 topic echo --once /right/franka/joint_states 2>/dev/null)" && [[ -n "${topic_output}" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  die "FR3 controller did not publish /right/franka/joint_states within 30 seconds. Enable FCI mode in Desk and verify the robot IP/network."
+}
+
 stop_child_groups() {
   local child_pid
   local attempt
@@ -217,7 +234,10 @@ if [[ "${no_controllers}" -eq 0 ]]; then
     wait_for_tcp_listener 5557 "${bridge_pid}" "LeRobot camera-cache publisher"
     wait_for_tcp_listener "${telemetry_port}" "${bridge_pid}" "LeRobot hand-telemetry receiver"
   fi
-  setsid ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py "robot_config_file:=${robot_config}" deployment_mode:=true & child_pids+=("$!")
+  setsid ros2 launch franka_fr3_arm_controllers franka_fr3_arm_controllers.launch.py "robot_config_file:=${robot_config}" deployment_mode:=true &
+  controller_pid="$!"
+  child_pids+=("${controller_pid}")
+  wait_for_fr3_state "${controller_pid}"
   deployment_env="${DEPLOYMENT_CONDA_ENV:-${LEROBOT_CONDA_ENV:-lerobot}}"
   declare -a hand_python=()
   real_exp_build_conda_python_command "${deployment_env}" hand_python || exit 1

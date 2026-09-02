@@ -104,6 +104,11 @@ PATH="$HOME/anaconda3/bin:$PATH" \
   --local-bridge
 ```
 
+Before running the client, put the FR3 into **FCI mode** in Franka Desk. The
+launcher waits for the first `/right/franka/joint_states` message before it
+starts the Wuji worker; if FCI is disabled, it exits with a direct diagnostic
+instead of starting a hand process that cannot be used.
+
 If SDK discovery cannot find the powered Wuji hand, add its verified SDK
 address (do not guess it):
 
@@ -142,8 +147,10 @@ cd /home/landau/real-exp
     --state-connect tcp://127.0.0.1:5555 \
     --arm-command-connect tcp://127.0.0.1:5556 \
     --robot-urdf /home/landau/real-exp/simtoolreal/assets/fr3v2_wuji_hand2_right_slanted.urdf \
-    --goal-pose '1,0,0,0,0,1,0,0,0,0,1,0.6,0,0,0,1' \
-    --world-from-camera '1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1'
+    --goal-pose /home/landau/real-exp/calibration/generated/simtoolreal_policy_frame/goal_policy.json \
+    --pose-frame camera \
+    --world-from-camera /home/landau/real-exp/calibration/generated/simtoolreal_policy_frame/world_from_camera_policy.json \
+    --world-from-robot /home/landau/real-exp/calibration/generated/simtoolreal_policy_frame/world_from_robot_policy.json
 ```
 
 The expected first line is:
@@ -162,10 +169,49 @@ The explicit local addresses are intentional: state and arm commands connect
 to the bridge on the client. Pose `:5570` and policy RPC `:5571` use
 `--server-ip 192.168.50.13` and therefore connect to the server.
 
-The transforms above are deterministic placeholders for pipeline testing:
-`world_from_camera` is identity and `goal_pose` is identity rotation translated
-to `(0, 0, 0.6)` metres. They have no valid physical calibration meaning.
-**Never add `--execute` while using these placeholder transforms.**
+Before this command, generate the scheme-2 frame from the measured calibration
+matrices. The generated `world_from_camera_policy.json` maps D435 camera
+coordinates into the pretrained policy world `Wp`; the generated
+`world_from_robot_policy.json` is the unchanged training pose of the URDF root
+(`trapezoid_base`).
+
+On the machine containing this checkout:
+
+```bash
+cd /home/pair1/real-exp
+python calibration/build_simtoolreal_policy_frame.py \
+  --input calibration/simtoolreal_scheme2_input.json \
+  --urdf simtoolreal/assets/fr3v2_wuji_hand2_right_slanted.urdf
+```
+
+Copy the generated directory to the robot client before launching the executor:
+
+```bash
+scp -r pair1@192.168.50.13:/home/pair1/real-exp/calibration/generated \
+  /home/landau/real-exp/calibration/
+```
+
+The input JSON must contain `Wreal_T_C` and `C_T_B_R`, using the convention
+`A_T_B` maps points from frame B into frame A. After measuring and saving the
+desired 4x4 tabletop-world goal `Wreal_T_G`, run the generator again with:
+
+```bash
+python calibration/build_simtoolreal_policy_frame.py \
+  --input calibration/simtoolreal_scheme2_input.json \
+  --urdf simtoolreal/assets/fr3v2_wuji_hand2_right_slanted.urdf \
+  --real-world-goal /absolute/path/to/real_world_goal.json
+```
+
+The script then writes `goal_policy.json = Wp_T_Wreal @ Wreal_T_G`. The
+`--goal-pose` path is therefore a policy-world pose, not a camera- or
+tabletop-world pose. Do not invent a goal matrix merely to satisfy the
+argument; omit `--real-world-goal` until a safe target has been measured.
+
+Run the executor without `--execute` first. Confirm that the projected object
+box follows the real object, the reported `object_xyz` is plausible, the goal
+is in the intended workspace, and the robot FK/palm pose agrees with the
+physical right arm. Only then should an operator add `--execute`, with the
+workspace clear and the emergency stop ready.
 
 ## Manual client startup (diagnostics/fallback)
 

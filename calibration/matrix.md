@@ -24,8 +24,8 @@ Both robot-base calibrations use the `cam_front` color profile for serial
 ## L515 to D435i
 
 The installed L515 is serial `f1480539`, firmware `1.5.4.1`. The current pair
-calibration was captured on 2026-09-10 with both fixed cameras observing the
-same unmoved 95 mm tag36h11 marker, ID 0.
+calibration was recaptured on 2026-09-10 at 19:24--19:25 CST with both fixed
+cameras observing the same unmoved 95 mm tag36h11 marker, ID 0.
 
 - D435i reference serial: `401622071701`
 - L515 serial: `f1480539`
@@ -35,9 +35,9 @@ same unmoved 95 mm tag36h11 marker, ID 0.
 
 ```text
 D435I_T_L515 =
-[[ -0.997838321,  0.064017235,  0.014848557, -0.011125084],
- [  0.016650444,  0.027705863,  0.999477437, -0.878630524],
- [  0.063572390,  0.997564123, -0.028711887,  0.962116441],
+[[ -0.421118632, -0.558109517,  0.714963541, -0.473215966],
+ [  0.870301936, -0.026668864,  0.491796006, -0.333840599],
+ [ -0.255408766,  0.829338615,  0.496954548,  0.781269400],
  [  0.000000000,  0.000000000,  0.000000000,  1.000000000]]
 
 p_D435I = D435I_T_L515 @ p_L515
@@ -46,35 +46,40 @@ W_T_L515 = W_T_D435I @ D435I_T_L515
 
 Calibration evidence:
 
-- D435i capture: `calibration/runs/d435i_pair_20260910_104846`
-- L515 capture: `calibration/runs/l515_pair_20260910_104928`
-- Pair result JSON: `calibration/runs/d435i_T_l515_20260910.json`
+- D435i capture: `calibration/runs/d435i_recal_20260910_1924`
+- L515 capture: `calibration/runs/l515_recal_20260910_1925`
+- Pair result JSON: `calibration/runs/d435i_T_l515_20260910_1925.json`
 - Composition: `D435I_T_L515 = inverse(WORLD_T_D435I_PAIR) @
   WORLD_T_L515_PAIR`, using `world_T_camera` from the two capture directories'
   `camera_to_world.json` files
 - Tag parameters: `tag36h11`, ID `0`, measured black-square side `0.095 m`
-- Saved RGB and aligned depth geometry: `1280x720` for both cameras
-- D435i native streams: `1280x720@30` color and depth
+- Saved D435i RGB and aligned depth geometry: `640x480`
+- D435i native streams: `640x480@30` color and depth
 - L515 native streams: `1280x720@30` color, `640x480@30` depth; depth aligned
   into the color pixel grid before saving
-- D435i color/depth timestamp gap: median/max `0.023/99.714 ms`
-- L515 color/depth timestamp gap: median/max `5.986/6.861 ms`
+- D435i color/depth timestamp gap: median/max `0.017/0.018 ms`
+- L515 color/depth timestamp gap: median/max `6.549/7.405 ms`
 - D435i Tag detections and dominant cluster: `100/100`; median/max reprojection
-  RMSE `0.086/0.086 px`
-- L515 Tag detections and dominant cluster: `100/100`; median/max reprojection
-  RMSE `0.444/0.444 px` (mean `0.401 px`)
-- Optical-origin baseline: `1.302990 m`
-- Independent live fused-depth validation for this 2026-09-10 matrix is
-  pending. Perform the 15-frame temporal-median / 3 mm-voxel check before
-  allowing robot execution; the validation numbers from the previous
-  2026-09-01 matrix are not applicable to this replacement matrix.
+  RMSE `0.214/0.214 px`
+- L515 Tag detections and dominant cluster: `100/95`; median/max reprojection
+  RMSE `0.359/0.461 px` (mean `0.296 px`); frames `9`, `19`, `24`, `83`, and
+  `90` were excluded from the dominant pose cluster
+- Optical-origin baseline: `0.972504 m`
+- Independent fused-depth validation capture:
+  `calibration/runs/fusion_check_20260910_1930`
+- The validation used 15-frame per-pixel nonzero medians, a `0.2--2.0 m`
+  depth range, and 3 mm voxels. In the common robust-bounds region, the new
+  transform's symmetric nearest-neighbor distance was `9.129 mm` median and
+  `22.995 mm` at p90, with `74.576%` of points within `15 mm`.
+- On the same validation capture, the previous runtime transform produced
+  `13.011 mm` median, `102.223 mm` at p90, and `55.240%` within `15 mm`.
+  The new transform therefore materially improves independent depth alignment.
 
 The solver selects the largest pairwise SE(3) cluster within 10 mm and 1 degree
 before averaging, preventing low-reprojection planar-PnP branch flips from
-biasing the installed transform. The D435i capture contains one color/depth
-timestamp gap near the 100 ms collection limit; this does not affect the RGB
-AprilTag solve, but fused-depth validation remains required before hardware
-execution.
+biasing the installed transform. The numerical fused-depth check passed, but
+the generated fused cloud should still be inspected visually for doubled edges
+before hardware execution.
 
 ## Left Robot Base to Camera
 

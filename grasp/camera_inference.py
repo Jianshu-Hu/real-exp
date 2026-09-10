@@ -661,10 +661,18 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
             )
         unfiltered_world = np.concatenate(unfiltered_clouds, axis=0)
         filtered_world_raw = np.concatenate(filtered_clouds, axis=0)
+
+        # Persist the diagnostic clouds before sampling.  Sampling deliberately
+        # fails when the workspace crop is empty (or too sparse), but the raw
+        # world cloud is still the most useful artifact for diagnosing a bad
+        # workspace box or a camera pose/calibration problem.
+        world_dir = args.output_dir / "world"
+        world_dir.mkdir(parents=True, exist_ok=True)
+        _write_ply_points(world_dir / "scene_points_unfiltered.ply", unfiltered_world)
+
         filtered_world, fusion_record = _fuse_world_clouds(
             filtered_clouds_by_role, args
         )
-        sampled_world = _sample_merged_world_points(filtered_world, args)
         filter_record = {
             "min_depth_m": args.min_depth_m,
             "max_depth_m": args.max_depth_m,
@@ -673,16 +681,20 @@ def run_camera_inference(args: argparse.Namespace) -> dict[str, Any]:
             "valid_depth_points": int(unfiltered_world.shape[0]),
             "filtered_world_points_before_voxel_fusion": int(filtered_world_raw.shape[0]),
             "filtered_world_points": int(filtered_world.shape[0]),
-            "generator_input_points": int(sampled_world.shape[0]),
+            "generator_input_points": 0,
             "fusion_voxel_size_m": args.fusion_voxel_size_m,
             "fusion": fusion_record,
             "cameras": camera_filter_records,
         }
-        _write_json(args.output_dir / "filter.json", filter_record)
-        world_dir = args.output_dir / "world"
-        world_dir.mkdir(parents=True, exist_ok=True)
-        _write_ply_points(world_dir / "scene_points_unfiltered.ply", unfiltered_world)
         _write_ply_points(world_dir / "scene_points_filtered.ply", filtered_world)
+
+        # Write the filtering record even when the minimum-point check below
+        # raises, so the failure directory contains the counts that explain it.
+        _write_json(args.output_dir / "filter.json", filter_record)
+
+        sampled_world = _sample_merged_world_points(filtered_world, args)
+        filter_record["generator_input_points"] = int(sampled_world.shape[0])
+        _write_json(args.output_dir / "filter.json", filter_record)
         _write_ply_points(world_dir / "generator_input.ply", sampled_world)
 
         stage = "model_inference"

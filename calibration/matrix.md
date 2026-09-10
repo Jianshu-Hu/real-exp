@@ -23,9 +23,9 @@ Both robot-base calibrations use the `cam_front` color profile for serial
 
 ## L515 to D435i
 
-The installed L515 is serial `f1480539`, firmware `1.5.4.1`. The accepted pair
-calibration was captured on 2026-09-01 with both fixed cameras observing the
-same unmoved 94 mm tag36h11 marker, ID 0.
+The installed L515 is serial `f1480539`, firmware `1.5.4.1`. The current pair
+calibration was captured on 2026-09-10 with both fixed cameras observing the
+same unmoved 95 mm tag36h11 marker, ID 0.
 
 - D435i reference serial: `401622071701`
 - L515 serial: `f1480539`
@@ -35,9 +35,9 @@ same unmoved 94 mm tag36h11 marker, ID 0.
 
 ```text
 D435I_T_L515 =
-[[ -0.997594459,  0.068617076,  0.009848427,  0.023147317],
- [ -0.000304589, -0.146409000,  0.989224096, -0.728169935],
- [  0.069319564,  0.986841477,  0.146077708,  0.980355134],
+[[ -0.997838321,  0.064017235,  0.014848557, -0.011125084],
+ [  0.016650444,  0.027705863,  0.999477437, -0.878630524],
+ [  0.063572390,  0.997564123, -0.028711887,  0.962116441],
  [  0.000000000,  0.000000000,  0.000000000,  1.000000000]]
 
 p_D435I = D435I_T_L515 @ p_L515
@@ -46,32 +46,35 @@ W_T_L515 = W_T_D435I @ D435I_T_L515
 
 Calibration evidence:
 
-- D435i capture: `calibration/runs/d435i_pair_final_20260901_v2`
-- L515 capture: `calibration/runs/l515_pair_final_20260901_v2`
+- D435i capture: `calibration/runs/d435i_pair_20260910_104846`
+- L515 capture: `calibration/runs/l515_pair_20260910_104928`
+- Pair result JSON: `calibration/runs/d435i_T_l515_20260910.json`
 - Composition: `D435I_T_L515 = inverse(WORLD_T_D435I_PAIR) @
   WORLD_T_L515_PAIR`, using `world_T_camera` from the two capture directories'
   `camera_to_world.json` files
+- Tag parameters: `tag36h11`, ID `0`, measured black-square side `0.095 m`
 - Saved RGB and aligned depth geometry: `1280x720` for both cameras
 - D435i native streams: `1280x720@30` color and depth
 - L515 native streams: `1280x720@30` color, `640x480@30` depth; depth aligned
   into the color pixel grid before saving
-- D435i color/depth timestamp gap: median/max `0.024/0.024 ms`
-- L515 color/depth timestamp gap: median/max `6.159/7.033 ms`
-- D435i Tag detections: `100/100`; median/max reprojection RMSE
-  `0.083/0.184 px`
-- D435i dominant SE(3) cluster: `95/100`; excluded planar-PnP branch frames
-  `11`, `13`, `41`, `42`, and `84`
+- D435i color/depth timestamp gap: median/max `0.023/99.714 ms`
+- L515 color/depth timestamp gap: median/max `5.986/6.861 ms`
+- D435i Tag detections and dominant cluster: `100/100`; median/max reprojection
+  RMSE `0.086/0.086 px`
 - L515 Tag detections and dominant cluster: `100/100`; median/max reprojection
-  RMSE `0.219/0.386 px`
-- Optical-origin baseline: `1.221419 m`
-- Independent live fused-depth validation used 15-frame temporal medians and
-  a 3 mm voxel grid. D435i-to-L515/L515-to-D435i common-surface median nearest
-  distances were `6.38/7.16 mm`; `68.6%/91.0%` of workspace voxels had a
-  counterpart within 30 mm.
+  RMSE `0.444/0.444 px` (mean `0.401 px`)
+- Optical-origin baseline: `1.302990 m`
+- Independent live fused-depth validation for this 2026-09-10 matrix is
+  pending. Perform the 15-frame temporal-median / 3 mm-voxel check before
+  allowing robot execution; the validation numbers from the previous
+  2026-09-01 matrix are not applicable to this replacement matrix.
 
 The solver selects the largest pairwise SE(3) cluster within 10 mm and 1 degree
 before averaging, preventing low-reprojection planar-PnP branch flips from
-biasing the installed transform.
+biasing the installed transform. The D435i capture contains one color/depth
+timestamp gap near the 100 ms collection limit; this does not affect the RGB
+AprilTag solve, but fused-depth validation remains required before hardware
+execution.
 
 ## Left Robot Base to Camera
 

@@ -193,7 +193,7 @@ def add_camera_inference_arguments(
     parser.add_argument("--contact-sigma-m", type=float, default=0.01)
     parser.add_argument("--contact-d-max-m", type=float, default=0.03)
     parser.add_argument("--contact-binary-threshold-m", type=float, default=0.010)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=0)
     return parser
 

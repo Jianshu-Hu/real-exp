@@ -14,6 +14,8 @@ import uuid
 from grasp.common import (
     INFERENCE_REQUEST_FORMAT,
     INFERENCE_RESPONSE_FORMAT,
+    matrix_to_xyz_rpy,
+    read_transform,
     validate_command,
 )
 
@@ -71,6 +73,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--once",
         action="store_true",
         help="Send one request immediately and exit; otherwise use an interactive loop.",
+    )
+    parser.add_argument(
+        "--grasp-contract",
+        action="store_true",
+        default=True,
+        help="After the hand reaches the inferred target, contract each joint by 10%% of its remaining range.",
+    )
+    parser.add_argument(
+        "--lift-after-grasp-m",
+        type=float,
+        default=0.20,
+        help="Lift the EE by this distance in world +Z after grasping (default: 0.20 m).",
     )
     return parser
 
@@ -176,6 +190,8 @@ def execute_grasp(args: argparse.Namespace) -> int:
     # Remote data can never grant execution permission. This field is replaced
     # exclusively from the local --execute option after full target validation.
     command["execute"] = bool(args.execute)
+    if args.lift_after_grasp_m < 0:
+        raise ValueError("--lift-after-grasp-m must be non-negative")
     pose = [f"{value:.12g}" for value in command["ee_pose_xyz_rpy"]]
     move_command = [
         str(args.move_script),
@@ -193,6 +209,15 @@ def execute_grasp(args: argparse.Namespace) -> int:
                 os.environ["GRASP_FIXED_RIGHT_HAND_IP"],
             )
         )
+        if args.grasp_contract:
+            move_command.append("--grasp-contract")
+        if args.lift_after_grasp_m > 0:
+            base_t_world = read_transform(command["base_T_world"], "base_T_world")
+            post_pose = read_transform(command["base_T_ee"], "base_T_ee").copy()
+            post_pose[:3, 3] += base_t_world[:3, :3] @ [0.0, 0.0, args.lift_after_grasp_m]
+            move_command.extend(
+                ("--post-grasp-pose", *(f"{v:.12g}" for v in matrix_to_xyz_rpy(post_pose)))
+            )
     if not args.execute:
         move_command.append("--dry-run")
     mode = "execute with local confirmation" if args.execute else "dry-run"

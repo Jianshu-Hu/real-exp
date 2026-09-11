@@ -16,6 +16,7 @@ import math
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -26,8 +27,11 @@ DEFAULT_RIGHT_ROBOT_IP = "172.16.0.2"
 JOINT_NAMES = [f"fr3_joint{index}" for index in range(1, 8)]
 MOVEIT_PLANNING_TIME_S = 10.0
 MOVEIT_PLANNING_ATTEMPTS = 5
-MOVEIT_VELOCITY_SCALING = 0.20
-MOVEIT_ACCELERATION_SCALING = 0.15
+# Moderate execution speed for pose planning. The deterministic Cartesian
+# trajectory below applies its own limits, so keep these in sync with that
+# policy instead of relying on MoveIt's defaults.
+MOVEIT_VELOCITY_SCALING = 0.40
+MOVEIT_ACCELERATION_SCALING = 0.30
 MOVEIT_POSITION_TOLERANCE_M = 0.002
 MOVEIT_ORIENTATION_TOLERANCE_RAD = 0.01
 MOVEIT_SERVER_TIMEOUT_S = 30.0
@@ -45,14 +49,16 @@ CARTESIAN_MAX_ORIENTATION_DEVIATION_RAD = 0.10
 CARTESIAN_IK_CORRIDOR_MARGIN_RAD = 0.30
 CARTESIAN_REFERENCE_MAX_JOINT_CHANGE_RAD = 2.60
 CARTESIAN_JOINT_SPEED_RAD_S = np.asarray(
-    [0.12, 0.12, 0.12, 0.12, 0.15, 0.15, 0.15], dtype=float
+    [0.30, 0.30, 0.30, 0.30, 0.40, 0.40, 0.40], dtype=float
 )
-CARTESIAN_JOINT_ACCELERATION_RAD_S2 = 0.30
+CARTESIAN_JOINT_ACCELERATION_RAD_S2 = 1.00
 CARTESIAN_MIN_SEGMENT_DURATION_S = 0.05
 IK_POSITION_TOLERANCE_M = 5e-3
 IK_ORIENTATION_TOLERANCE_RAD = 3e-3
 IK_MAX_FUNCTION_EVALUATIONS = 1200
 END_EFFECTOR_MOVE_TIMEOUT_S = 30.0
+HAND_GRASP_CONTRACT_FRACTION = 0.10
+HAND_SETTLE_TIMEOUT_S = 120.0
 
 # Match JointReferenceGenerator's operational envelope in the ROS controller.
 # It is deliberately narrower than the mechanical URDF limits, so an IK target
@@ -170,6 +176,14 @@ def build_parser() -> argparse.ArgumentParser:
             "(20 values). Omit with --arm."
         ),
     )
+    parser.add_argument(
+        "--grasp-contract", action="store_true",
+        help="After a hand target reaches its commanded trajectory, contract it by 10%% of each joint range and hold it.",
+    )
+    parser.add_argument(
+        "--post-grasp-pose", nargs="+", default=None, metavar="X,Y,Z,ROLL,PITCH,YAW",
+        help="Optional second Cartesian pose executed after the hand grasp settles.",
+    )
     parser.add_argument("--ip-left", default=DEFAULT_LEFT_ROBOT_IP)
     parser.add_argument("--ip-right", default=DEFAULT_RIGHT_ROBOT_IP)
     parser.add_argument(
@@ -229,6 +243,8 @@ def resolve_targets(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             )
     pose = np.asarray(pose_values, dtype=float)
     validate_pose(pose, args.arm_mode, parser)
+    if args.post_grasp_pose is not None and args.end_effector != "hand":
+        parser.error("--post-grasp-pose requires --hand")
     joint = None
     if joints_per_side:
         joint = np.asarray(resolved_joint_values, dtype=float)
@@ -1324,7 +1340,21 @@ def read_hand_states(sockets: dict[str, Any]) -> dict[str, np.ndarray]:
     return result
 
 
-def move_hands(sockets: dict[str, Any], targets: list[SideTarget]) -> None:
+def hand_position_limits(side: str) -> tuple[np.ndarray, np.ndarray]:
+    path = os.path.join(os.path.dirname(__file__), "..", "libs", "wuji-retargeting", "wuji_retargeting", "wuji-description", "hand2", "body", "urdf", f"{side}.urdf")
+    root = ET.parse(path).getroot()
+    limits = []
+    for joint in root.findall("joint"):
+        limit = joint.find("limit")
+        if limit is not None and "lower" in limit.attrib and "upper" in limit.attrib:
+            limits.append((float(limit.attrib["lower"]), float(limit.attrib["upper"])))
+    if len(limits) != 20:
+        raise RuntimeError(f"Could not load 20 Wuji Hand 2 joint limits from {path}")
+    lower, upper = np.asarray(limits, dtype=float).T
+    return lower, upper
+
+
+def move_hands(sockets: dict[str, Any], targets: list[SideTarget], *, contract: bool = False) -> None:
     for target in targets:
         status = request_hand_status(
             sockets[target.side],
@@ -1332,11 +1362,29 @@ def move_hands(sockets: dict[str, Any], targets: list[SideTarget]) -> None:
         )
         if not status.get("initial_received", False):
             raise RuntimeError(f"[{target.side}] Wuji worker rejected the hand target")
-    deadline = time.monotonic() + END_EFFECTOR_MOVE_TIMEOUT_S
+    deadline = time.monotonic() + HAND_SETTLE_TIMEOUT_S
     while time.monotonic() < deadline:
         statuses = {side: request_hand_status(socket) for side, socket in sockets.items()}
         if all(status.get("initial_reached", False) for status in statuses.values()):
             print("All selected Wuji hands reached their targets.", flush=True)
+            if contract:
+                for target in targets:
+                    lower, upper = hand_position_limits(target.side)
+                    q = np.asarray(target.end_effector_joint, dtype=float)
+                    # Move toward the closing direction while staying within limits.
+                    contracted = np.where(q >= 0.0, q + HAND_GRASP_CONTRACT_FRACTION * (upper - q), q - HAND_GRASP_CONTRACT_FRACTION * (q - lower))
+                    request_hand_status(
+                        sockets[target.side],
+                        {"kind": "initial", "target": contracted.tolist()},
+                    )
+                print("Applying 10% joint-range grasp contract.", flush=True)
+                contract_deadline = time.monotonic() + HAND_SETTLE_TIMEOUT_S
+                while time.monotonic() < contract_deadline:
+                    statuses = {side: request_hand_status(socket) for side, socket in sockets.items()}
+                    if all(status.get("initial_reached", False) for status in statuses.values()):
+                        return
+                    time.sleep(0.05)
+                raise TimeoutError("Hands did not settle after grasp contract")
             return
         time.sleep(0.05)
     errors = {}
@@ -1345,7 +1393,7 @@ def move_hands(sockets: dict[str, Any], targets: list[SideTarget]) -> None:
         errors[target.side] = None if actual is None else float(
             np.max(np.abs(np.asarray(actual, dtype=float) - target.end_effector_joint))
         )
-    raise TimeoutError(f"Hands did not settle within {END_EFFECTOR_MOVE_TIMEOUT_S:g} s; errors={errors}")
+    raise TimeoutError(f"Hands did not settle within {HAND_SETTLE_TIMEOUT_S:g} s; errors={errors}")
 
 
 def read_current_targets(
@@ -1463,6 +1511,14 @@ def main() -> None:
         # Preserve these diagnostics even when the planner cannot find a path.
         print_move_summary(args, targets, current)
         target = targets[0]
+        post_grasp_matrix = None
+        if args.post_grasp_pose is not None:
+            post_values = parse_target_values(args.post_grasp_pose, "--post-grasp-pose", parser)
+            if len(post_values) != 6:
+                parser.error("--post-grasp-pose requires 6 values")
+            post_pose = np.asarray(post_values, dtype=float)
+            validate_pose(post_pose, args.arm_mode, parser)
+            post_grasp_matrix = pose_vector_to_matrix(post_pose)
         target_matrix = pose_vector_to_matrix(target.pose)
 
         def plan_from_live_state() -> tuple[Any, np.ndarray]:
@@ -1584,7 +1640,21 @@ def main() -> None:
                     float(target.end_effector_joint[0]),
                 )
         elif args.end_effector == "hand":
-            move_hands(hand_sockets, targets)
+            move_hands(hand_sockets, targets, contract=args.grasp_contract)
+            if post_grasp_matrix is not None:
+                target_matrix = post_grasp_matrix
+                trajectory, planned_final_q = plan_from_live_state()
+                print("The grasp is secured; review the post-grasp lift trajectory.")
+                require_approval("Execute the post-grasp lift on the real robot? [y/N]: ")
+                execute_joint_trajectory(rclpy, node, target.side, trajectory, FollowJointTrajectory)
+                reached, position_error, orientation_error = measure_final_ee_pose(
+                    rclpy, node, target.side, post_grasp_matrix, planned_final_q
+                )
+                if not reached:
+                    raise RuntimeError(
+                        f"[{target.side}] post-grasp pose was not reached: "
+                        f"position={position_error:.6f} m, orientation={orientation_error:.6f} rad"
+                    )
         print("All requested targets reached.")
     finally:
         node.destroy_node()

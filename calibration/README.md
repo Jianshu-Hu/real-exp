@@ -14,6 +14,26 @@ both cameras must remain completely fixed throughout both captures. Use a
 large rigidly backed tag, measure its black-square side length accurately, and
 avoid a nearly edge-on view.
 
+The complete capture, detection, solve, and matrix-composition workflow can be
+run with one command. The defaults below select this installation's D435i and
+L515 and its 95 mm tag36h11 marker, ID 0:
+
+```bash
+python calibration/run_realsense_pair_calibration.py
+```
+
+Use `--tag-size-m`, `--tag-family`, `--tag-id`, `--d435i-serial`, and
+`--l515-serial` when the hardware differs. Every run receives a timestamped
+output name under `calibration/runs`; existing evidence is never overwritten.
+The script stops on insufficient detections, inconsistent Tag conventions,
+invalid transforms, or median reprojection RMSE above 0.5 px. On success it
+saves `d435i_T_l515_<timestamp>.json` and prints `CALIBRATED_L515_SERIAL` and
+`CALIBRATED_D435I_T_L515` as a copyable Python snippet. It intentionally does
+not edit `calibration/matrix.md` or `grasp/inference_client.py`.
+
+The individual commands below document and support manual execution of the
+same workflow.
+
 First list the devices and note the L515 serial (the D435i serial used by the
 grasp pipeline is `401622071701`):
 

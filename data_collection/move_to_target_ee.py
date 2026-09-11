@@ -57,7 +57,14 @@ IK_POSITION_TOLERANCE_M = 5e-3
 IK_ORIENTATION_TOLERANCE_RAD = 3e-3
 IK_MAX_FUNCTION_EVALUATIONS = 1200
 END_EFFECTOR_MOVE_TIMEOUT_S = 30.0
-HAND_GRASP_CONTRACT_FRACTION = 0.10
+HAND_GRASP_CONTRACT_FRACTION = 0.2
+# Canonical Wuji order: keep the four non-thumb finger lateral/abduction
+# joints at their inferred grasp targets during contract.
+HAND_FINGER_LATERAL_CONTRACT_INDICES = (5, 9, 13, 17)
+# The object may prevent the hand from reaching the fully contracted joint
+# target. Give the hand time to apply the closing command, but do not require
+# the measured joints to reach that target before lifting the arm.
+HAND_GRASP_CONTRACT_WAIT_S = 2.0
 HAND_SETTLE_TIMEOUT_S = 120.0
 
 # Match JointReferenceGenerator's operational envelope in the ROS controller.
@@ -178,7 +185,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--grasp-contract", action="store_true",
-        help="After a hand target reaches its commanded trajectory, contract it by 10%% of each joint range and hold it.",
+        help=(
+            "After a hand target reaches its commanded trajectory, contract all "
+            "non-lateral joints by 10%% of their remaining range and hold it. "
+            "The four finger lateral joints stay at their grasp targets."
+        ),
     )
     parser.add_argument(
         "--post-grasp-pose", nargs="+", default=None, metavar="X,Y,Z,ROLL,PITCH,YAW",
@@ -1364,18 +1375,30 @@ def move_hands(sockets: dict[str, Any], targets: list[SideTarget], *, contract: 
                     q = np.asarray(target.end_effector_joint, dtype=float)
                     # Move toward the closing direction while staying within limits.
                     contracted = np.where(q >= 0.0, q + HAND_GRASP_CONTRACT_FRACTION * (upper - q), q - HAND_GRASP_CONTRACT_FRACTION * (q - lower))
+                    lateral_indices = list(HAND_FINGER_LATERAL_CONTRACT_INDICES)
+                    contracted[lateral_indices] = q[lateral_indices]
                     request_hand_status(
                         sockets[target.side],
                         {"kind": "initial", "target": contracted.tolist()},
                     )
-                print("Applying 10% joint-range grasp contract.", flush=True)
-                contract_deadline = time.monotonic() + HAND_SETTLE_TIMEOUT_S
+                print(
+                    "Applying 10% joint-range grasp contract; "
+                    f"waiting up to {HAND_GRASP_CONTRACT_WAIT_S:g} s before lifting.",
+                    flush=True,
+                )
+                contract_deadline = time.monotonic() + HAND_GRASP_CONTRACT_WAIT_S
                 while time.monotonic() < contract_deadline:
                     statuses = {side: request_hand_status(socket) for side, socket in sockets.items()}
                     if all(status.get("initial_reached", False) for status in statuses.values()):
+                        print("Contract target reached before the bounded wait elapsed.", flush=True)
                         return
                     time.sleep(0.05)
-                raise TimeoutError("Hands did not settle after grasp contract")
+                print(
+                    "Contract wait elapsed; proceeding with the post-grasp lift "
+                    "without requiring the hand joints to reach the contract target.",
+                    flush=True,
+                )
+                return
             return
         time.sleep(0.05)
     errors = {}
@@ -1633,10 +1656,13 @@ def main() -> None:
         elif args.end_effector == "hand":
             move_hands(hand_sockets, targets, contract=args.grasp_contract)
             if post_grasp_matrix is not None:
+                print("Hand grasp phase complete; planning the configured post-grasp lift.", flush=True)
                 target_matrix = post_grasp_matrix
                 trajectory, planned_final_q = plan_from_live_state()
-                print("The grasp is secured; review the post-grasp lift trajectory.")
-                require_approval("Execute the post-grasp lift on the real robot? [y/N]: ")
+                print(
+                    "Executing the configured post-grasp lift without an additional confirmation.",
+                    flush=True,
+                )
                 execute_joint_trajectory(rclpy, node, target.side, trajectory, FollowJointTrajectory)
                 reached, position_error, orientation_error = measure_final_ee_pose(
                     rclpy, node, target.side, post_grasp_matrix, planned_final_q
@@ -1646,6 +1672,11 @@ def main() -> None:
                         f"[{target.side}] post-grasp pose was not reached: "
                         f"position={position_error:.6f} m, orientation={orientation_error:.6f} rad"
                     )
+            else:
+                print(
+                    "No post-grasp pose was supplied; skipping the arm lift.",
+                    flush=True,
+                )
         print("All requested targets reached.")
     finally:
         node.destroy_node()

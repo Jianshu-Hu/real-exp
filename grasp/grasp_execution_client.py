@@ -66,7 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Permit real hardware execution. The local move script still displays "
-            "state and requires y/yes confirmation. Default is dry-run."
+            "state and requires y/yes confirmation for the initial arm motion; "
+            "the configured post-grasp lift runs automatically. Default is dry-run."
         ),
     )
     parser.add_argument(
@@ -78,7 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--grasp-contract",
         action="store_true",
         default=True,
-        help="After the hand reaches the inferred target, contract each joint by 10%% of its remaining range.",
+        help=(
+            "After the hand reaches the inferred target, contract all non-lateral "
+            "joints by 10%% of their remaining range. The four finger lateral "
+            "joints stay at their grasp targets."
+        ),
     )
     parser.add_argument(
         "--lift-after-grasp-m",

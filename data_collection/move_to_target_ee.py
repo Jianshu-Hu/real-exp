@@ -272,17 +272,11 @@ def validate_pose(pose: np.ndarray, side: str, parser: argparse.ArgumentParser) 
 
 
 def rpy_to_rotation(roll: float, pitch: float, yaw: float) -> np.ndarray:
-    cr, sr = math.cos(roll), math.sin(roll)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    return np.asarray(
-        [
-            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
-            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
-            [-sp, cp * sr, cp * cr],
-        ],
-        dtype=float,
-    )
+    # Grasp inference serializes poses with scipy Rotation.as_euler("xyz").
+    # Use the same intrinsic XYZ convention when consuming those values.
+    from scipy.spatial.transform import Rotation
+
+    return Rotation.from_euler("xyz", [roll, pitch, yaw]).as_matrix()
 
 
 def pose_vector_to_matrix(pose: Sequence[float]) -> np.ndarray:
@@ -293,15 +287,12 @@ def pose_vector_to_matrix(pose: Sequence[float]) -> np.ndarray:
 
 
 def rotation_to_rpy(rotation: np.ndarray) -> np.ndarray:
-    """Convert a rotation matrix to the same ZYX roll/pitch/yaw convention."""
-    pitch = math.asin(float(np.clip(-rotation[2, 0], -1.0, 1.0)))
-    if abs(math.cos(pitch)) > 1e-8:
-        roll = math.atan2(float(rotation[2, 1]), float(rotation[2, 2]))
-        yaw = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
-    else:
-        roll = 0.0
-        yaw = math.atan2(float(-rotation[0, 1]), float(rotation[1, 1]))
-    return np.asarray([roll, pitch, yaw], dtype=float)
+    """Convert a rotation matrix to the protocol's intrinsic XYZ RPY values."""
+    from scipy.spatial.transform import Rotation
+
+    return Rotation.from_matrix(np.asarray(rotation, dtype=float)).as_euler(
+        "xyz", degrees=False
+    )
 
 
 def matrix_to_pose_vector(transform: np.ndarray) -> np.ndarray:

@@ -65,6 +65,9 @@ HAND_FINGER_LATERAL_CONTRACT_INDICES = (5, 9, 13, 17)
 # target. Give the hand time to apply the closing command, but do not require
 # the measured joints to reach that target before lifting the arm.
 HAND_GRASP_CONTRACT_WAIT_S = 2.0
+# Do not require a hand to reach the inferred target: an object may block
+# individual joints. Allow the command to run briefly before the next phase.
+HAND_INITIAL_COMMAND_WAIT_S = 2.0
 HAND_SETTLE_TIMEOUT_S = 120.0
 
 # Match JointReferenceGenerator's operational envelope in the ROS controller.
@@ -1364,50 +1367,41 @@ def move_hands(sockets: dict[str, Any], targets: list[SideTarget], *, contract: 
         )
         if not status.get("initial_received", False):
             raise RuntimeError(f"[{target.side}] Wuji worker rejected the hand target")
-    deadline = time.monotonic() + HAND_SETTLE_TIMEOUT_S
-    while time.monotonic() < deadline:
-        statuses = {side: request_hand_status(socket) for side, socket in sockets.items()}
-        if all(status.get("initial_reached", False) for status in statuses.values()):
-            print("All selected Wuji hands reached their targets.", flush=True)
-            if contract:
-                for target in targets:
-                    lower, upper = hand_position_limits(target.side)
-                    q = np.asarray(target.end_effector_joint, dtype=float)
-                    # Move toward the closing direction while staying within limits.
-                    contracted = np.where(q >= 0.0, q + HAND_GRASP_CONTRACT_FRACTION * (upper - q), q - HAND_GRASP_CONTRACT_FRACTION * (q - lower))
-                    lateral_indices = list(HAND_FINGER_LATERAL_CONTRACT_INDICES)
-                    contracted[lateral_indices] = q[lateral_indices]
-                    request_hand_status(
-                        sockets[target.side],
-                        {"kind": "initial", "target": contracted.tolist()},
-                    )
-                print(
-                    "Applying 10% joint-range grasp contract; "
-                    f"waiting up to {HAND_GRASP_CONTRACT_WAIT_S:g} s before lifting.",
-                    flush=True,
-                )
-                contract_deadline = time.monotonic() + HAND_GRASP_CONTRACT_WAIT_S
-                while time.monotonic() < contract_deadline:
-                    statuses = {side: request_hand_status(socket) for side, socket in sockets.items()}
-                    if all(status.get("initial_reached", False) for status in statuses.values()):
-                        print("Contract target reached before the bounded wait elapsed.", flush=True)
-                        return
-                    time.sleep(0.05)
-                print(
-                    "Contract wait elapsed; proceeding with the post-grasp lift "
-                    "without requiring the hand joints to reach the contract target.",
-                    flush=True,
-                )
-                return
-            return
-        time.sleep(0.05)
-    errors = {}
+    print(
+        "Initial hand targets sent; waiting "
+        f"{HAND_INITIAL_COMMAND_WAIT_S:g} s without requiring the joint angles to arrive.",
+        flush=True,
+    )
+    time.sleep(HAND_INITIAL_COMMAND_WAIT_S)
+    if not contract:
+        return
+
     for target in targets:
-        actual = request_hand_status(sockets[target.side]).get("actual")
-        errors[target.side] = None if actual is None else float(
-            np.max(np.abs(np.asarray(actual, dtype=float) - target.end_effector_joint))
+        lower, upper = hand_position_limits(target.side)
+        q = np.asarray(target.end_effector_joint, dtype=float)
+        # Move toward the closing direction while staying within limits.
+        contracted = np.where(
+            q >= 0.0,
+            q + HAND_GRASP_CONTRACT_FRACTION * (upper - q),
+            q - HAND_GRASP_CONTRACT_FRACTION * (q - lower),
         )
-    raise TimeoutError(f"Hands did not settle within {HAND_SETTLE_TIMEOUT_S:g} s; errors={errors}")
+        lateral_indices = list(HAND_FINGER_LATERAL_CONTRACT_INDICES)
+        contracted[lateral_indices] = q[lateral_indices]
+        request_hand_status(
+            sockets[target.side],
+            {"kind": "initial", "target": contracted.tolist()},
+        )
+    print(
+        "Applying 10% joint-range grasp contract; "
+        f"waiting up to {HAND_GRASP_CONTRACT_WAIT_S:g} s before lifting.",
+        flush=True,
+    )
+    time.sleep(HAND_GRASP_CONTRACT_WAIT_S)
+    print(
+        "Contract wait elapsed; proceeding with the post-grasp lift "
+        "without checking whether any hand joint reached its target.",
+        flush=True,
+    )
 
 
 def read_current_targets(

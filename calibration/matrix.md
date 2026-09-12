@@ -24,7 +24,7 @@ Both robot-base calibrations use the `cam_front` color profile for serial
 ## L515 to D435i
 
 The installed L515 is serial `f1480539`, firmware `1.5.4.1`. The current pair
-calibration was recaptured on 2026-09-12 at 10:24 CST with both fixed
+calibration was recaptured on 2026-09-12 at 11:30 CST with both fixed
 cameras observing the same unmoved 95 mm tag36h11 marker, ID 0.
 
 - D435i reference serial: `401622071701`
@@ -35,9 +35,9 @@ cameras observing the same unmoved 95 mm tag36h11 marker, ID 0.
 
 ```text
 D435I_T_L515 =
-[[ -0.289584691,  0.673230171, -0.680368903,  0.493053701],
- [ -0.887169286,  0.078015047,  0.454801397, -0.382073810],
- [  0.359265034,  0.735305916,  0.574677166,  0.755266560],
+[[ -0.353463814, -0.629417947,  0.692023395, -0.406973323],
+ [  0.863370887,  0.065253168,  0.500332625, -0.325334179],
+ [ -0.360075052,  0.774322331,  0.520356498,  0.757494931],
  [  0.000000000,  0.000000000,  0.000000000,  1.000000000]]
 
 p_D435I = D435I_T_L515 @ p_L515
@@ -46,9 +46,9 @@ W_T_L515 = W_T_D435I @ D435I_T_L515
 
 Calibration evidence:
 
-- D435i capture: `calibration/runs/d435i_recal_20260912_102413`
-- L515 capture: `calibration/runs/l515_recal_20260912_102413`
-- Pair result JSON: `calibration/runs/d435i_T_l515_20260912_102413.json`
+- D435i capture: `calibration/runs/d435i_recal_20260912_113013`
+- L515 capture: `calibration/runs/l515_recal_20260912_113013`
+- Pair result JSON: `calibration/runs/d435i_T_l515_20260912_113013.json`
 - Composition: `D435I_T_L515 = inverse(WORLD_T_D435I_PAIR) @
   WORLD_T_L515_PAIR`, using `world_T_camera` from the two capture directories'
   `camera_to_world.json` files
@@ -58,23 +58,23 @@ Calibration evidence:
 - L515 native streams: `1280x720@30` color, `640x480@30` depth; depth aligned
   into the color pixel grid before saving
 - D435i color/depth timestamp gap: median/max `0.018/0.018 ms`
-- L515 color/depth timestamp gap: median/max `5.495/6.348 ms`
+- L515 color/depth timestamp gap: median/max `6.881/7.747 ms`
 - D435i Tag detections and dominant cluster: `100/100`; median/max reprojection
   RMSE `0.272/0.272 px`
 - L515 Tag detections and dominant cluster: `100/100`; median/max reprojection
-  RMSE `0.061/0.198 px` (mean `0.062 px`)
-- Optical-origin baseline: `0.979546 m`
+  RMSE `0.189/0.279 px` (mean `0.186 px`)
+- Optical-origin baseline: `0.919385 m`
 - Independent fused-depth validation capture:
-  `calibration/runs/fusion_check_20260912_102550`
+  `calibration/runs/fusion_check_20260912_113115`
 - The validation used 15-frame per-pixel nonzero medians, a `0.2--2.0 m`
   depth range, and 3 mm voxels. In the common robust-bounds region, the new
-  transform's symmetric nearest-neighbor distance was `7.472 mm` median and
-  `18.654 mm` at p90, with `83.497%` of points within `15 mm`.
+  transform's symmetric nearest-neighbor distance was `6.708 mm` median and
+  `15.359 mm` at p90, with `89.338%` of points within `15 mm`.
 - On the same validation capture, the previous runtime transform produced
-  `18.171 mm` median, `104.458 mm` at p90, and `40.203%` within `15 mm`.
+  `12.693 mm` median, `85.765 mm` at p90, and `56.891%` within `15 mm`.
   The new transform therefore materially improves independent depth alignment.
 - Relative to the previous runtime transform, this calibration changes the
-  camera-to-camera pose by `957.164 mm` and `146.855 deg`, consistent with the
+  camera-to-camera pose by `901.816 mm` and `142.490 deg`, consistent with the
   L515 having been moved to its new installation position.
 
 The solver selects the largest pairwise SE(3) cluster within 10 mm and 1 degree

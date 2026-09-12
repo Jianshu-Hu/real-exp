@@ -6,7 +6,8 @@ grasp_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${grasp_dir}/.." && pwd)"
 initial_move_script="${repository_root}/scripts/move_to_target_ee.sh"
 readonly -a initial_ee_xyzrpy=(
-  0.682977 0.154027 0.452649 -2.134387 0.498717 -2.334388
+  0.6217188822449426 0.5166373362592817 0.419112304865263
+  -1.6543702490520547 0.6474849359530839 -1.3522691731776382
 )
 readonly -a initial_hand_joints=(
   0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0

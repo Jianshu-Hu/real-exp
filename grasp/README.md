@@ -114,10 +114,12 @@ On the robot-control computer, select exactly one mode. Start with a dry run:
 ./grasp/start_grasp_execution_client.sh --arm-only
 ```
 
-The launcher first moves the right arm to its configured initial pose. In
-`--arm-with-hand` mode it also opens the hand by setting all 20 joints to zero.
-If this initial move fails or is declined, the grasp client does not start.
-Running with `-h` or `--help` never moves hardware.
+The launcher starts the right-arm controller for the full client session, then
+moves the arm to its configured initial pose. In `--arm-with-hand` mode it also
+starts the right-hand worker for the session and opens the hand by setting all
+20 joints to zero. If this initial move fails or is declined, the grasp client
+does not start. Running with `-h` or `--help` never starts robot-control
+processes or moves hardware.
 
 At the `grasp>` prompt:
 
@@ -129,7 +131,9 @@ After a successful grasp, the client automatically returns to the initial
 pose and, in hand mode, opens the hand. Use `--once` for one noninteractive
 request. `GRASP_SERVER_IP` and `GRASP_INFERENCE_PORT` select the inference
 server. The Wuji SDK endpoint is intentionally fixed in
-`start_grasp_execution_client.sh` for this installation.
+`start_grasp_execution_client.sh` for this installation. Grasp contraction and
+the post-grasp lift are implemented by `grasp.grasp_motion`; the generic
+end-effector move utility has no grasp-specific phases.
 
 ## Execution safety
 
@@ -141,9 +145,9 @@ enable real execution locally:
 ./grasp/start_grasp_execution_client.sh --arm-with-hand --execute
 ```
 
-The inference server cannot authorize robot motion. Even with `--execute`,
-`scripts/move_to_target_ee.sh` reads the live robot state, validates and
-previews the motion, and requires the operator to enter `y` or `yes` on the
+The inference server cannot authorize robot motion. Even with `--execute`, the
+local grasp motion runner reads the live robot state, validates and previews
+the motion, and requires the operator to enter `y` or `yes` on the
 robot-control computer. Keep an operator and emergency stop available.
 
 The server and client also validate request IDs and ages, pose/matrix

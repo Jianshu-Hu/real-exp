@@ -141,7 +141,7 @@ def reorder_joint_vector(values: Iterable[float], names: Iterable[str]) -> np.nd
         raise ValueError("joint names and values must have the same length")
     if len(set(normalized_names)) != len(normalized_names):
         raise ValueError("joint state contains duplicate canonical names")
-    by_name = dict(zip(normalized_names, vector, strict=True))
+    by_name = dict(zip(normalized_names, vector))
     missing = [name for name in JOINT_NAMES if name not in by_name]
     if missing:
         raise ValueError(f"joint state is missing canonical joints: {missing}")

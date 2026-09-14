@@ -60,18 +60,88 @@ connection; adapter names and the correct host address are installation-specific
 
 ### 1. Server terminal: FoundationPose++ and policy server
 
-On the server (`/home/pair1/real-exp`)(conda env: pose):
+FoundationPose++ opens an interactive OpenCV window for the initial hammer
+ROI. Use one of the following two startup methods depending on which monitor
+should show that window. In both cases, run the stack in the `pose` Conda
+environment; launching it from `base` or system Python can fail with missing
+runtime modules such as `zmq`.
+
+#### A. Running directly on the server
+
+Open a graphical terminal on the physical server. The ROI window will appear
+on the monitor connected to the server:
 
 ```bash
+conda activate pose
 cd /home/pair1/real-exp
 
 ./simtoolreal/scripts/start_server.sh \
   --config libs/SimToolReal-Franka-Wuji2/pretrained_policy/config.yaml \
   --checkpoint libs/SimToolReal-Franka-Wuji2/pretrained_policy/model.pth \
   --foundationpose-mesh libs/FoundationPose-plus-plus/test/mesh/hammer.stl \
+  --foundationpose-camera l515 \
   --device cuda \
   --no-bridge \
   --no-wait-only
+```
+
+The prompt should show `(pose)`, and `which python3` should report
+`/home/pair1/miniconda3/envs/pose/bin/python3` before starting the stack.
+
+#### B. Running from the client by SSH
+
+From a graphical terminal on the client computer, connect with trusted X11
+forwarding so the server-side ROI window appears on the client monitor:
+
+```bash
+ssh -Y pair1@192.168.50.13
+```
+
+Inside that SSH session, verify that `DISPLAY` is nonempty, activate the
+server's `pose` environment, and launch the stack:
+
+```bash
+echo "$DISPLAY"
+# Expected: localhost:10.0 or another localhost:N.0 value
+
+conda activate pose
+which python3
+# Expected: /home/pair1/miniconda3/envs/pose/bin/python3
+
+cd /home/pair1/real-exp
+
+SIMTOOLREAL_POLICY_PYTHON=/home/pair1/miniconda3/envs/pose/bin/python \
+  SIMTOOLREAL_POSE_PYTHON=/home/pair1/miniconda3/envs/pose/bin/python \
+    ./simtoolreal/scripts/start_server.sh \
+      --config libs/SimToolReal-Franka-Wuji2/pretrained_policy/config.yaml \
+      --checkpoint libs/SimToolReal-Franka-Wuji2/pretrained_policy/model.pth \
+      --foundationpose-mesh libs/FoundationPose-plus-plus/test/mesh/hammer.stl \
+      --foundationpose-camera l515 \
+      --device cuda \
+```
+
+Keep this SSH session open while the stack is running. Do not set `DISPLAY`
+manually: `ssh -Y` creates the authenticated display and forwarding tunnel. If
+`echo "$DISPLAY"` is empty, stop and reconnect with `ssh -Y`; otherwise Qt will
+fail with `could not connect to display` when OpenCV opens the ROI selector.
+
+The `l515` preset selects calibrated serial `f1480539`, requests its supported
+`1280x720@30` color and `640x480@30` depth streams, and aligns depth into the
+color pixel grid before FoundationPose++. If this checkout contains
+`.vendor/l515_realsense`, the launcher prepends it to `PYTHONPATH` so the
+L500-compatible `pyrealsense2==2.54.2.5684` binding is used. Install it once
+on the server if needed:
+
+```bash
+conda run -n pose python -m pip install \
+  --target "$PWD/.vendor/l515_realsense" \
+  pyrealsense2==2.54.2.5684
+```
+
+The expected camera line is:
+
+```text
+FoundationPose++ RealSense serial=f1480539 color=1280x720@30 depth=640x480@30 aligned=1280x720
 ```
 
 Select the hammer ROI in the FoundationPose++ window and confirm it. A healthy
@@ -149,7 +219,7 @@ cd /home/landau/real-exp
     --robot-urdf /home/landau/real-exp/simtoolreal/assets/fr3v2_wuji_hand2_right_slanted.urdf \
     --goal-pose /home/landau/real-exp/calibration/generated/simtoolreal_policy_frame/goal_policy.json \
     --pose-frame camera \
-    --world-from-camera /home/landau/real-exp/calibration/generated/simtoolreal_policy_frame/world_from_camera_policy.json \
+    --world-from-camera /home/landau/real-exp/calibration/generated/simtoolreal_policy_frame/world_from_l515_policy.json \
     --world-from-robot /home/landau/real-exp/calibration/generated/simtoolreal_policy_frame/world_from_robot_policy.json
 ```
 
@@ -170,8 +240,10 @@ to the bridge on the client. Pose `:5570` and policy RPC `:5571` use
 `--server-ip 192.168.50.13` and therefore connect to the server.
 
 Before this command, generate the scheme-2 frame from the measured calibration
-matrices. The generated `world_from_camera_policy.json` maps D435 camera
-coordinates into the pretrained policy world `Wp`; the generated
+matrices. The generated `world_from_l515_policy.json` maps L515 camera
+coordinates into the pretrained policy world `Wp` by composing the calibrated
+`D435I_T_L515` in `calibration/matrix.md` with the existing D435 policy-frame
+transform. The generated
 `world_from_robot_policy.json` is the unchanged training pose of the URDF root
 (`trapezoid_base`).
 
@@ -191,8 +263,10 @@ scp -r pair1@192.168.50.13:/home/pair1/real-exp/calibration/generated \
   /home/landau/real-exp/calibration/
 ```
 
-The input JSON must contain `Wreal_T_C` and `C_T_B_R`, using the convention
-`A_T_B` maps points from frame B into frame A. After measuring and saving the
+The input JSON contains `Wreal_T_C`, `C_T_B_R`, `L515_serial`, and
+`D435I_T_L515`, using the convention `A_T_B` maps points from frame B into
+frame A. The L515 serial and pair transform are the measured values recorded
+in `calibration/matrix.md`. After measuring and saving the
 desired 4x4 tabletop-world goal `Wreal_T_G`, run the generator again with:
 
 ```bash

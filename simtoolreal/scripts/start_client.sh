@@ -43,17 +43,21 @@ wait_for_fr3_state() {
   local controller_pid="$1"
   local attempt
   local topic_output
-  for ((attempt = 0; attempt < 150; attempt += 1)); do
+  # A newly started ros2 CLI subscriber must first complete DDS discovery.
+  # A 0.2-second process lifetime is too short on this host and can repeatedly
+  # miss a healthy 30 Hz publisher even while the long-lived bridge receives
+  # the same topic. Give each subscriber enough time to discover its publisher.
+  for ((attempt = 0; attempt < 10; attempt += 1)); do
     if ! kill -0 "${controller_pid}" 2>/dev/null; then
       wait "${controller_pid}" 2>/dev/null || true
       die "FR3 controller exited before receiving robot state. Enable FCI mode in Desk and verify the robot IP/network."
     fi
-    if topic_output="$(timeout 0.2s ros2 topic echo --once /right/franka/joint_states 2>/dev/null)" && [[ -n "${topic_output}" ]]; then
+    if topic_output="$(timeout 3s ros2 topic echo --no-daemon --once /right/franka/joint_states 2>/dev/null)" && [[ -n "${topic_output}" ]]; then
       return 0
     fi
     sleep 0.1
   done
-  die "FR3 controller did not publish /right/franka/joint_states within 30 seconds. Enable FCI mode in Desk and verify the robot IP/network."
+  die "no /right/franka/joint_states sample was observed within 30 seconds; inspect the ROS topic and controller state (the robot connection may still be healthy)"
 }
 
 stop_child_groups() {

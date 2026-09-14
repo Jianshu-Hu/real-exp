@@ -70,8 +70,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rate", type=float, default=30.0)
     parser.add_argument("--mesh", type=Path)
     parser.add_argument("--mesh-scale", type=float, default=0.001)
+    parser.add_argument(
+        "--camera-serial",
+        default=None,
+        help="RealSense serial to open (required for deterministic selection with multiple cameras).",
+    )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
+    parser.add_argument(
+        "--depth-width",
+        type=int,
+        default=None,
+        help="Native depth width (default: --width).",
+    )
+    parser.add_argument(
+        "--depth-height",
+        type=int,
+        default=None,
+        help="Native depth height (default: --height).",
+    )
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--est-refine-iter", type=int, default=10)
     parser.add_argument("--track-refine-iter", type=int, default=3)
@@ -81,10 +98,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _publish(socket: Any, pose: Any, source: str, object_id: str) -> None:
+def _publish(socket: Any, pose: Any, source: str, object_id: str,
+             to_origin: np.ndarray | None = None) -> None:
+    """Publish pose in the raw STL frame consumed by SimToolReal.
+
+    FoundationPose returns ``ob_in_cam`` for the centered mesh frame created
+    by ``trimesh.bounds.oriented_bounds``.  The policy and snapshot contract,
+    however, uses the uncentered/raw STL frame.  Convert at the transport
+    boundary so every downstream consumer sees the same frame.
+    """
     matrix = np.asarray(pose, dtype=np.float64)
     if matrix.ndim == 3:
         matrix = matrix[-1]
+    if to_origin is not None:
+        matrix = matrix @ np.linalg.inv(np.asarray(to_origin, dtype=np.float64))
     socket.send_json(make_object_pose(matrix.reshape(4, 4).tolist(), object_id=object_id, frame_id="camera", source=source))
 
 
@@ -141,14 +168,32 @@ def _run_realsense(socket: Any, args: argparse.Namespace, stop: list[bool]) -> N
     estimator = FoundationPose(model_pts=mesh.vertices, model_normals=mesh.vertex_normals, mesh=mesh,
                                 scorer=scorer, refiner=refiner, glctx=dr.RasterizeCudaContext(), debug=0)
     _normalize_estimator_geometry(estimator)
+    depth_width = args.depth_width or args.width
+    depth_height = args.depth_height or args.height
     pipeline, config = rs.pipeline(), rs.config()
+    if args.camera_serial:
+        config.enable_device(args.camera_serial)
     config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
-    config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
+    config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, args.fps)
     profile = pipeline.start(config); align = rs.align(rs.stream.color)
-    scale = profile.get_device().first_depth_sensor().get_depth_scale()
+    device = profile.get_device()
+    actual_serial = str(device.get_info(rs.camera_info.serial_number))
+    if args.camera_serial and actual_serial != args.camera_serial:
+        pipeline.stop()
+        raise RuntimeError(
+            f"opened RealSense serial {actual_serial!r}, expected {args.camera_serial!r}"
+        )
+    scale = device.first_depth_sensor().get_depth_scale()
     intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
     K = np.asarray(((intrinsics.fx, 0, intrinsics.ppx), (0, intrinsics.fy, intrinsics.ppy), (0, 0, 1)), dtype=np.float32)
     initialized = False; pose = None
+    print(
+        f"FoundationPose++ RealSense serial={actual_serial} "
+        f"color={args.width}x{args.height}@{args.fps} "
+        f"depth={depth_width}x{depth_height}@{args.fps} "
+        f"aligned={args.width}x{args.height}",
+        flush=True,
+    )
     print("FoundationPose++ waiting for first-frame mask/ROI initialization", flush=True)
     try:
         while not stop[0]:
@@ -156,13 +201,19 @@ def _run_realsense(socket: Any, args: argparse.Namespace, stop: list[bool]) -> N
             if not color or not depth: continue
             bgr = np.asanyarray(color.get_data()); rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             depth_m = np.asanyarray(depth.get_data()).astype(np.float32) * scale
+            if depth_m.shape != rgb.shape[:2]:
+                raise RuntimeError(
+                    "aligned depth dimensions do not match the color frame: "
+                    f"depth={depth_m.shape}, color={rgb.shape[:2]}"
+                )
             if not initialized:
                 pose, _ = _select_and_register(estimator, K, rgb, depth_m, args.est_refine_iter, roi=args.roi)
                 initialized = pose is not None
                 if initialized: print("FoundationPose++ registered; publishing live poses", flush=True)
             else:
                 pose = estimator.track_one(rgb=rgb, depth=depth_m, K=K, iteration=args.track_refine_iter)
-            if pose is not None: _publish(socket, pose, "foundationpose++", args.object_id)
+            if pose is not None:
+                _publish(socket, pose, "foundationpose++", args.object_id, to_origin=to_origin)
             if not args.no_display:
                 preview = bgr.copy()
                 if pose is not None:
@@ -192,6 +243,10 @@ def _run_realsense(socket: Any, args: argparse.Namespace, stop: list[bool]) -> N
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.rate <= 0: raise SystemExit("--rate must be positive")
+    depth_width = args.depth_width or args.width
+    depth_height = args.depth_height or args.height
+    if min(args.width, args.height, depth_width, depth_height, args.fps) <= 0:
+        raise SystemExit("camera color/depth dimensions and FPS must be positive")
     if not args.mock and args.pose_file is None and args.mesh is None:
         raise SystemExit("provide --mesh for live mode, or --pose-file/--mock for transport mode")
     context = zmq.Context(); socket = context.socket(zmq.PUB); socket.setsockopt(zmq.SNDHWM, 2); socket.setsockopt(zmq.LINGER, 0); socket.bind(args.connect)

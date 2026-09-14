@@ -5,6 +5,10 @@ Convention: ``A_T_B`` maps coordinates in frame B into frame A.  The input
 calibration JSON contains ``Wreal_T_C`` and ``C_T_B_R``.  The fixed mount
 transform ``U_T_B_R`` is read from the selected URDF, where U is the
 ``trapezoid_base`` root used by the trained policy.
+
+If the input also contains the calibrated ``D435I_T_L515`` transform, the
+generator writes ``world_from_l515_policy.json`` so poses tracked in the L515
+optical frame can be consumed without pretending they came from the D435i.
 """
 
 from __future__ import annotations
@@ -108,6 +112,16 @@ def load_inputs(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return checked_transform(world, "Wreal_T_C"), checked_transform(camera_base, "C_T_B_R")
 
 
+def load_l515_extrinsic(path: Path) -> tuple[str, np.ndarray] | None:
+    data = json.loads(path.read_text())
+    if "D435I_T_L515" not in data:
+        return None
+    serial = str(data.get("L515_serial", "")).strip()
+    if not serial:
+        raise ValueError("input JSON with D435I_T_L515 must contain L515_serial")
+    return serial, checked_transform(data["D435I_T_L515"], "D435I_T_L515")
+
+
 def matrix_list(value: np.ndarray) -> list[list[float]]:
     return np.asarray(value, dtype=np.float64).tolist()
 
@@ -143,6 +157,10 @@ def main() -> int:
     mount = read_urdf_mount(args.urdf)
     policy_root = DEFAULT_POLICY_T_U if args.policy_world_from_robot is None else read_matrix_arg(args.policy_world_from_robot, "Wp_T_U")
     transforms = build(world_real_camera, camera_base, mount, policy_root)
+    l515 = load_l515_extrinsic(args.input)
+    if l515 is not None:
+        _, d435i_from_l515 = l515
+        transforms["Wp_T_L515"] = transforms["Wp_T_C"] @ d435i_from_l515
     residual_camera = np.max(np.abs(transforms["Wp_T_C"] - transforms["Wp_T_Wreal"] @ world_real_camera))
     residual_base = np.max(np.abs(transforms["Wp_T_Wreal"] @ transforms["Wreal_T_B_R"] - transforms["Wp_T_B_R"]))
     if max(residual_camera, residual_base) > 1e-8:
@@ -152,6 +170,8 @@ def main() -> int:
              "Wp_T_Wreal": "policy_from_real_world.json", "Wreal_T_U": "real_world_from_robot_root.json",
              "Wreal_T_B_R": "real_world_from_right_base.json", "Wp_T_B_R": "policy_from_right_base.json",
              "U_T_B_R": "urdf_root_from_right_base.json"}
+    if l515 is not None:
+        names["Wp_T_L515"] = "world_from_l515_policy.json"
     for key, filename in names.items():
         (args.output_dir / filename).write_text(json.dumps(matrix_list(transforms[key]), indent=2) + "\n")
     if args.real_world_goal is not None:
@@ -165,11 +185,21 @@ def main() -> int:
                 "urdf": str(args.urdf), "formula": "Wp_T_Wreal = Wp_T_B_R @ inv(Wreal_T_B_R)",
                 "residuals": {"camera": float(residual_camera), "right_base": float(residual_base)},
                 "transforms": {key: matrix_list(value) for key, value in transforms.items()}}
+    if l515 is not None:
+        l515_serial, d435i_from_l515 = l515
+        manifest["l515"] = {
+            "serial": l515_serial,
+            "formula": "Wp_T_L515 = Wp_T_C @ D435I_T_L515",
+            "D435I_T_L515": matrix_list(d435i_from_l515),
+        }
     (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Generated policy-frame calibration in {args.output_dir}")
     print("Dry-run executor arguments:")
     print(f"  --pose-frame camera --world-from-camera {args.output_dir / names['Wp_T_C']}")
     print(f"  --world-from-robot {args.output_dir / names['Wp_T_U']}")
+    if l515 is not None:
+        print(f"L515 serial {l515[0]} executor camera transform:")
+        print(f"  --world-from-camera {args.output_dir / names['Wp_T_L515']}")
     if args.real_world_goal is None:
         print("Pass --real-world-goal Wreal_T_G to generate goal_policy.json (Wp_T_G).")
     else:

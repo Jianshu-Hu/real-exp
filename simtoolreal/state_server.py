@@ -187,9 +187,15 @@ def client_state(packet: Any) -> tuple[np.ndarray, np.ndarray, int]:
 
 
 def format_cycle(q: np.ndarray, pose: np.ndarray, observation: np.ndarray, action: np.ndarray, targets: np.ndarray, execute: bool) -> str:
+    # OBS_FIELDS layout: palm_pos starts at 81; keypoints_rel_palm at 107.
+    palm = observation[81:84]
+    rel_keypoints = observation[107:119].reshape(4, 3)
     return (
         f"mode={'EXECUTE' if execute else 'DRY-RUN'} state[27]={np.array2string(q, precision=4)}\n"
-        f"object_xyz={np.array2string(pose[:3, 3], precision=5)} observation[{observation.size}] "
+        f"object_xyz={np.array2string(pose[:3, 3], precision=5)} "
+        f"palm_xyz={np.array2string(palm, precision=5)} "
+        f"keypoints_rel_palm_z={np.array2string(rel_keypoints[:, 2], precision=5)} "
+        f"mean_rel_z={rel_keypoints[:, 2].mean():+.5f} observation[{observation.size}] "
         f"min/max=({observation.min():+.4f},{observation.max():+.4f})\n"
         f"action[27]={np.array2string(action, precision=4)}\n"
         f"target[27]={np.array2string(targets, precision=4)}"

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from foundation_pose_runner import _normalize_estimator_geometry
+from foundation_pose_runner import _normalize_estimator_geometry, parse_args
 
 
 class _Mesh:
@@ -28,3 +28,16 @@ def test_estimator_geometry_is_normalized_to_float32() -> None:
     assert type(estimator.diameter * 1.2 / 2) is float
     assert estimator.mesh.vertices.dtype == np.float32
     assert estimator.mesh._cache == {}
+
+
+def test_l515_stream_geometry_can_be_selected_independently() -> None:
+    args = parse_args([
+        "--mesh", "hammer.stl",
+        "--camera-serial", "f1480539",
+        "--width", "1280", "--height", "720",
+        "--depth-width", "640", "--depth-height", "480",
+    ])
+
+    assert args.camera_serial == "f1480539"
+    assert (args.width, args.height) == (1280, 720)
+    assert (args.depth_width, args.depth_height) == (640, 480)

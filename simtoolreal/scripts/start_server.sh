@@ -58,6 +58,7 @@ repository_root_default="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 policy_config="${SIMTOOLREAL_POLICY_CONFIG:-${repository_root_default}/libs/SimToolReal-Franka-Wuji2/pretrained_policy/config.yaml}"
 policy_checkpoint="${SIMTOOLREAL_POLICY_CHECKPOINT:-${repository_root_default}/libs/SimToolReal-Franka-Wuji2/pretrained_policy/model.pth}"
 pose_mode=""; pose_mesh=""; pose_roi=(); pose_no_display=0; mock_policy=0; start_bridge=1; wait_only=1; policy_upstream=""; policy_device="cpu"; pose_file=""
+pose_camera="auto"; pose_camera_serial=""; pose_width=""; pose_height=""; pose_depth_width=""; pose_depth_height=""; pose_fps=""
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -69,6 +70,13 @@ while [[ "$#" -gt 0 ]]; do
     --foundationpose-mock) pose_mode=mock; shift ;;
     --foundationpose-roi) [[ "$#" -ge 5 ]] || die "$1 requires X Y W H"; pose_roi=("$2" "$3" "$4" "$5"); shift 5 ;;
     --foundationpose-no-display) pose_no_display=1; shift ;;
+    --foundationpose-camera) [[ "$#" -ge 2 ]] || die "$1 requires auto, d435, or l515"; pose_camera="$2"; shift 2 ;;
+    --foundationpose-camera-serial) [[ "$#" -ge 2 ]] || die "$1 requires a value"; pose_camera_serial="$2"; shift 2 ;;
+    --foundationpose-width) [[ "$#" -ge 2 ]] || die "$1 requires a value"; pose_width="$2"; shift 2 ;;
+    --foundationpose-height) [[ "$#" -ge 2 ]] || die "$1 requires a value"; pose_height="$2"; shift 2 ;;
+    --foundationpose-depth-width) [[ "$#" -ge 2 ]] || die "$1 requires a value"; pose_depth_width="$2"; shift 2 ;;
+    --foundationpose-depth-height) [[ "$#" -ge 2 ]] || die "$1 requires a value"; pose_depth_height="$2"; shift 2 ;;
+    --foundationpose-fps) [[ "$#" -ge 2 ]] || die "$1 requires a value"; pose_fps="$2"; shift 2 ;;
     --pose-address) [[ "$#" -ge 2 ]] || die "$1 requires a value"; pose_address="$2"; shift 2 ;;
     --policy-bind) [[ "$#" -ge 2 ]] || die "$1 requires a value"; policy_bind="$2"; shift 2 ;;
     --config) [[ "$#" -ge 2 ]] || die "$1 requires a value"; policy_config="$2"; shift 2 ;;
@@ -80,10 +88,28 @@ while [[ "$#" -gt 0 ]]; do
     --mock-policy) mock_policy=1; shift ;;
     --wait-only) wait_only=1; shift ;;
     --no-wait-only) wait_only=0; shift ;;
-    --help|-h) echo "Usage: start_server.sh [--config CONFIG --checkpoint CHECKPOINT] [--foundationpose-mesh MESH --foundationpose-roi X Y W H]"; exit 0 ;;
+    --help|-h) echo "Usage: start_server.sh [--config CONFIG --checkpoint CHECKPOINT] [--foundationpose-mesh MESH --foundationpose-camera auto|d435|l515 --foundationpose-roi X Y W H]"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
+case "${pose_camera}" in
+  auto) ;;
+  d435)
+    pose_camera_serial="${pose_camera_serial:-${SIMTOOLREAL_D435_SERIAL:-401622071701}}"
+    pose_width="${pose_width:-640}"; pose_height="${pose_height:-480}"
+    pose_depth_width="${pose_depth_width:-640}"; pose_depth_height="${pose_depth_height:-480}"
+    pose_fps="${pose_fps:-30}"
+    ;;
+  l515)
+    # Installed/calibrated camera from calibration/matrix.md. The L515 does
+    # not expose native 640x480 color: align its 640x480 depth into 1280x720.
+    pose_camera_serial="${pose_camera_serial:-${SIMTOOLREAL_L515_SERIAL:-f1480539}}"
+    pose_width="${pose_width:-1280}"; pose_height="${pose_height:-720}"
+    pose_depth_width="${pose_depth_width:-640}"; pose_depth_height="${pose_depth_height:-480}"
+    pose_fps="${pose_fps:-30}"
+    ;;
+  *) die "--foundationpose-camera must be auto, d435, or l515 (got ${pose_camera})" ;;
+esac
 if [[ "${mock_policy}" -eq 0 ]]; then
   [[ -n "${policy_config}" && -n "${policy_checkpoint}" ]] || die "--config and --checkpoint are required (or use --mock-policy)"
 fi
@@ -122,9 +148,20 @@ if [[ -n "${pose_mode}" ]]; then
   [[ "${pose_mode}" == mock ]] && pose_args+=(--mock)
   [[ "${pose_mode}" == file ]] && pose_args+=(--pose-file "${pose_file}")
   [[ "${pose_mode}" == live ]] && pose_args+=(--mesh "${pose_mesh}")
+  [[ -n "${pose_camera_serial}" ]] && pose_args+=(--camera-serial "${pose_camera_serial}")
+  [[ -n "${pose_width}" ]] && pose_args+=(--width "${pose_width}")
+  [[ -n "${pose_height}" ]] && pose_args+=(--height "${pose_height}")
+  [[ -n "${pose_depth_width}" ]] && pose_args+=(--depth-width "${pose_depth_width}")
+  [[ -n "${pose_depth_height}" ]] && pose_args+=(--depth-height "${pose_depth_height}")
+  [[ -n "${pose_fps}" ]] && pose_args+=(--fps "${pose_fps}")
   [[ "${#pose_roi[@]}" -eq 4 ]] && pose_args+=(--roi "${pose_roi[@]}")
   [[ "${pose_no_display}" -eq 1 ]] && pose_args+=(--no-display)
-  setsid "${pose_python}" "${root_dir}/foundation_pose_runner.py" "${pose_args[@]}" & child_pids+=("$!")
+  if [[ "${pose_camera}" == l515 && -d "${repository_root}/.vendor/l515_realsense" ]]; then
+    setsid env PYTHONPATH="${repository_root}/.vendor/l515_realsense:${PYTHONPATH}" \
+      "${pose_python}" "${root_dir}/foundation_pose_runner.py" "${pose_args[@]}" & child_pids+=("$!")
+  else
+    setsid "${pose_python}" "${root_dir}/foundation_pose_runner.py" "${pose_args[@]}" & child_pids+=("$!")
+  fi
 fi
 if [[ -z "${pose_mode}" ]]; then
   die "select a FoundationPose++ source with --foundationpose-mesh, --foundationpose-pose-file, or --foundationpose-mock"

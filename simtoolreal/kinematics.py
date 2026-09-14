@@ -153,7 +153,10 @@ class UrdfForwardKinematics:
         return list(reversed(chain))
 
     def link_pose(self, link_name: str, q: np.ndarray) -> np.ndarray:
-        positions = dict(zip(JOINT_NAMES, np.asarray(q), strict=True))
+        values = np.asarray(q)
+        if len(JOINT_NAMES) != len(values):
+            raise ValueError("joint names and values must have the same length")
+        positions = dict(zip(JOINT_NAMES, values))
         result = np.eye(4)
         for joint in self._chain(link_name):
             result = result @ joint.origin
@@ -180,7 +183,7 @@ class PolicyKinematics:
         palm_pos = world_from_link7[:3, 3] + world_from_link7[:3, :3] @ PALM_CENTER_OFFSET
         palm_rotation = world_from_link7[:3, :3] @ quat_wxyz_to_matrix(PALM_FRAME_QUAT_WXYZ)
         fingertip_positions = []
-        for link_name, offset in zip(FINGERTIP_LINK_NAMES, FINGERTIP_OFFSETS, strict=True):
+        for link_name, offset in zip(FINGERTIP_LINK_NAMES, FINGERTIP_OFFSETS):
             robot_from_tip = self.robot_fk.link_pose(link_name, q)
             world_from_tip = world_from_robot @ robot_from_tip
             fingertip_positions.append(world_from_tip[:3, 3] + world_from_tip[:3, :3] @ offset)

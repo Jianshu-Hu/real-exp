@@ -44,6 +44,22 @@ WUJI_FINGER_SEGMENT_LINKS: tuple[tuple[str, str, str], ...] = tuple(
     )
 )
 
+WUJI_HAND2_BETA1_FINGER_SEGMENT_LINKS: tuple[tuple[str, str, str], ...] = tuple(
+    (finger, segment, f"r_{stem}_{suffix}")
+    for finger, stem in (
+        ("thumb", "thumb"),
+        ("index", "index_finger"),
+        ("middle", "middle_finger"),
+        ("ring", "ring_finger"),
+        ("pinky", "pinky"),
+    )
+    for segment, suffix in (
+        ("proximal", "proximal_abd"),
+        ("middle", "middle"),
+        ("distal", "distal"),
+    )
+)
+
 SHADOW_FINGER_SEGMENT_LINKS: tuple[tuple[str, str, str], ...] = tuple(
     (finger, segment, f"{prefix}{suffix}")
     for finger, prefix in (
@@ -89,6 +105,7 @@ LEAP_FINGER_SEGMENT_LINKS = (
 FINGER_SEGMENT_LINKS_BY_HAND = {
     "right_sharpa_wave": SHARPA_FINGER_SEGMENT_LINKS,
     "right_wuji_hand": WUJI_FINGER_SEGMENT_LINKS,
+    "right_wuji_hand2_beta1": WUJI_HAND2_BETA1_FINGER_SEGMENT_LINKS,
     "right_shadow_hand": SHADOW_FINGER_SEGMENT_LINKS,
     "right_allegro_hand": ALLEGRO_FINGER_SEGMENT_LINKS,
     "right_leap_hand": LEAP_FINGER_SEGMENT_LINKS,
@@ -260,10 +277,14 @@ def _reference_joints(robot_model, flexion: float) -> np.ndarray:
     lower = robot_model.joint_limits.lower.detach().cpu().numpy()
     upper = robot_model.joint_limits.upper.detach().cpu().numpy()
     joints = lower + float(flexion) * (upper - lower)
-    if robot_model.spec.name == "right_wuji_hand":
+    if robot_model.spec.name in ("right_wuji_hand", "right_wuji_hand2_beta1"):
         for index, name in enumerate(robot_model.joint_names):
-            joint_number = int(name.rsplit("joint", 1)[1])
-            if joint_number == 2:
+            is_abduction = (
+                int(name.rsplit("joint", 1)[1]) == 2
+                if "joint" in name
+                else name.endswith(("cmc_abd", "mcp_abd"))
+            )
+            if is_abduction:
                 joints[index] = np.clip(0.0, lower[index], upper[index])
         return joints.astype(np.float32)
     for index, name in enumerate(robot_model.joint_names):

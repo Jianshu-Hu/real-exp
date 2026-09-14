@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from data_collection import move_to_target_ee as move
+from grasp.common import matrix_to_xyz_rpy
 
 
 def parse(*arguments: str) -> tuple[argparse.Namespace, list[move.SideTarget]]:
@@ -371,6 +372,16 @@ def test_robot_pose_matrix_round_trip_preserves_robot_coordinates() -> None:
     matrix = move.pose_vector_to_matrix(pose)
     np.testing.assert_allclose(move.matrix_to_pose_vector(matrix), pose)
     np.testing.assert_allclose(move.matrix_to_pose_vector(matrix.reshape(16, order="F")), pose)
+
+
+def test_pose_encoding_matches_grasp_protocol_xyz_rpy() -> None:
+    # The grasp server publishes scipy Rotation.as_euler("xyz") values.
+    # The execution utility must reconstruct the exact same homogeneous pose.
+    pose_matrix = move.pose_vector_to_matrix(
+        [0.577507, 0.175247, 0.086312, -0.589094, 0.428755, 2.691951]
+    )
+    encoded = matrix_to_xyz_rpy(pose_matrix)
+    np.testing.assert_allclose(move.pose_vector_to_matrix(encoded), pose_matrix, atol=1e-10)
 
 
 def test_approval_requires_explicit_yes(monkeypatch: pytest.MonkeyPatch) -> None:

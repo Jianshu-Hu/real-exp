@@ -90,7 +90,14 @@ class SemanticContactRefiner:
             )
             if config.use_inner_finger_surfaces
             and robot_spec.name
-            in ("right_sharpa_wave", "right_wuji_hand", "right_shadow_hand", "right_allegro_hand", "right_leap_hand")
+            in (
+                "right_sharpa_wave",
+                "right_wuji_hand",
+                "right_wuji_hand2_beta1",
+                "right_shadow_hand",
+                "right_allegro_hand",
+                "right_leap_hand",
+            )
             else None
         )
 

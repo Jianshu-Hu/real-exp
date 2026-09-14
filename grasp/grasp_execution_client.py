@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Request a camera grasp and execute it locally through move_to_target_ee.sh."""
+"""Request a camera grasp and execute it through the local grasp motion runner."""
 
 from __future__ import annotations
 
 import argparse
-import os
-from pathlib import Path
 import subprocess
+import sys
 import time
 from typing import Any
 import uuid
@@ -14,12 +13,13 @@ import uuid
 from grasp.common import (
     INFERENCE_REQUEST_FORMAT,
     INFERENCE_RESPONSE_FORMAT,
+    matrix_to_xyz_rpy,
+    read_transform,
     validate_command,
 )
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MOVE_SCRIPT = REPOSITORY_ROOT / "scripts" / "move_to_target_ee.sh"
+GRASP_MOTION_MODULE = "grasp.grasp_motion"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,7 +30,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Camera inference endpoint (default: tcp://192.168.50.13:5571).",
     )
     parser.add_argument("--side", choices=("right",), default="right")
-    parser.add_argument("--move-script", type=Path, default=DEFAULT_MOVE_SCRIPT)
     parser.add_argument(
         "--return-ee-pose",
         nargs=6,
@@ -63,14 +62,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--execute",
         action="store_true",
         help=(
-            "Permit real hardware execution. The local move script still displays "
-            "state and requires y/yes confirmation. Default is dry-run."
+            "Permit real hardware execution. The local grasp motion runner displays "
+            "state and requires y/yes confirmation for the initial arm motion; "
+            "the configured post-grasp lift runs automatically. Default is dry-run."
         ),
     )
     parser.add_argument(
         "--once",
         action="store_true",
         help="Send one request immediately and exit; otherwise use an interactive loop.",
+    )
+    parser.add_argument(
+        "--grasp-contract",
+        action="store_true",
+        default=True,
+        help=(
+            "After the hand reaches the inferred target, contract all non-lateral "
+            "joints by 10%% of their remaining range. The four finger lateral "
+            "joints stay at their grasp targets."
+        ),
+    )
+    parser.add_argument(
+        "--lift-after-grasp-m",
+        type=float,
+        default=0.20,
+        help="Lift the EE by this distance in world +Z after grasping (default: 0.20 m).",
     )
     return parser
 
@@ -129,7 +145,9 @@ def reset_to_initial_pose(args: argparse.Namespace) -> int:
 
     reset_pose = [f"{value:.12g}" for value in args.return_ee_pose]
     reset_command = [
-        str(args.move_script),
+        sys.executable,
+        "-m",
+        GRASP_MOTION_MODULE,
         f"--{args.side}",
         "--hand" if args.control_mode == "arm_with_hand" else "--arm",
         "--target-ee-pose",
@@ -137,12 +155,6 @@ def reset_to_initial_pose(args: argparse.Namespace) -> int:
     ]
     if args.control_mode == "arm_with_hand":
         reset_command.extend(("--target-ee-joint", *(["0"] * 20)))
-        reset_command.extend(
-            (
-                f"--{args.side}-hand-ip",
-                os.environ["GRASP_FIXED_RIGHT_HAND_IP"],
-            )
-        )
     if not args.execute:
         reset_command.append("--dry-run")
 
@@ -176,9 +188,13 @@ def execute_grasp(args: argparse.Namespace) -> int:
     # Remote data can never grant execution permission. This field is replaced
     # exclusively from the local --execute option after full target validation.
     command["execute"] = bool(args.execute)
+    if args.lift_after_grasp_m < 0:
+        raise ValueError("--lift-after-grasp-m must be non-negative")
     pose = [f"{value:.12g}" for value in command["ee_pose_xyz_rpy"]]
     move_command = [
-        str(args.move_script),
+        sys.executable,
+        "-m",
+        GRASP_MOTION_MODULE,
         f"--{args.side}",
         "--hand" if args.control_mode == "arm_with_hand" else "--arm",
         "--target-ee-pose",
@@ -187,16 +203,19 @@ def execute_grasp(args: argparse.Namespace) -> int:
     if args.control_mode == "arm_with_hand":
         joints = [f"{value:.12g}" for value in command["hand_joints"]]
         move_command.extend(("--target-ee-joint", *joints))
-        move_command.extend(
-            (
-                f"--{args.side}-hand-ip",
-                os.environ["GRASP_FIXED_RIGHT_HAND_IP"],
+        if args.grasp_contract:
+            move_command.append("--grasp-contract")
+        if args.lift_after_grasp_m > 0:
+            base_t_world = read_transform(command["base_T_world"], "base_T_world")
+            post_pose = read_transform(command["base_T_ee"], "base_T_ee").copy()
+            post_pose[:3, 3] += base_t_world[:3, :3] @ [0.0, 0.0, args.lift_after_grasp_m]
+            move_command.extend(
+                ("--post-grasp-pose", *(f"{v:.12g}" for v in matrix_to_xyz_rpy(post_pose)))
             )
-        )
     if not args.execute:
         move_command.append("--dry-run")
     mode = "execute with local confirmation" if args.execute else "dry-run"
-    print(f"Starting local move utility in {mode} mode...", flush=True)
+    print(f"Starting local grasp motion runner in {mode} mode...", flush=True)
     grasp_returncode = subprocess.run(move_command, check=False).returncode
     if grasp_returncode != 0 or args.return_ee_pose is None:
         return grasp_returncode
@@ -210,16 +229,6 @@ def main() -> int:
     args = parser.parse_args()
     if args.request_timeout_s <= 0 or args.max_command_age_s <= 0:
         parser.error("timeouts and maximum command age must be positive")
-    if not args.move_script.is_file():
-        parser.error(f"move script does not exist: {args.move_script}")
-    if args.control_mode == "arm_with_hand" and not os.environ.get(
-        "GRASP_FIXED_RIGHT_HAND_IP"
-    ):
-        parser.error(
-            "arm-with-hand mode must be started through "
-            "start_grasp_execution_client.sh"
-        )
-
     if args.once:
         return execute_grasp(args)
 

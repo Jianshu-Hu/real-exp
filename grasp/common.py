@@ -12,25 +12,20 @@ import numpy as np
 COMMAND_FORMAT = "real_exp_wuji_grasp_command_v2"
 INFERENCE_REQUEST_FORMAT = "real_exp_camera_grasp_request_v1"
 INFERENCE_RESPONSE_FORMAT = "real_exp_camera_grasp_response_v1"
-WUJI_RIGHT_JOINT_NAMES = tuple(
-    f"right_finger{finger}_joint{joint}"
-    for finger in range(1, 6)
-    for joint in range(1, 5)
+WUJI_RIGHT_JOINT_NAMES = (
+    "r_thumb_cmc_flex", "r_thumb_cmc_abd", "r_thumb_mcp", "r_thumb_ip",
+    "r_index_finger_mcp_flex", "r_index_finger_mcp_abd",
+    "r_index_finger_pip", "r_index_finger_dip",
+    "r_middle_finger_mcp_flex", "r_middle_finger_mcp_abd",
+    "r_middle_finger_pip", "r_middle_finger_dip",
+    "r_ring_finger_mcp_flex", "r_ring_finger_mcp_abd",
+    "r_ring_finger_pip", "r_ring_finger_dip",
+    "r_pinky_mcp_flex", "r_pinky_mcp_abd", "r_pinky_pip", "r_pinky_dip",
 )
-WUJI_COMMAND_HAND_MODEL = "wuji_hand_2"
+WUJI_COMMAND_HAND_MODEL = "wuji_hand2_beta_1"
 WUJI_COMMAND_JOINT_CONVENTION = "wuji_sdk_firmware_order"
-WUJI_COMMAND_SOURCE_MODEL = "wuji_hand_v1_robodex"
-WUJI_COMMAND_CONVERSION = "wuji_hand_v1_robodex_to_wuji_hand_2_lateral_sign_v1"
-# The first-generation RoboDex model and the Wuji Hand 2 firmware use opposite
-# positive axes for the MCP abduction/adduction joint of the four non-thumb
-# fingers. Their remaining joint axes do not require a sign change. This is a
-# temporary model-boundary conversion until grasp inference uses Hand 2 geometry.
-WUJI_V1_TO_HAND2_NEGATED_JOINT_NAMES = (
-    "right_finger2_joint2",
-    "right_finger3_joint2",
-    "right_finger4_joint2",
-    "right_finger5_joint2",
-)
+WUJI_COMMAND_SOURCE_MODEL = "wuji_hand2_beta1_right"
+WUJI_COMMAND_CONVERSION = "identity"
 EE_POSITION_LOWER_M = np.asarray([-0.40, -1.00, -0.60], dtype=np.float64)
 EE_POSITION_UPPER_M = np.asarray([1.00, 1.00, 1.20], dtype=np.float64)
 EE_POSITION_MAX_RADIUS_M = 1.25
@@ -144,21 +139,6 @@ def reorder_wuji_joints(joints: np.ndarray, names: Sequence[str]) -> np.ndarray:
     if not np.all(np.isfinite(ordered)):
         raise ValueError("Wuji joint target contains non-finite values")
     return ordered
-
-
-def wuji_v1_model_to_hand2_firmware(joints: np.ndarray) -> np.ndarray:
-    """Convert canonical RoboDex/Wuji-v1 angles to Hand 2 SDK firmware angles.
-
-    Input and output both use finger-major ``finger1..5 x joint1..4`` ordering.
-    Only the four non-thumb lateral joints change sign.
-    """
-    converted = np.asarray(joints, dtype=np.float64).reshape(-1).copy()
-    if converted.shape != (20,) or not np.all(np.isfinite(converted)):
-        raise ValueError("Wuji v1-to-Hand-2 conversion requires 20 finite joint angles")
-    name_to_index = {name: index for index, name in enumerate(WUJI_RIGHT_JOINT_NAMES)}
-    for name in WUJI_V1_TO_HAND2_NEGATED_JOINT_NAMES:
-        converted[name_to_index[name]] *= -1.0
-    return converted
 
 
 def validate_command(command: Any, *, max_age_s: float, expected_side: str) -> dict[str, Any]:

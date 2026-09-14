@@ -21,7 +21,10 @@ from grasp.runtime.retargeting.mano_model import (
     ManoModelConfig,
     flat_hand_mean_from_contract,
 )
-from grasp.runtime.retargeting.wuji import create_wuji_hand_right_spec, wuji_hand_right_global_orient_from_mano
+from grasp.runtime.retargeting.wuji_hand2 import (
+    create_wuji_hand2_beta1_right_spec,
+    wuji_hand2_beta1_right_global_orient_from_mano,
+)
 
 
 @dataclass(frozen=True)
@@ -33,7 +36,7 @@ class GeneratorRuntimeConfig:
     world_z_segmentation_min_m: float = 0.002
     mano_root: Path = Path("data/HandsAndObejects/mano")
     mano_side: str = "right"
-    robodex_root: Path = Path("grasp/assets/RoboDex")
+    hand_assets_root: Path = Path("grasp/assets/Wuji_hand2")
     diffusion_steps: int = 100
     retarget_landmark_fit_steps: int = 50
     device: str = "auto"
@@ -147,7 +150,9 @@ class GeneratorRuntime:
                 flat_hand_mean=self.mano_flat_hand_mean,
             )
         )
-        robot_spec = create_wuji_hand_right_spec(robodex_root=config.robodex_root)
+        robot_spec = create_wuji_hand2_beta1_right_spec(
+            hand_root=config.hand_assets_root
+        )
         self.retargeter = ManoToRobotRetargeter(
             robot_spec=robot_spec,
             config=ManoToRobotRetargetConfig(
@@ -190,7 +195,7 @@ class GeneratorRuntime:
             "diffusion_steps": int(config.diffusion_steps),
             "sample_latent": False,
             "seed": int(config.seed),
-            "hand_type": "wuji_hand_right",
+            "hand_type": "wuji_hand2_beta1_right",
             "device": str(self.device),
             "retarget_device": str(config.retarget_device),
             "frame": "robodex_world_z_up",
@@ -277,7 +282,7 @@ class GeneratorRuntime:
                 .astype(np.int64)
             )
 
-        init_orient = wuji_hand_right_global_orient_from_mano(mano_orient)
+        init_orient = wuji_hand2_beta1_right_global_orient_from_mano(mano_orient)
         mano_transl = _mano_translation_for_wrist(
             mano_model=self.mano_model,
             wrist_translation=wrist,

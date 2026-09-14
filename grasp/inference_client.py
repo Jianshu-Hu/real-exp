@@ -26,7 +26,6 @@ from grasp.common import (
     read_transform,
     reorder_wuji_joints,
     transform_points,
-    wuji_v1_model_to_hand2_firmware,
 )
 
 
@@ -34,9 +33,9 @@ DEFAULT_CAMERA_SERIAL = "401622071701"
 CALIBRATED_L515_SERIAL: str | None = "f1480539"
 CALIBRATED_D435I_T_L515: np.ndarray | None = np.asarray(
     [
-        [-0.997594459, 0.068617076, 0.009848427, 0.023147317],
-        [-0.000304589, -0.146409000, 0.989224096, -0.728169935],
-        [0.069319564, 0.986841477, 0.146077708, 0.980355134],
+        [-0.325302673, -0.685909022, 0.650927787, -0.359028168],
+        [0.848951697, 0.091342298, 0.520516667, -0.331052357],
+        [-0.416484319, 0.721931713, 0.552589735, 0.749659696],
         [0.0, 0.0, 0.0, 1.0],
     ],
     dtype=np.float64,
@@ -45,7 +44,7 @@ FINGER_NAMES = ("thumb", "index", "middle", "ring", "pinky")
 ASSETS_ROOT = Path(__file__).resolve().parent / "assets"
 DEFAULT_GENERATOR_CHECKPOINT = ASSETS_ROOT / "checkpoints" / "generator_best.pt"
 DEFAULT_MANO_ROOT = ASSETS_ROOT / "mano"
-DEFAULT_ROBODEX_ROOT = ASSETS_ROOT / "RoboDex"
+DEFAULT_WUJI_HAND2_ROOT = ASSETS_ROOT / "Wuji_hand2"
 DEFAULT_MOUNT_CALIBRATION = Path(__file__).resolve().parent / "ee_to_wuji_nominal.json"
 
 # Calibrated transforms from calibration/matrix.md. The right-arm matrix is
@@ -138,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--world-min", type=float, nargs=3, default=(-0.50, -0.50, 0.005))
     parser.add_argument("--world-max", type=float, nargs=3, default=(0.50, 0.50, 0.50))
     parser.add_argument("--min-filtered-points", type=int, default=300)
-    parser.add_argument("--num-points", type=int, default=8192)
+    parser.add_argument("--num-points", type=int, default=2048)
     parser.add_argument("--world-z-segmentation-min-m", type=float, default=0.002)
     parser.add_argument("--generator-weights", choices=("ema", "model"), default="ema")
     parser.add_argument(
@@ -188,8 +187,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         (args.generator_checkpoint, "generator checkpoint"),
         (DEFAULT_MANO_ROOT / "models" / "MANO_RIGHT.pkl", "MANO right-hand model"),
         (
-            DEFAULT_ROBODEX_ROOT / "task/assets/urdf/panda_wuji_hand_right_handonly.urdf",
-            "Wuji hand-only URDF",
+            DEFAULT_WUJI_HAND2_ROOT / "hand2_beta1/body/urdf/right.urdf",
+            "Wuji Hand 2 Beta 1 URDF",
         ),
     ):
         if not path.is_file():
@@ -333,24 +332,30 @@ def filter_and_sample_points(
 def _interpolate_local_points(
     points: np.ndarray, target_count: int, rng: np.random.Generator
 ) -> np.ndarray:
-    """Fill a sparse cloud with points linearly interpolated to local neighbours."""
+    """Resize a cloud using the same local-edge interpolation as simulation."""
     if points.shape[0] >= target_count:
         return points
-    if points.shape[0] < 2:
-        raise ValueError("at least two points are required for point-cloud interpolation")
+    if points.shape[0] == 1:
+        return np.repeat(points, target_count, axis=0)
 
     from scipy.spatial import cKDTree
 
     interpolation_count = target_count - points.shape[0]
-    anchor_indices = rng.integers(points.shape[0], size=interpolation_count)
-    neighbour_count = min(8, points.shape[0])
+    anchor_order = rng.permutation(points.shape[0])
+    anchor_indices = np.tile(
+        anchor_order,
+        (interpolation_count + points.shape[0] - 1) // points.shape[0],
+    )[:interpolation_count]
+    neighbour_count = min(8, points.shape[0] - 1)
     _, neighbour_indices = cKDTree(points).query(
-        points[anchor_indices], k=neighbour_count
+        points[anchor_indices], k=neighbour_count + 1
     )
-    if neighbour_count == 2:
+    if neighbour_count == 1:
         selected_neighbours = neighbour_indices[:, 1]
     else:
-        neighbour_columns = rng.integers(1, neighbour_count, size=interpolation_count)
+        neighbour_columns = rng.integers(
+            1, neighbour_count + 1, size=interpolation_count
+        )
         selected_neighbours = neighbour_indices[
             np.arange(interpolation_count), neighbour_columns
         ]
@@ -396,7 +401,7 @@ def run_model(scene_points_world: np.ndarray, args: argparse.Namespace) -> tuple
         SemanticContactRefinementConfig,
         SemanticContactRefiner,
     )
-    from grasp.runtime.retargeting.wuji import create_wuji_hand_right_spec
+    from grasp.runtime.retargeting.wuji_hand2 import create_wuji_hand2_beta1_right_spec
     runtime = GeneratorRuntime(
         config=GeneratorRuntimeConfig(
             generator_checkpoint=args.generator_checkpoint,
@@ -405,7 +410,7 @@ def run_model(scene_points_world: np.ndarray, args: argparse.Namespace) -> tuple
             posterior_conditioning=args.posterior_conditioning,
             world_z_segmentation_min_m=args.world_z_segmentation_min_m,
             mano_root=DEFAULT_MANO_ROOT,
-            robodex_root=DEFAULT_ROBODEX_ROOT,
+            hand_assets_root=DEFAULT_WUJI_HAND2_ROOT,
             diffusion_steps=args.diffusion_steps,
             retarget_landmark_fit_steps=args.retarget_landmark_fit_steps,
             device=args.device,
@@ -420,7 +425,7 @@ def run_model(scene_points_world: np.ndarray, args: argparse.Namespace) -> tuple
         runtime.mano_model.finger_vertex_indices(("proximal", "middle", "distal", "fingertip")),
         args,
     )
-    robot_spec = create_wuji_hand_right_spec(robodex_root=DEFAULT_ROBODEX_ROOT)
+    robot_spec = create_wuji_hand2_beta1_right_spec(hand_root=DEFAULT_WUJI_HAND2_ROOT)
     refiner = SemanticContactRefiner(
         robot_spec=robot_spec,
         config=SemanticContactRefinementConfig(
@@ -469,7 +474,6 @@ def build_command(
     model_joints = reorder_wuji_joints(
         refined.robot_joints, generated.robot_joint_names
     )
-    firmware_joints = wuji_v1_model_to_hand2_firmware(model_joints)
     command_id = str(uuid.uuid4())
     return {
         "format": COMMAND_FORMAT,
@@ -479,7 +483,7 @@ def build_command(
         "execute": bool(args.execute),
         "base_T_ee": base_t_ee.tolist(),
         "ee_pose_xyz_rpy": matrix_to_xyz_rpy(base_t_ee).tolist(),
-        "hand_joints": firmware_joints.tolist(),
+        "hand_joints": model_joints.tolist(),
         "hand_joint_names": list(WUJI_RIGHT_JOINT_NAMES),
         "hand_model": WUJI_COMMAND_HAND_MODEL,
         "hand_joint_convention": WUJI_COMMAND_JOINT_CONVENTION,
@@ -567,9 +571,14 @@ def _posed_wuji_mesh(
     robot_global_orient: np.ndarray,
     robot_joints: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    from grasp.runtime.retargeting import RobotHandModel, create_wuji_hand_right_spec
+    from grasp.runtime.retargeting import (
+        RobotHandModel,
+        create_wuji_hand2_beta1_right_spec,
+    )
 
-    model = RobotHandModel(create_wuji_hand_right_spec(robodex_root=DEFAULT_ROBODEX_ROOT))
+    model = RobotHandModel(
+        create_wuji_hand2_beta1_right_spec(hand_root=DEFAULT_WUJI_HAND2_ROOT)
+    )
     meshes = model.collision_meshes(
         trans=robot_trans,
         global_orient=robot_global_orient,

@@ -22,6 +22,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 from lerobot.configs.default import DatasetConfig, WandBConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_policy_config, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -56,6 +57,7 @@ from utils.mode_aware_dataset import (
     mode_action_config,
     mode_trajectory_config,
     normalize_training_mode,
+    select_trajectory_arm,
 )
 
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "pick_and_place_test"
@@ -100,6 +102,21 @@ def parse_args() -> argparse.Namespace:
         help=(
             "State/action representation to train. Defaults to the dataset contract: "
             "joint state + target joint action or end-effector pose state + delta pose action."
+        ),
+    )
+    parser.add_argument(
+        "--arm-mode",
+        choices=("left", "right", "duo"),
+        default=None,
+        help="Train on one arm from a duo dataset, or preserve the dataset arm layout by default.",
+    )
+    parser.add_argument(
+        "--camera-names",
+        nargs="+",
+        default=None,
+        help=(
+            "Camera observation names to train on, for example: "
+            "--camera-names cam_left cam_front. Defaults to every dataset camera."
         ),
     )
     parser.add_argument(
@@ -483,6 +500,51 @@ def load_action_config(dataset_root: Path) -> dict[str, Any]:
     return json.loads(action_config_path.read_text())
 
 
+def resolve_training_camera_names(
+    dataset_info: dict[str, Any], requested_names: list[str] | None
+) -> list[str]:
+    features = dataset_info.get("features", {})
+    available = [
+        key.removeprefix("observation.images.")
+        for key, feature in features.items()
+        if key.startswith("observation.images.")
+        and feature.get("dtype") in {"image", "video"}
+    ]
+    selected = available if requested_names is None else requested_names
+    if not selected:
+        raise ValueError("Training requires at least one camera observation.")
+    if len(selected) != len(set(selected)):
+        raise ValueError(f"Camera names must be unique, got {selected}.")
+    unknown = [name for name in selected if name not in available]
+    if unknown:
+        raise ValueError(
+            f"Unknown training cameras {unknown}; available cameras are {available}."
+        )
+    return list(selected)
+
+
+def configure_policy_inputs(policy_cfg, dataset_info: dict[str, Any], camera_names: list[str]) -> None:
+    policy_features = dataset_to_policy_features(dataset_info["features"])
+    selected_keys = [OBS_STATE, *[f"observation.images.{name}" for name in camera_names]]
+    missing = [key for key in selected_keys if key not in policy_features]
+    if missing:
+        raise ValueError(f"Dataset is missing selected policy inputs: {missing}.")
+    policy_cfg.input_features = {key: policy_features[key] for key in selected_keys}
+
+
+def filter_dataset_info_cameras(
+    dataset_info: dict[str, Any], camera_names: list[str]
+) -> dict[str, Any]:
+    filtered = json.loads(json.dumps(dataset_info))
+    selected_keys = {f"observation.images.{name}" for name in camera_names}
+    filtered["features"] = {
+        key: value
+        for key, value in filtered["features"].items()
+        if not key.startswith("observation.images.") or key in selected_keys
+    }
+    return filtered
+
+
 def write_policy_data_contract(
     checkpoint_dir: Path,
     dataset_info: dict[str, Any],
@@ -620,6 +682,8 @@ def main() -> None:
     source_action_config = load_action_config(dataset_root)
     source_trajectory_config = require_dataset_trajectory_config(dataset_root)
     trajectory_config = require_state_action_mode_dataset(dataset_root, args.state_action_mode)
+    source_arm_mode = str(trajectory_config["arm_mode"])
+    trajectory_config = select_trajectory_arm(trajectory_config, args.arm_mode)
     selected_mode = normalize_training_mode(
         trajectory_config.get("state_action_mode"),
         str(source_trajectory_config.get("state_action_mode", "joint")),
@@ -712,9 +776,15 @@ def main() -> None:
             f"{describe_trajectory_layout(trajectory_config)}"
         )
 
-    train_dataset = adapt_dataset_for_mode(make_dataset(cfg), selected_mode)
+    train_dataset = adapt_dataset_for_mode(
+        make_dataset(cfg), selected_mode, trajectory_config["arm_mode"], source_arm_mode
+    )
     apply_dataset_image_transform(train_dataset, resize_pad_config)
-    dataset_info = json.loads(json.dumps(train_dataset.meta.info))
+    camera_names = resolve_training_camera_names(train_dataset.meta.info, args.camera_names)
+    configure_policy_inputs(policy_cfg, train_dataset.meta.info, camera_names)
+    dataset_info = filter_dataset_info_cameras(train_dataset.meta.info, camera_names)
+    if is_main_process:
+        print(f"Policy cameras: {', '.join(camera_names)}")
     val_dataset = None
     if val_episodes:
         val_cfg = TrainPipelineConfig(
@@ -737,7 +807,9 @@ def main() -> None:
             save_freq=save_freq,
             wandb=wandb_cfg,
         )
-        val_dataset = adapt_dataset_for_mode(make_dataset(val_cfg), selected_mode)
+        val_dataset = adapt_dataset_for_mode(
+            make_dataset(val_cfg), selected_mode, trajectory_config["arm_mode"], source_arm_mode
+        )
         apply_dataset_image_transform(val_dataset, resize_pad_config)
 
     policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta, rename_map=cfg.rename_map)

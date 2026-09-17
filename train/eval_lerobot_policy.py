@@ -263,7 +263,7 @@ def evaluate_checkpoint(
     training_mode = normalize_training_mode(
         checkpoint_trajectory.get("state_action_mode"), "joint"
     )
-    require_state_action_mode_dataset(dataset_root, training_mode)
+    source_trajectory = require_state_action_mode_dataset(dataset_root, training_mode)
 
     cli_overrides = build_policy_cli_overrides(policy_type, args)
     policy_class = get_policy_class(policy_type)
@@ -277,7 +277,12 @@ def evaluate_checkpoint(
         num_workers=args.num_workers,
         tolerance_s=float(train_config.get("tolerance_s", 1e-4)),
     )
-    val_dataset = adapt_dataset_for_mode(make_dataset(build_cfg), training_mode)
+    val_dataset = adapt_dataset_for_mode(
+        make_dataset(build_cfg),
+        training_mode,
+        checkpoint_trajectory["arm_mode"],
+        source_trajectory["arm_mode"],
+    )
     apply_dataset_image_transform(val_dataset, resize_pad_config)
 
     preprocessor, _ = make_pre_post_processors(

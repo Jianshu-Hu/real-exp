@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from train.train_lerobot_policy import format_run_timestamp, resolve_output_dir
+from train.train_lerobot_policy import (
+    filter_dataset_info_cameras,
+    format_run_timestamp,
+    resolve_output_dir,
+    resolve_training_camera_names,
+)
 from train.eval_lerobot_policy import discover_run_dirs
 
 
@@ -105,3 +110,26 @@ def test_eval_discovers_timestamped_and_legacy_run_directories(tmp_path) -> None
     runs = discover_run_dirs(tmp_path, "act")
 
     assert runs == [timestamped_config.parents[3], legacy_config.parents[3]]
+
+
+def test_training_camera_selection_filters_checkpoint_metadata() -> None:
+    info = json.loads(Path("data/memory_260915/meta/info.json").read_text())
+
+    selected = resolve_training_camera_names(info, ["cam_left", "cam_front"])
+    filtered = filter_dataset_info_cameras(info, selected)
+    image_keys = {
+        key for key in filtered["features"] if key.startswith("observation.images.")
+    }
+
+    assert selected == ["cam_left", "cam_front"]
+    assert image_keys == {
+        "observation.images.cam_left",
+        "observation.images.cam_front",
+    }
+
+
+def test_training_camera_selection_rejects_unknown_camera() -> None:
+    info = json.loads(Path("data/memory_260915/meta/info.json").read_text())
+
+    with pytest.raises(ValueError, match="Unknown training cameras"):
+        resolve_training_camera_names(info, ["cam_left", "missing_camera"])

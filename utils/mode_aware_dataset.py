@@ -43,8 +43,34 @@ def mode_action_config(source_config, mode, trajectory):
     arm_rep = "delta_joint_position" if mode == "joint" else "delta_end_effector_position_rotation_vector"
     if int(trajectory.get("schema_version", -1)) != TRAJECTORY_CONFIG_SCHEMA_VERSION:
         raise ValueError("Only schema-v2 trajectories can be used for training.")
-    result.update(schema_version=TRAJECTORY_CONFIG_SCHEMA_VERSION, action_dim=int(trajectory["action_dim"]), state_action_mode=trajectory["state_action_mode"], state_representation=trajectory["state_representation"], action_representation=trajectory["action_representation"], arm_action_representation=arm_rep, arm_action_definition="q_target[t+h]-q_measured[t]" if mode == "joint" else "base_spatial_delta(ee_measured[t],ee_target[t+h])", delta_alignment="chunk_anchor", chunk_anchor_definition="latest_generation_observation", ee_state_rotation_representation="rotation_6d_first_two_columns", ee_action_rotation_representation="rotation_vector", ee_action_rotation_frame="robot_base_spatial", ee_rotation_composition="R_target=Exp(rotvec)@R_anchor", transport_action_representation="absolute_target")
+    result.update(schema_version=TRAJECTORY_CONFIG_SCHEMA_VERSION, action_dim=int(trajectory["action_dim"]), arm_mode=trajectory["arm_mode"], include_right_arm=trajectory["arm_mode"] == "duo", state_action_mode=trajectory["state_action_mode"], state_representation=trajectory["state_representation"], action_representation=trajectory["action_representation"], arm_action_representation=arm_rep, arm_action_definition="q_target[t+h]-q_measured[t]" if mode == "joint" else "base_spatial_delta(ee_measured[t],ee_target[t+h])", delta_alignment="chunk_anchor", chunk_anchor_definition="latest_generation_observation", ee_state_rotation_representation="rotation_6d_first_two_columns", ee_action_rotation_representation="rotation_vector", ee_action_rotation_frame="robot_base_spatial", ee_rotation_composition="R_target=Exp(rotvec)@R_anchor", transport_action_representation="absolute_target")
     return result
+
+def select_trajectory_arm(config, arm_mode):
+    """Select one side from a duo trajectory contract."""
+    source_mode = str(config["arm_mode"])
+    selected_mode = source_mode if arm_mode is None else str(arm_mode)
+    if selected_mode == source_mode:
+        return dict(config)
+    if source_mode != "duo" or selected_mode not in {"left", "right"}:
+        raise ValueError(f"Cannot select arm_mode={selected_mode!r} from {source_mode!r} data.")
+    state_dim = int(config["robot_state_dim"])
+    action_dim = int(config["action_dim"])
+    if state_dim % 2 or action_dim % 2:
+        raise ValueError("Duo state/action dimensions must split evenly between arms.")
+    selected = dict(config)
+    selected.update(
+        arm_mode=selected_mode,
+        arms=[selected_mode],
+        robot_state_dim=state_dim // 2,
+        action_dim=action_dim // 2,
+    )
+    return validate_trajectory_config(
+        selected,
+        state_dim // 2,
+        action_dim // 2,
+        source="selected training arm",
+    )
 
 def _tensor(x, like=None):
     if isinstance(x, torch.Tensor): return x
@@ -158,4 +184,65 @@ class ModeAwareDataset(torch.utils.data.Dataset):
         if action.ndim>1: pad=pad|torch.as_tensor([o<0 for o in self.action_offsets],dtype=torch.bool)
         item["observation.state"]=state; item["action"]=action; item["action_is_pad"]=pad; return item
     def __getattr__(self,name): return getattr(self.dataset,name)
-def adapt_dataset_for_mode(dataset,mode): return ModeAwareDataset(dataset,mode)
+
+class ArmSubsetDataset(torch.utils.data.Dataset):
+    """Expose one arm block from a mode-aware duo dataset."""
+
+    def __init__(self, dataset, arm_mode, source_arm_mode):
+        self.dataset = dataset
+        self.arm_mode = str(arm_mode)
+        self.source_arm_mode = str(source_arm_mode)
+        if self.arm_mode not in {"left", "right", "duo"}:
+            raise ValueError(f"Unsupported training arm mode {self.arm_mode!r}.")
+        if self.arm_mode == self.source_arm_mode:
+            self._slice = None
+            self.meta = dataset.meta
+            return
+        if self.source_arm_mode != "duo" or self.arm_mode == "duo":
+            raise ValueError(
+                f"Cannot select arm_mode={self.arm_mode!r} from {self.source_arm_mode!r} data."
+            )
+
+        self.meta = copy.copy(dataset.meta)
+        self.meta.info = copy.deepcopy(dataset.meta.info)
+        self.meta.stats = copy.deepcopy(dataset.meta.stats)
+        state_dim = _feature_dim(self.meta.info, "observation.state")
+        action_dim = _feature_dim(self.meta.info, "action")
+        if state_dim % 2 or action_dim % 2:
+            raise ValueError("Duo state/action dimensions must split evenly between arms.")
+        state_block = state_dim // 2
+        action_block = action_dim // 2
+        block_index = 0 if self.arm_mode == "left" else 1
+        self._slice = {
+            "observation.state": slice(block_index * state_block, (block_index + 1) * state_block),
+            "action": slice(block_index * action_block, (block_index + 1) * action_block),
+        }
+        for key, full_dim, block in (
+            ("observation.state", state_dim, state_block),
+            ("action", action_dim, action_block),
+        ):
+            self.meta.info["features"][key]["shape"] = (block,)
+            for stat_name, value in self.meta.stats[key].items():
+                array = np.asarray(value)
+                if array.shape == (full_dim,):
+                    self.meta.stats[key][stat_name] = array[self._slice[key]].copy()
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        item = dict(self.dataset[index])
+        if self._slice is not None:
+            for key, value_slice in self._slice.items():
+                item[key] = item[key][..., value_slice]
+        return item
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+def adapt_dataset_for_mode(dataset, mode, arm_mode=None, source_arm_mode=None):
+    mode_dataset = ModeAwareDataset(dataset, mode)
+    if arm_mode is None:
+        return mode_dataset
+    source = source_arm_mode or ("duo" if mode_dataset.n == 2 else arm_mode)
+    return ArmSubsetDataset(mode_dataset, arm_mode, source)

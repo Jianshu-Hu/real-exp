@@ -108,6 +108,8 @@ Important options:
 - `--dataset-root`: override the local dataset path
 - `--dataset-repo-id`: override the LeRobot dataset repo id
 - `--policy-type {act,diffusion}`: choose the imitation-learning policy
+- `--arm-mode {left,right,duo}`: select one arm from a duo dataset or keep both arms
+- `--camera-names NAME [NAME ...]`: select the image observations used by the policy
 - `--output-dir`: choose the parent directory for a new timestamped run; with `--resume`, specify the exact existing run directory
 - `--steps`: total number of optimizer steps
 - `--batch-size`: training batch size

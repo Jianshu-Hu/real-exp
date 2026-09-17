@@ -5,7 +5,13 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from utils.mode_aware_dataset import ModeAwareDataset, mode_action_config, mode_trajectory_config
+from utils.mode_aware_dataset import (
+    ArmSubsetDataset,
+    ModeAwareDataset,
+    mode_action_config,
+    mode_trajectory_config,
+    select_trajectory_arm,
+)
 
 
 def _source_dataset() -> SimpleNamespace:
@@ -115,6 +121,66 @@ def test_joint_dataset_view_preserves_primary_fields() -> None:
     assert tuple(sample["observation.state"].shape) == (16,)
     assert torch.equal(sample["observation.state"], torch.arange(16) + 2)
     assert torch.equal(sample["action"], torch.arange(16) + 3)
+
+
+def test_left_arm_selection_slices_duo_gripper_state_and_action() -> None:
+    features = {
+        "observation.state": {"dtype": "float32", "shape": [16]},
+        "action": {"dtype": "float32", "shape": [16]},
+    }
+    stats = {
+        key: {
+            "mean": np.arange(16, dtype=np.float32),
+            "std": np.ones(16, dtype=np.float32),
+        }
+        for key in features
+    }
+
+    class Dataset:
+        meta = SimpleNamespace(info={"features": features}, stats=stats)
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            del index
+            return {
+                "observation.state": torch.arange(16),
+                "action": torch.arange(100, 116),
+            }
+
+    dataset = ArmSubsetDataset(Dataset(), "left", "duo")
+    sample = dataset[0]
+
+    assert dataset.meta.info["features"]["observation.state"]["shape"] == (8,)
+    assert dataset.meta.info["features"]["action"]["shape"] == (8,)
+    assert torch.equal(sample["observation.state"], torch.arange(8))
+    assert torch.equal(sample["action"], torch.arange(100, 108))
+    np.testing.assert_array_equal(dataset.meta.stats["action"]["mean"], np.arange(8))
+
+
+def test_left_arm_selection_updates_trajectory_contract() -> None:
+    source = {
+        "schema_version": 2,
+        "end_effector": "gripper",
+        "arm_mode": "duo",
+        "arms": ["left", "right"],
+        "include_gripper": True,
+        "include_hand": False,
+        "robot_state_dim": 16,
+        "action_dim": 16,
+        "state_action_mode": "joint",
+        "state_representation": "joint",
+        "action_representation": "delta_joint_position",
+        "delta_alignment": "one_step",
+    }
+
+    selected = select_trajectory_arm(source, "left")
+
+    assert selected["arm_mode"] == "left"
+    assert selected["arms"] == ["left"]
+    assert selected["robot_state_dim"] == 8
+    assert selected["action_dim"] == 8
 
 
 def test_ee_dataset_view_preserves_current_and_target_gripper_widths() -> None:

@@ -219,3 +219,6 @@ replay_trace
 grasp/assets/checkpoints
 calibration/runs
 grasp/runs
+# Repository-local uv deployment environments and tools.
+.venvs/
+.tools/

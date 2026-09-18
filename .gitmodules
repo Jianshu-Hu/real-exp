@@ -16,3 +16,6 @@
 [submodule "libs/SimToolReal-Franka-Wuji2"]
 	path = libs/SimToolReal-Franka-Wuji2
 	url = git@github.com:etach-qs/SimToolReal-Franka-Wuji2.git
+[submodule "libs/RMBench"]
+	path = libs/RMBench
+	url = https://github.com/yuaniw/RMBench.git

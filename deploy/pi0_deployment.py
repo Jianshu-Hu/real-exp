@@ -15,6 +15,9 @@ from typing import Any
 
 PI0_PROTOCOL_VERSION = 1
 PI0_TRAIN_CONFIG = "pi0_base_franka_left_memory_260915_anchor_adaln_h50_30k_v1"
+PI0_PRESS_BUTTON_TRAIN_CONFIG = (
+    "pi0_base_franka_press_button_260917_anchor_adaln_bz32_h50_30k"
+)
 PI0_PROMPT = (
     "There are four mats, one block, and a button on the table. "
     "One block is on one of the mats. First, put the block to the center, "
@@ -24,22 +27,62 @@ PI0_FPS = 15.0
 PI0_HORIZON = 50
 PI0_DEFAULT_ACTIONS_PER_CHUNK = 8
 
+PI0_CHECKPOINT_PROFILES: dict[str, dict[str, Any]] = {
+    "memory_260915-franka-left-2view-v1": {
+        "train_config": PI0_TRAIN_CONFIG,
+        "arm_mode": "left",
+        "camera_names": ["cam_front", "cam_left"],
+        "prompt": PI0_PROMPT,
+    },
+    "memory_260915-franka-left-front-v1": {
+        "train_config": (
+            "pi0_base_franka_left_memory_260915_front_anchor_adaln_h50_30k_v1"
+        ),
+        "arm_mode": "left",
+        "camera_names": ["cam_front"],
+        "prompt": PI0_PROMPT,
+    },
+    "press_button-memory-260917-franka-3view-v1": {
+        "train_config": PI0_PRESS_BUTTON_TRAIN_CONFIG,
+        "arm_mode": "duo",
+        "camera_names": ["cam_front", "cam_left", "cam_right"],
+        "prompt": "Press the button.",
+    },
+}
+
 
 def _franka_contract(
-    *, arm_mode: str, asset_id: str, train_config: str, prompt: str
+    *,
+    arm_mode: str,
+    asset_id: str,
+    train_config: str,
+    prompt: str,
+    camera_names: list[str] | None = None,
 ) -> dict[str, Any]:
     if arm_mode not in {"left", "right", "duo"}:
         raise ValueError(f"Unsupported Franka Pi0 arm mode {arm_mode!r}.")
     arms = ["left", "right"] if arm_mode == "duo" else [arm_mode]
-    camera_names = [
-        "cam_front",
-        *(["cam_left"] if "left" in arms else []),
-        *(["cam_right"] if "right" in arms else []),
-    ]
+    if camera_names is None:
+        camera_names = [
+            "cam_front",
+            *(["cam_left"] if "left" in arms else []),
+            *(["cam_right"] if "right" in arms else []),
+        ]
+    camera_names = list(camera_names)
+    allowed_cameras = {"cam_front", *(f"cam_{side}" for side in arms)}
+    if (
+        not camera_names
+        or len(camera_names) != len(set(camera_names))
+        or "cam_front" not in camera_names
+        or set(camera_names) - allowed_cameras
+    ):
+        raise ValueError(
+            f"Invalid cameras {camera_names!r} for Franka arm mode {arm_mode!r}."
+        )
     camera_key_map = {"cam_front": "cam_high"}
-    if "left" in arms:
+    if "cam_left" in camera_names:
         camera_key_map["cam_left"] = "cam_left_wrist"
-    if "right" in arms:
+    if "cam_right" in camera_names:
         camera_key_map["cam_right"] = "cam_right_wrist"
     state_dim = 8 * len(arms)
     trajectory = {
@@ -163,28 +206,40 @@ def load_pi0_deployment_contract(checkpoint: Path | str) -> dict[str, Any]:
         raise ValueError(
             f"Unsupported Pi0 state/action layout {state_dim}/{action_dim} in {norm_stats_path}."
         )
-    asset_lower = asset_id.lower()
-    if state_dim == 16:
-        arm_mode = "duo"
-    elif "franka-right" in asset_lower or "franka_right" in asset_lower:
-        arm_mode = "right"
-    elif "franka-left" in asset_lower or "franka_left" in asset_lower:
-        arm_mode = "left"
+    profile = PI0_CHECKPOINT_PROFILES.get(asset_id)
+    if profile is not None:
+        arm_mode = str(profile["arm_mode"])
+        expected_dim = 16 if arm_mode == "duo" else 8
+        if state_dim != expected_dim:
+            raise ValueError(
+                f"Pi0 asset {asset_id!r} is registered as {arm_mode} ({expected_dim}-D), "
+                f"but its normalization stats use {state_dim} dimensions."
+            )
+        train_config = str(profile["train_config"])
+        camera_names = list(profile["camera_names"])
+        prompt = str(profile["prompt"])
     else:
-        raise ValueError(
-            f"Cannot determine the single-arm side from Pi0 asset {asset_id!r}; "
-            "use a norm-stats asset name containing franka-left or franka-right."
-        )
-    train_config = (
-        PI0_TRAIN_CONFIG if asset_id == "memory_260915-franka-left-2view-v1" else "auto"
-    )
+        asset_lower = asset_id.lower()
+        if state_dim == 16:
+            arm_mode = "duo"
+        elif "franka-right" in asset_lower or "franka_right" in asset_lower:
+            arm_mode = "right"
+        elif "franka-left" in asset_lower or "franka_left" in asset_lower:
+            arm_mode = "left"
+        else:
+            raise ValueError(
+                f"Cannot determine the single-arm side from Pi0 asset {asset_id!r}; "
+                "use a norm-stats asset name containing franka-left or franka-right."
+            )
+        train_config = "auto"
+        camera_names = None
+        prompt = PI0_PROMPT
     contract = _franka_contract(
         arm_mode=arm_mode,
         asset_id=asset_id,
         train_config=train_config,
-        prompt="Press the button."
-        if asset_lower.startswith("press_button")
-        else PI0_PROMPT,
+        prompt=prompt,
+        camera_names=camera_names,
     )
     contract["checkpoint_profile"] = (
         f"franka_{arm_mode}_{len(contract['camera_names'])}view"

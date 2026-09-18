@@ -73,8 +73,10 @@ cd /home/pair1/gzy/real-exp
 ```
 
 The Pi0 deployment profile is resolved from the checkpoint normalization asset.
-Single-arm policies use 8-D state/action and `cam_front` plus the selected
-arm's wrist camera. Duo policies use 16-D state/action and all three cameras.
+Known asset IDs select their exact registered OpenPI training config; compatible
+unregistered checkpoints use their saved history config. Single-arm policies
+use 8-D state/action and their registered camera subset (front-only or front
+plus the selected wrist). Duo policies use 16-D state/action and all three cameras.
 The server publishes the detected `left`, `right`, or `duo` contract; the
 hardware client selects matching controllers, and the executor sends commands
 only to those arms. All profiles run at 15 Hz and return 50 absolute targets per

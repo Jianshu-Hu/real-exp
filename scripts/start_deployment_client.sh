@@ -8,12 +8,10 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/start_deployment_client.sh [options]
 
-Required:
-  --server-address HOST:PORT  Policy server gRPC address used to discover the checkpoint contract
-
 Options:
   --server-ip IP         Inference/server computer IP (default: DEPLOYMENT_SERVER_IP or 192.168.50.13)
-  --server-address HOST:PORT  Policy server gRPC address (default: server-ip:8080)
+  --server-address HOST:PORT  Policy service address (WebSocket for Pi0, gRPC otherwise;
+                              default: server-ip:8080)
   --metadata-address HOST:PORT  Metadata HTTP endpoint (default: server-ip:8081)
   --robot-config FILE    Override the metadata-selected FR3 config
   --gripper-config FILE  Override the metadata-selected Franka-hand config
@@ -77,6 +75,8 @@ policy_type="${trajectory_lines[7]}"; actions_per_chunk="${trajectory_lines[8]}"
 case "${arm_mode}" in left|right|duo) ;; *) die "unsupported metadata arm mode: ${arm_mode}" ;; esac
 case "${end_effector}" in arm|gripper|hand) ;; *) die "unsupported metadata end effector: ${end_effector}" ;; esac
 case "${state_action_mode}" in joint|end_effector) ;; *) die "unsupported metadata state/action mode: ${state_action_mode}" ;; esac
+[[ "${state_dim}" =~ ^[0-9]+$ && "${action_dim}" =~ ^[0-9]+$ ]] || die "metadata dimensions must be integers"
+[[ "${actions_per_chunk}" =~ ^[0-9]+$ && "${actions_per_chunk}" -gt 0 ]] || die "metadata actions_per_chunk must be positive"
 if [[ -z "${robot_config}" ]]; then
   case "${arm_mode}:${end_effector}" in
     left:gripper) robot_config=example_fr3_config.yaml ;;

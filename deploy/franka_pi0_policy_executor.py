@@ -46,7 +46,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--command-zmq-host", default=DEFAULT_SERVER_IP)
     parser.add_argument("--command-zmq-port", type=int, default=5556)
     parser.add_argument(
-        "--actions-per-chunk", type=int, default=PI0_DEFAULT_ACTIONS_PER_CHUNK
+        "--actions-per-chunk",
+        type=int,
+        default=None,
+        help="Execution prefix length; defaults to the checkpoint metadata.",
     )
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument(
@@ -136,13 +139,26 @@ def validate_server_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "protocol": "real-exp-pi0-websocket",
         "protocol_version": 1,
         "policy_type": "pi0",
-        "max_actions_per_chunk": PI0_HORIZON,
     }
     mismatches = [
         f"{key}: server={metadata.get(key)!r}, executor={value!r}"
         for key, value in required.items()
         if metadata.get(key) != value
     ]
+    try:
+        max_actions_per_chunk = int(metadata["max_actions_per_chunk"])
+        actions_per_chunk = int(metadata["actions_per_chunk"])
+    except (KeyError, TypeError, ValueError):
+        mismatches.append("invalid action chunk metadata")
+    else:
+        if (
+            max_actions_per_chunk <= 0
+            or not 1 <= actions_per_chunk <= max_actions_per_chunk
+        ):
+            mismatches.append(
+                "actions_per_chunk/max_actions_per_chunk="
+                f"{actions_per_chunk}/{max_actions_per_chunk}"
+            )
     trajectory = metadata.get("trajectory_config") or {}
     arm_mode = trajectory.get("arm_mode")
     expected_arms = ["left", "right"] if arm_mode == "duo" else [arm_mode]
@@ -160,9 +176,16 @@ def validate_server_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
             "state/action dimensions="
             f"{trajectory.get('robot_state_dim')!r}/{trajectory.get('action_dim')!r}"
         )
-    expected_cameras = {"cam_front", *(f"cam_{side}" for side in expected_arms)}
-    if set(metadata.get("camera_names", ())) != expected_cameras:
-        mismatches.append(f"camera_names={metadata.get('camera_names')!r}")
+    camera_names = metadata.get("camera_names")
+    allowed_cameras = {"cam_front", *(f"cam_{side}" for side in expected_arms)}
+    if (
+        not isinstance(camera_names, list)
+        or not camera_names
+        or len(camera_names) != len(set(camera_names))
+        or "cam_front" not in camera_names
+        or set(camera_names) - allowed_cameras
+    ):
+        mismatches.append(f"camera_names={camera_names!r}")
     if mismatches:
         raise ValueError("Pi0 server metadata mismatch: " + "; ".join(mismatches))
     return metadata
@@ -171,10 +194,8 @@ def validate_server_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 class FrankaPi0PolicyExecutor:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        if not 1 <= args.actions_per_chunk <= PI0_HORIZON:
-            raise ValueError(
-                f"--actions-per-chunk must be in [1, {PI0_HORIZON}], got {args.actions_per_chunk}."
-            )
+        if args.actions_per_chunk is not None and args.actions_per_chunk <= 0:
+            raise ValueError("--actions-per-chunk must be positive.")
         if args.fps is not None and args.fps <= 0:
             raise ValueError("--fps must be positive.")
         if not 0.0 <= args.temporal_proposal_decay <= 1.0:
@@ -186,6 +207,13 @@ class FrankaPi0PolicyExecutor:
         self.command_socket = None
         self.bridge_active = False
         self.fps = 15.0
+        self.horizon = PI0_HORIZON
+        self.requested_actions_per_chunk = args.actions_per_chunk
+        self.actions_per_chunk = (
+            PI0_DEFAULT_ACTIONS_PER_CHUNK
+            if args.actions_per_chunk is None
+            else args.actions_per_chunk
+        )
         self.metadata = pi0_deployment_contract()
         self.trajectory_config = self.metadata["trajectory_config"]
         self.action_dim = int(self.trajectory_config["action_dim"])
@@ -263,12 +291,26 @@ class FrankaPi0PolicyExecutor:
         self.websocket = websocket.create_connection(
             uri, timeout=300, enable_multithread=False
         )
-        metadata = validate_server_metadata(json.loads(self.websocket.recv()))
+        return self._configure_from_metadata(json.loads(self.websocket.recv()))
+
+    def _configure_from_metadata(self, value: dict[str, Any]) -> dict[str, Any]:
+        metadata = validate_server_metadata(value)
         self.metadata = metadata
         self.trajectory_config = metadata["trajectory_config"]
         self.action_dim = int(self.trajectory_config["action_dim"])
         self.prompt = self.args.task or str(metadata["prompt"])
         self.fps = float(metadata["fps"])
+        self.horizon = int(metadata["max_actions_per_chunk"])
+        self.actions_per_chunk = (
+            int(metadata["actions_per_chunk"])
+            if self.requested_actions_per_chunk is None
+            else int(self.requested_actions_per_chunk)
+        )
+        if not 1 <= self.actions_per_chunk <= self.horizon:
+            raise ValueError(
+                f"--actions-per-chunk must be in [1, {self.horizon}], "
+                f"got {self.actions_per_chunk}."
+            )
         if self.args.fps is not None and not np.isclose(self.args.fps, self.fps):
             raise ValueError(
                 f"--fps={self.args.fps:g} does not match Pi0 server fps={self.fps:g}."
@@ -292,7 +334,7 @@ class FrankaPi0PolicyExecutor:
             raise RuntimeError(f"Pi0 server rejected inference: {response['error']}")
         actions = np.asarray(response.get("actions"), dtype=np.float32)
         if (
-            actions.shape != (PI0_HORIZON, self.action_dim)
+            actions.shape != (self.horizon, self.action_dim)
             or not np.isfinite(actions).all()
         ):
             raise RuntimeError(f"Pi0 server returned invalid actions {actions.shape}.")
@@ -317,7 +359,7 @@ class FrankaPi0PolicyExecutor:
                 "inference_s": inference_s,
                 "camera_bundle_sequence": request["camera_bundle_sequence"],
                 "state": request["state"],
-                "actions": actions[: self.args.actions_per_chunk].tolist(),
+                "actions": actions[: self.actions_per_chunk].tolist(),
             }
         )
         return actions
@@ -367,7 +409,7 @@ class FrankaPi0PolicyExecutor:
                 {
                     "server_address": self.args.server_address,
                     "fps": self.fps,
-                    "actions_per_chunk": self.args.actions_per_chunk,
+                    "actions_per_chunk": self.actions_per_chunk,
                     "temporal_proposal_decay": self.args.temporal_proposal_decay,
                     "prompt": self.prompt,
                     "arm_mode": self.trajectory_config["arm_mode"],
@@ -403,7 +445,7 @@ class FrankaPi0PolicyExecutor:
         print(f"train_config: {metadata['train_config']}")
         print(f"arm_mode: {self.trajectory_config['arm_mode']}")
         print(f"fps: {self.fps:g}")
-        print(f"actions_per_chunk: {self.args.actions_per_chunk} / {PI0_HORIZON}")
+        print(f"actions_per_chunk: {self.actions_per_chunk} / {self.horizon}")
         print(f"temporal_proposal_decay: {self.args.temporal_proposal_decay:g}")
         print(f"execute: {self.args.execute}")
 
@@ -437,7 +479,7 @@ class FrankaPi0PolicyExecutor:
                 chunk = self._infer(current_packet)
                 merge_stats = self._merge_action_chunk(chunk, next_timestep)
                 self._log({"event": "action_chunk_merged", **merge_stats})
-                for chunk_index in range(self.args.actions_per_chunk):
+                for chunk_index in range(self.actions_per_chunk):
                     loop_started = time.perf_counter()
                     current_packet = self._recv_latest(observation_socket, zmq)
                     validate_live_packet(current_packet, metadata)

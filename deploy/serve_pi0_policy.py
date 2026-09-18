@@ -7,6 +7,7 @@ import asyncio
 from collections import OrderedDict
 import dataclasses
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib
 import json
 import logging
 from pathlib import Path
@@ -294,6 +295,30 @@ class Pi0JsonWebsocketServer:
             await server.serve_forever()
 
 
+def import_openpi_training_config() -> object:
+    """Import the config registry across the current RMBench schema mismatch."""
+    from openpi.models import history
+
+    history_fields = {
+        field.name for field in dataclasses.fields(history.HistoryEncoderConfig)
+    }
+    if "history_window_size" in history_fields:
+        return importlib.import_module("openpi.training.config")
+
+    original_replace = dataclasses.replace
+
+    def compatible_replace(instance: object, /, **changes: object) -> object:
+        if isinstance(instance, history.HistoryEncoderConfig):
+            changes.pop("history_window_size", None)
+        return original_replace(instance, **changes)
+
+    dataclasses.replace = compatible_replace
+    try:
+        return importlib.import_module("openpi.training.config")
+    finally:
+        dataclasses.replace = original_replace
+
+
 def create_checkpoint_policy(
     checkpoint: Path,
     contract: dict,
@@ -304,13 +329,79 @@ def create_checkpoint_policy(
     """Build the OpenPI model and native Franka transforms for a resolved contract."""
     from openpi import transforms
     from openpi.models import history
-    from openpi.policies import policy_config
-    from openpi.training import config
 
-    base = config.get_config(PI0_TRAIN_CONFIG)
-    if contract["train_config"] == PI0_TRAIN_CONFIG:
-        train_config = base
+    config = import_openpi_training_config()
+    from openpi.policies import policy_config
+
+    registered_config_name = str(contract["train_config"])
+    if registered_config_name == "auto":
+        action_dim = int(contract["trajectory_config"]["action_dim"])
+        candidates = [
+            candidate
+            for candidate in getattr(config, "_CONFIGS", ())
+            if getattr(getattr(candidate, "data", None), "repo_id", None)
+            == contract["checkpoint_asset_id"]
+            and getattr(getattr(candidate, "model", None), "history", None) is not None
+            and int(candidate.model.action_horizon)
+            == int(contract["max_actions_per_chunk"])
+            and int(candidate.model.history.action_target_dim) == action_dim
+        ]
+        if len(candidates) > 1:
+            names = ", ".join(candidate.name for candidate in candidates)
+            raise ValueError(
+                f"Multiple history-enabled Pi0 configs match asset "
+                f"{contract['checkpoint_asset_id']!r}: {names}."
+            )
+        if candidates:
+            registered_config_name = candidates[0].name
+            contract["train_config"] = registered_config_name
+
+    if registered_config_name != "auto":
+        train_config = config.get_config(registered_config_name)
+        data_config = train_config.data
+        expected_asset = contract["checkpoint_asset_id"]
+        actual_asset = getattr(data_config.assets, "asset_id", None)
+        if data_config.repo_id != expected_asset or actual_asset != expected_asset:
+            raise ValueError(
+                f"Registered Pi0 config {registered_config_name!r} uses asset "
+                f"{data_config.repo_id!r}/{actual_asset!r}, expected {expected_asset!r}."
+            )
+        action_dim = int(contract["trajectory_config"]["action_dim"])
+        expected_delta_mask = tuple(
+            value
+            for _ in contract["trajectory_config"]["arms"]
+            for value in (*([True] * 7), False)
+        )
+        configured_history = train_config.model.history
+        if (
+            int(train_config.model.action_horizon)
+            != int(contract["max_actions_per_chunk"])
+            or configured_history is None
+            or int(configured_history.action_target_dim) != action_dim
+            or int(data_config.action_output_dim) != action_dim
+            or tuple(data_config.delta_joint_mask) != expected_delta_mask
+        ):
+            raise ValueError(
+                f"Registered Pi0 config {registered_config_name!r} does not match "
+                f"the checkpoint contract ({contract['max_actions_per_chunk']}x{action_dim})."
+            )
+        history_path = checkpoint / "assets" / "history_config.json"
+        if history_path.is_file():
+            saved_history = json.loads(history_path.read_text())
+            configured_history_values = dataclasses.asdict(configured_history)
+            mismatched_history = [
+                key
+                for key, value in saved_history.items()
+                if key in configured_history_values
+                and configured_history_values[key] != value
+            ]
+            if mismatched_history:
+                raise ValueError(
+                    f"Registered Pi0 config {registered_config_name!r} disagrees with "
+                    f"{history_path} on: {', '.join(sorted(mismatched_history))}."
+                )
     else:
+        base = config.get_config(PI0_TRAIN_CONFIG)
         history_path = checkpoint / "assets" / "history_config.json"
         if not history_path.is_file():
             raise FileNotFoundError(

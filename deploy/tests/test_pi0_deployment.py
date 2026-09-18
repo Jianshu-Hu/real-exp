@@ -18,6 +18,7 @@ from deploy.build_deployment_camera_config import build_config as build_camera_c
 from deploy.pi0_deployment import (
     PI0_DEFAULT_ACTIONS_PER_CHUNK,
     PI0_HORIZON,
+    PI0_PRESS_BUTTON_TRAIN_CONFIG,
     deployment_lines,
     is_pi0_checkpoint,
     load_pi0_deployment_contract,
@@ -146,6 +147,66 @@ def test_pi0_checkpoint_profile_detection(
     assert contract["trajectory_config"]["arm_mode"] == arm_mode
     assert contract["trajectory_config"]["action_dim"] == active_dim
     assert contract["camera_names"] == cameras
+
+
+def test_press_button_checkpoint_uses_its_registered_training_config(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "press_button"
+    (checkpoint / "params").mkdir(parents=True)
+    (checkpoint / "_CHECKPOINT_METADATA").write_text("{}")
+    stats = (
+        checkpoint / "assets/press_button-memory-260917-franka-3view-v1/norm_stats.json"
+    )
+    stats.parent.mkdir(parents=True)
+    stats.write_text(
+        json.dumps(
+            {
+                "norm_stats": {
+                    "state": {"std": [1.0] * 16 + [0.0] * 16},
+                    "actions": {"std": [1.0] * 16 + [0.0] * 16},
+                }
+            }
+        )
+    )
+    contract = load_pi0_deployment_contract(checkpoint)
+
+    assert contract["train_config"] == PI0_PRESS_BUTTON_TRAIN_CONFIG
+    assert (
+        contract["checkpoint_asset_id"] == "press_button-memory-260917-franka-3view-v1"
+    )
+    assert contract["trajectory_config"]["arm_mode"] == "duo"
+    assert contract["camera_names"] == ["cam_front", "cam_left", "cam_right"]
+
+
+def test_server_metadata_allows_checkpoint_specific_chunk_sizes() -> None:
+    metadata = pi0_deployment_contract()
+    metadata["max_actions_per_chunk"] = 24
+    metadata["actions_per_chunk"] = 6
+
+    assert validate_server_metadata(metadata)["max_actions_per_chunk"] == 24
+
+
+def test_executor_defaults_to_checkpoint_action_chunk_size() -> None:
+    executor = FrankaPi0PolicyExecutor(
+        SimpleNamespace(
+            actions_per_chunk=None,
+            fps=None,
+            task=None,
+            temporal_proposal_decay=0.5,
+        )
+    )
+    metadata = executor._configure_from_metadata(
+        {
+            **pi0_deployment_contract(),
+            "max_actions_per_chunk": 24,
+            "actions_per_chunk": 6,
+        }
+    )
+
+    assert metadata["max_actions_per_chunk"] == 24
+    assert executor.horizon == 24
+    assert executor.actions_per_chunk == 6
 
 
 def live_packet() -> dict:

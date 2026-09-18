@@ -75,8 +75,11 @@ cd /home/pair1/gzy/real-exp
 The Pi0 contract is fixed by its training configuration: 15 Hz; left Franka
 arm plus gripper (8-D state/action); `cam_front` and `cam_left`; 50 absolute
 targets per inference. The executor runs an 8-target receding-horizon prefix by
-default. The output transform has already restored the joint deltas to absolute
-joint targets, so the executor must not add the measured joints again.
+default. Successive chunks overlap in their future 50-target horizons and are
+merged with normalized generation-age weights; use `--temporal-proposal-decay`
+to control that weighting. The output transform has already restored the joint
+deltas to absolute joint targets, so the executor must not add the measured
+joints again.
 
 Start the server with the extracted step directory, then start the hardware
 client and finally the dedicated Pi0 executor on the robot computer:
@@ -88,6 +91,10 @@ client and finally the dedicated Pi0 executor on the robot computer:
 # Robot computer
 ./scripts/start_deployment_client.sh --server-ip 192.168.50.13
 python deploy/franka_pi0_policy_executor.py --server-address 192.168.50.13:8080
+# Or, set the default overlap decay explicitly:
+python deploy/franka_pi0_policy_executor.py \
+  --server-address 192.168.50.13:8080 \
+  --temporal-proposal-decay 0.5
 ```
 
 The executor is dry-run by default. Confirm finite predictions and matching

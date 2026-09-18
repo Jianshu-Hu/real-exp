@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -99,3 +100,21 @@ def test_pi0_payload_is_absolute_and_clips_gripper_only() -> None:
     assert payload["left_joint_target"] == pytest.approx(action[:7])
     assert payload["left_gripper_command"] == 1.0
     assert set(payload) == {"timestamp", "left_joint_target", "left_gripper_command"}
+
+
+def test_pi0_temporal_proposals_blend_overlapping_chunks() -> None:
+    executor = FrankaPi0PolicyExecutor(
+        SimpleNamespace(actions_per_chunk=8, fps=None, temporal_proposal_decay=0.5)
+    )
+    first = np.zeros((PI0_HORIZON, 8), dtype=np.float32)
+    second = np.ones((PI0_HORIZON, 8), dtype=np.float32)
+
+    first_stats = executor._merge_action_chunk(first, first_timestep=0)
+    second_stats = executor._merge_action_chunk(second, first_timestep=8)
+
+    assert first_stats["added"] == PI0_HORIZON
+    assert first_stats["blended"] == 0
+    assert second_stats["added"] == 8
+    assert second_stats["blended"] == PI0_HORIZON - 8
+    assert np.allclose(executor.action_queue[8], 2.0 / 3.0)
+    assert np.allclose(executor.action_queue[PI0_HORIZON + 7], 1.0)

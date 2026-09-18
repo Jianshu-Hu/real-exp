@@ -3,8 +3,9 @@
 The Pi0/JAX process and camera pixels stay on the inference computer. This
 executor sends only the current 8-D robot state plus the synchronized camera
 bundle sequence, receives a 50x8 absolute-target action chunk, and executes a
-short receding-horizon prefix. Passing ``--execute`` is the only operation that
-enables real robot commands.
+short receding-horizon prefix. Overlapping future proposals from successive
+chunks are temporally aggregated. Passing ``--execute`` is the only operation
+that enables real robot commands.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from deploy.action_aggregation import TemporalProposalAggregator
 from deploy.pi0_deployment import PI0_DEFAULT_ACTIONS_PER_CHUNK, PI0_HORIZON, PI0_PROMPT
 
 
@@ -43,6 +45,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--task", default=PI0_PROMPT, help="Language prompt sent to Pi0.")
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print action-chunk intervals and inference request/response times.",
+    )
+    parser.add_argument(
+        "--temporal-proposal-decay",
+        type=float,
+        default=0.5,
+        help=(
+            "Exponential generation-age decay for overlapping action proposals. The newest "
+            "proposal has weight 1 and each older generation has weight decay**age. "
+            "Defaults to 0.5."
+        ),
+    )
     parser.add_argument("--bridge-activation-service", default="/set_deployment_active")
     parser.add_argument("--no-auto-activate-bridge", action="store_true")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_ROOT)
@@ -121,12 +138,20 @@ class FrankaPi0PolicyExecutor:
             )
         if args.fps is not None and args.fps <= 0:
             raise ValueError("--fps must be positive.")
+        if not 0.0 <= args.temporal_proposal_decay <= 1.0:
+            raise ValueError(
+                "--temporal-proposal-decay must be between 0 and 1, "
+                f"got {args.temporal_proposal_decay}"
+            )
         self.websocket = None
         self.command_socket = None
         self.bridge_active = False
         self.fps = 15.0
         self.log_file = None
         self.log_path: Path | None = None
+        self._last_chunk_received_at: float | None = None
+        self.action_aggregator = TemporalProposalAggregator(args.temporal_proposal_decay)
+        self.action_queue: dict[int, np.ndarray] = {}
 
     @staticmethod
     def _command_payload_from_action(action: Any) -> dict[str, Any]:
@@ -191,21 +216,66 @@ class FrankaPi0PolicyExecutor:
         started = time.perf_counter()
         self.websocket.send(json.dumps(request, separators=(",", ":")))
         response = json.loads(self.websocket.recv())
+        chunk_received_at = time.perf_counter()
         if "error" in response:
             raise RuntimeError(f"Pi0 server rejected inference: {response['error']}")
         actions = np.asarray(response.get("actions"), dtype=np.float32)
         if actions.shape != (PI0_HORIZON, 8) or not np.isfinite(actions).all():
             raise RuntimeError(f"Pi0 server returned invalid actions {actions.shape}.")
+        inference_s = chunk_received_at - started
+        if self.args.debug:
+            if self._last_chunk_received_at is None:
+                print(f"[debug] first action chunk: inference={inference_s:.3f}s", flush=True)
+            else:
+                chunk_interval_s = chunk_received_at - self._last_chunk_received_at
+                print(
+                    f"[debug] action chunk interval={chunk_interval_s:.3f}s "
+                    f"inference={inference_s:.3f}s",
+                    flush=True,
+                )
+        self._last_chunk_received_at = chunk_received_at
         self._log(
             {
                 "event": "action_chunk_received",
-                "inference_s": time.perf_counter() - started,
+                "inference_s": inference_s,
                 "camera_bundle_sequence": request["camera_bundle_sequence"],
                 "state": request["state"],
                 "actions": actions[: self.args.actions_per_chunk].tolist(),
             }
         )
-        return actions[: self.args.actions_per_chunk]
+        return actions
+
+    def _merge_action_chunk(self, actions: np.ndarray, first_timestep: int) -> dict[str, Any]:
+        """Merge a chunk into the future action queue by execution timestep."""
+        generation = self.action_aggregator.begin_chunk()
+        blended = 0
+        added = 0
+        for offset, action in enumerate(actions):
+            timestep = first_timestep + offset
+            merged_action = self.action_aggregator.add(timestep, generation, action)
+            if timestep in self.action_queue:
+                blended += 1
+            else:
+                added += 1
+            self.action_queue[timestep] = merged_action
+        return {
+            "chunk_generation": generation,
+            "added": added,
+            "blended": blended,
+            "queue_size": len(self.action_queue),
+            "first_timestep": first_timestep,
+            "last_timestep": first_timestep + len(actions) - 1,
+        }
+
+    def _pop_action(self, timestep: int) -> np.ndarray:
+        try:
+            action = self.action_queue.pop(timestep)
+        except KeyError as exc:
+            raise RuntimeError(
+                f"No merged Pi0 action is available for execution timestep {timestep}."
+            ) from exc
+        self.action_aggregator.discard(timestep)
+        return action
 
     def _init_log(self) -> None:
         name = self.args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S_pi0")
@@ -219,6 +289,7 @@ class FrankaPi0PolicyExecutor:
                     "server_address": self.args.server_address,
                     "fps": self.fps,
                     "actions_per_chunk": self.args.actions_per_chunk,
+                    "temporal_proposal_decay": self.args.temporal_proposal_decay,
                     "prompt": self.args.task,
                     "execute": self.args.execute,
                     "action_representation": "absolute_target",
@@ -251,6 +322,7 @@ class FrankaPi0PolicyExecutor:
         print(f"train_config: {metadata['train_config']}")
         print(f"fps: {self.fps:g}")
         print(f"actions_per_chunk: {self.args.actions_per_chunk} / {PI0_HORIZON}")
+        print(f"temporal_proposal_decay: {self.args.temporal_proposal_decay:g}")
         print(f"execute: {self.args.execute}")
 
         context = zmq.Context()
@@ -276,25 +348,31 @@ class FrankaPi0PolicyExecutor:
             )
             self._init_log()
             current_packet = first_packet
+            next_timestep = 0
             while True:
                 validate_live_packet(current_packet)
                 chunk = self._infer(current_packet)
-                for index, action in enumerate(chunk):
+                merge_stats = self._merge_action_chunk(chunk, next_timestep)
+                self._log({"event": "action_chunk_merged", **merge_stats})
+                for chunk_index in range(self.args.actions_per_chunk):
                     loop_started = time.perf_counter()
                     current_packet = self._recv_latest(observation_socket, zmq)
                     validate_live_packet(current_packet)
+                    action = self._pop_action(next_timestep)
                     payload = self._command_payload_from_action(action)
                     if self.args.execute:
                         command_socket.send_pyobj(payload)
                     self._log(
                         {
                             "event": "action_executed" if self.args.execute else "action_predicted",
-                            "chunk_index": index,
+                            "chunk_index": chunk_index,
+                            "timestep": next_timestep,
                             "action": np.asarray(action, dtype=float).tolist(),
                             "current_state": list(current_packet["state"]),
                             "command_payload": payload if self.args.execute else None,
                         }
                     )
+                    next_timestep += 1
                     time.sleep(max(0.0, 1.0 / self.fps - (time.perf_counter() - loop_started)))
                 current_packet = self._recv_latest(observation_socket, zmq)
         except KeyboardInterrupt:

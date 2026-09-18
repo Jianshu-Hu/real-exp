@@ -1,23 +1,29 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import time
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import yaml
 
 from deploy.franka_pi0_policy_executor import (
     FrankaPi0PolicyExecutor,
     validate_live_packet,
     validate_server_metadata,
 )
+from deploy.build_deployment_camera_config import build_config as build_camera_config
 from deploy.pi0_deployment import (
     PI0_DEFAULT_ACTIONS_PER_CHUNK,
     PI0_HORIZON,
     deployment_lines,
     is_pi0_checkpoint,
+    load_pi0_deployment_contract,
     pi0_deployment_contract,
 )
+from deploy.serve_pi0_policy import ValidatedPi0Policy
 from utils.deployment_metadata import validate_deployment_contract
 
 
@@ -31,7 +37,10 @@ def test_pi0_contract_matches_trained_real_policy() -> None:
     assert contract["camera_names"] == ["cam_front", "cam_left"]
     assert contract["trajectory_config"]["robot_state_dim"] == 8
     assert contract["trajectory_config"]["action_dim"] == 8
-    assert contract["action_config"]["transport_action_representation"] == "absolute_target"
+    assert (
+        contract["action_config"]["transport_action_representation"]
+        == "absolute_target"
+    )
     assert deployment_lines(contract) == [
         "left",
         "gripper",
@@ -45,6 +54,36 @@ def test_pi0_contract_matches_trained_real_policy() -> None:
     ]
 
 
+def test_pi0_camera_publisher_config_matches_image_contract() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[2]
+        / "gello_software/ros2/src/franka_realsense_camera_publisher/config/example_three_cameras.yaml"
+    )
+    parameters = yaml.safe_load(config_path.read_text())["realsense_camera_publisher"][
+        "ros__parameters"
+    ]
+    contract = pi0_deployment_contract()["features"]
+
+    assert (parameters["height"], parameters["width"], 3) == tuple(
+        contract["observation.images.cam_left"]["shape"]
+    )
+    assert (parameters["camera_3_height"], parameters["camera_3_width"], 3) == tuple(
+        contract["observation.images.cam_front"]["shape"]
+    )
+
+    runtime = build_camera_config(
+        yaml.safe_load(config_path.read_text()),
+        SimpleNamespace(
+            camera_1_enabled=True, camera_2_enabled=False, camera_3_enabled=True
+        ),
+    )["realsense_camera_publisher"]["ros__parameters"]
+    assert [runtime[f"camera_{index}_enabled"] for index in range(1, 4)] == [
+        True,
+        False,
+        True,
+    ]
+
+
 def test_pi0_checkpoint_recognition_requires_norm_stats(tmp_path: Path) -> None:
     checkpoint = tmp_path / "step"
     (checkpoint / "params").mkdir(parents=True)
@@ -53,8 +92,60 @@ def test_pi0_checkpoint_recognition_requires_norm_stats(tmp_path: Path) -> None:
 
     stats = checkpoint / "assets/memory_260915-franka-left-2view-v1/norm_stats.json"
     stats.parent.mkdir(parents=True)
-    stats.write_text("{}")
+    stats.write_text(
+        json.dumps(
+            {
+                "norm_stats": {
+                    "state": {"std": [1.0] * 8 + [0.0] * 24},
+                    "actions": {"std": [1.0] * 8 + [0.0] * 24},
+                }
+            }
+        )
+    )
     assert is_pi0_checkpoint(checkpoint)
+
+
+@pytest.mark.parametrize(
+    ("asset_id", "active_dim", "arm_mode", "cameras"),
+    [
+        ("task-franka-left-2view-v1", 8, "left", ["cam_front", "cam_left"]),
+        ("task-franka-right-2view-v1", 8, "right", ["cam_front", "cam_right"]),
+        (
+            "task-franka-3view-v1",
+            16,
+            "duo",
+            ["cam_front", "cam_left", "cam_right"],
+        ),
+    ],
+)
+def test_pi0_checkpoint_profile_detection(
+    tmp_path: Path,
+    asset_id: str,
+    active_dim: int,
+    arm_mode: str,
+    cameras: list[str],
+) -> None:
+    checkpoint = tmp_path / "step"
+    (checkpoint / "params").mkdir(parents=True)
+    (checkpoint / "_CHECKPOINT_METADATA").write_text("{}")
+    stats = checkpoint / "assets" / asset_id / "norm_stats.json"
+    stats.parent.mkdir(parents=True)
+    stats.write_text(
+        json.dumps(
+            {
+                "norm_stats": {
+                    "state": {"std": [1.0] * active_dim + [0.0] * (32 - active_dim)},
+                    "actions": {"std": [1.0] * active_dim + [0.0] * (32 - active_dim)},
+                }
+            }
+        )
+    )
+
+    contract = load_pi0_deployment_contract(checkpoint)
+    assert is_pi0_checkpoint(checkpoint)
+    assert contract["trajectory_config"]["arm_mode"] == arm_mode
+    assert contract["trajectory_config"]["action_dim"] == active_dim
+    assert contract["camera_names"] == cameras
 
 
 def live_packet() -> dict:
@@ -100,6 +191,118 @@ def test_pi0_payload_is_absolute_and_clips_gripper_only() -> None:
     assert payload["left_joint_target"] == pytest.approx(action[:7])
     assert payload["left_gripper_command"] == 1.0
     assert set(payload) == {"timestamp", "left_joint_target", "left_gripper_command"}
+
+
+def test_pi0_right_payload_routes_only_right_arm() -> None:
+    trajectory = {
+        **pi0_deployment_contract()["trajectory_config"],
+        "arm_mode": "right",
+        "arms": ["right"],
+    }
+    action = np.arange(8, dtype=float)
+
+    payload = FrankaPi0PolicyExecutor._command_payload_from_action(action, trajectory)
+
+    assert payload["right_joint_target"] == pytest.approx(action[:7])
+    assert payload["right_gripper_command"] == 1.0
+    assert set(payload) == {"timestamp", "right_joint_target", "right_gripper_command"}
+
+
+def test_pi0_duo_payload_routes_both_arm_blocks(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "duo"
+    (checkpoint / "params").mkdir(parents=True)
+    (checkpoint / "_CHECKPOINT_METADATA").write_text("{}")
+    stats = checkpoint / "assets/task-franka-3view-v1/norm_stats.json"
+    stats.parent.mkdir(parents=True)
+    stats.write_text(
+        json.dumps(
+            {
+                "norm_stats": {
+                    "state": {"std": [1.0] * 16 + [0.0] * 16},
+                    "actions": {"std": [1.0] * 16 + [0.0] * 16},
+                }
+            }
+        )
+    )
+    contract = load_pi0_deployment_contract(checkpoint)
+    action = np.arange(16, dtype=float)
+    action[7] = -1.0
+    action[15] = 2.0
+
+    payload = FrankaPi0PolicyExecutor._command_payload_from_action(
+        action, contract["trajectory_config"]
+    )
+
+    assert payload["left_joint_target"] == pytest.approx(action[:7])
+    assert payload["left_gripper_command"] == 0.0
+    assert payload["right_joint_target"] == pytest.approx(action[8:15])
+    assert payload["right_gripper_command"] == 1.0
+
+
+def test_pi0_duo_server_maps_three_camera_bundle(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "duo"
+    (checkpoint / "params").mkdir(parents=True)
+    (checkpoint / "_CHECKPOINT_METADATA").write_text("{}")
+    stats = checkpoint / "assets/task-franka-3view-v1/norm_stats.json"
+    stats.parent.mkdir(parents=True)
+    stats.write_text(
+        json.dumps(
+            {
+                "norm_stats": {
+                    "state": {"std": [1.0] * 16 + [0.0] * 16},
+                    "actions": {"std": [1.0] * 16 + [0.0] * 16},
+                }
+            }
+        )
+    )
+    contract = load_pi0_deployment_contract(checkpoint)
+    now = time.time()
+    bundle = {
+        "camera_sync": {
+            "bundle_ready": True,
+            "max_skew_s": 0.01,
+            "reference_stamp_s": now,
+        },
+        "cameras": {
+            "cam_front": {"rgb": np.zeros((480, 640, 3), dtype=np.uint8)},
+            "cam_left": {"rgb": np.zeros((240, 424, 3), dtype=np.uint8)},
+            "cam_right": {"rgb": np.zeros((240, 424, 3), dtype=np.uint8)},
+        },
+    }
+
+    class Policy:
+        observation = None
+
+        def infer(self, observation):
+            self.observation = observation
+            return {"actions": np.zeros((PI0_HORIZON, 16), dtype=np.float32)}
+
+        def reset_history(self):
+            return None
+
+    policy = Policy()
+    validated = ValidatedPi0Policy(
+        policy,
+        SimpleNamespace(get=lambda sequence: bundle if sequence == 7 else None),
+        max_observation_age=0.25,
+        max_camera_skew=0.067,
+        contract=contract,
+    )
+
+    result = validated.infer(
+        {
+            "state": np.zeros(16, dtype=np.float32),
+            "camera_bundle_sequence": 7,
+            "robot_state_stamp_s": now,
+        }
+    )
+
+    assert result["actions"].shape == (PI0_HORIZON, 16)
+    assert set(policy.observation["images"]) == {
+        "cam_high",
+        "cam_left_wrist",
+        "cam_right_wrist",
+    }
 
 
 def test_pi0_temporal_proposals_blend_overlapping_chunks() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import OrderedDict
+import dataclasses
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
@@ -20,11 +21,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from deploy.pi0_deployment import (
-    PI0_PROMPT,
+from deploy.pi0_deployment import (  # noqa: E402
     PI0_TRAIN_CONFIG,
-    is_pi0_checkpoint,
-    pi0_deployment_contract,
+    load_pi0_deployment_contract,
 )
 
 
@@ -37,8 +36,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-cache-address", default="tcp://127.0.0.1:5557")
     parser.add_argument("--max-observation-age", type=float, default=0.25)
     parser.add_argument("--max-camera-skew", type=float, default=0.067)
-    parser.add_argument("--default-prompt", default=PI0_PROMPT)
-    parser.add_argument("--history-overflow", choices=("error", "hold", "slide", "grow"), default="grow")
+    parser.add_argument("--default-prompt", default=None)
+    parser.add_argument(
+        "--history-overflow", choices=("error", "hold", "slide", "grow"), default="grow"
+    )
     return parser.parse_args()
 
 
@@ -58,7 +59,9 @@ class CameraBundleCache:
         self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
         self._socket.connect(address)
         self._max_entries = max_entries
-        self._thread = threading.Thread(target=self._run, daemon=True, name="pi0-camera-cache")
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="pi0-camera-cache"
+        )
 
     def start(self) -> None:
         self._thread.start()
@@ -76,7 +79,11 @@ class CameraBundleCache:
             if self._socket not in dict(poller.poll(100)):
                 continue
             packet = self._socket.recv_pyobj()
-            sequence = packet.get("camera_bundle_sequence") if isinstance(packet, dict) else None
+            sequence = (
+                packet.get("camera_bundle_sequence")
+                if isinstance(packet, dict)
+                else None
+            )
             if sequence is None:
                 continue
             with self._lock:
@@ -99,12 +106,13 @@ class ValidatedPi0Policy:
         camera_cache: CameraBundleCache,
         max_observation_age: float,
         max_camera_skew: float,
+        contract: dict,
     ) -> None:
         self._policy = policy
         self._camera_cache = camera_cache
         self._max_observation_age = max_observation_age
         self._max_camera_skew = max_camera_skew
-        self.metadata = pi0_deployment_contract()
+        self.metadata = dict(contract)
         self.metadata["action_output_representation"] = "absolute_target"
         self.metadata["history_reset"] = "on_server_start_or_new_client_connection"
 
@@ -136,7 +144,9 @@ class ValidatedPi0Policy:
             )
         state_stamp = request.get("robot_state_stamp_s")
         if state_stamp is None:
-            raise RuntimeError(f"Request for camera bundle #{sequence} has no robot-state timestamp.")
+            raise RuntimeError(
+                f"Request for camera bundle #{sequence} has no robot-state timestamp."
+            )
         state_age = time.time() - float(state_stamp)
         if state_age < -1.0 or state_age > self._max_observation_age:
             raise RuntimeError(
@@ -149,11 +159,16 @@ class ValidatedPi0Policy:
                 f"{self._max_observation_age:.3f}s."
             )
         cameras = bundle.get("cameras") or {}
-        missing = sorted({"cam_front", "cam_left"} - set(cameras))
+        camera_names = list(self.metadata["camera_names"])
+        missing = sorted(set(camera_names) - set(cameras))
         if missing:
-            raise RuntimeError(f"Camera bundle #{sequence} is missing {', '.join(missing)}.")
-        expected_shapes = {"cam_front": (480, 640, 3), "cam_left": (240, 424, 3)}
-        for name, expected_shape in expected_shapes.items():
+            raise RuntimeError(
+                f"Camera bundle #{sequence} is missing {', '.join(missing)}."
+            )
+        for name in camera_names:
+            expected_shape = tuple(
+                self.metadata["features"][f"observation.images.{name}"]["shape"]
+            )
             actual_shape = tuple(np.asarray(cameras[name].get("rgb")).shape)
             if actual_shape != expected_shape:
                 raise RuntimeError(
@@ -163,31 +178,43 @@ class ValidatedPi0Policy:
         observation = {
             "state": request.get("state"),
             "images": {
-                "cam_high": np.transpose(np.asarray(cameras["cam_front"]["rgb"]), (2, 0, 1)),
-                "cam_left_wrist": np.transpose(np.asarray(cameras["cam_left"]["rgb"]), (2, 0, 1)),
+                self.metadata["camera_key_map"][name]: np.transpose(
+                    np.asarray(cameras[name]["rgb"]), (2, 0, 1)
+                )
+                for name in camera_names
             },
-            "prompt": request.get("prompt") or PI0_PROMPT,
+            "prompt": request.get("prompt") or self.metadata["prompt"],
         }
         state = np.asarray(observation.get("state"), dtype=np.float32)
-        if state.shape != (8,) or not np.isfinite(state).all():
-            raise ValueError(f"Pi0 state must be finite with shape (8,), got {state.shape}.")
+        state_dim = int(self.metadata["trajectory_config"]["robot_state_dim"])
+        if state.shape != (state_dim,) or not np.isfinite(state).all():
+            raise ValueError(
+                f"Pi0 state must be finite with shape ({state_dim},), got {state.shape}."
+            )
         images = observation.get("images")
         if not isinstance(images, dict):
             raise ValueError("Pi0 observation must contain an images mapping.")
-        expected = {"cam_high", "cam_left_wrist"}
+        expected = set(self.metadata["camera_key_map"].values())
         if set(images) != expected:
             raise ValueError(
-                "Pi0 expects exactly cam_high and cam_left_wrist; "
-                f"got {sorted(images)}."
+                f"Pi0 expects image keys {sorted(expected)}; got {sorted(images)}."
             )
         for name in sorted(expected):
             image = np.asarray(images[name])
             if image.ndim != 3 or image.shape[0] != 3:
-                raise ValueError(f"{name} must be CHW RGB with shape (3,H,W), got {image.shape}.")
+                raise ValueError(
+                    f"{name} must be CHW RGB with shape (3,H,W), got {image.shape}."
+                )
         result = self._policy.infer(observation)
         actions = np.asarray(result.get("actions"))
-        if actions.shape != (50, 8) or not np.isfinite(actions).all():
-            raise RuntimeError(f"Pi0 returned an invalid action chunk: {actions.shape}.")
+        action_shape = (
+            int(self.metadata["max_actions_per_chunk"]),
+            int(self.metadata["trajectory_config"]["action_dim"]),
+        )
+        if actions.shape != action_shape or not np.isfinite(actions).all():
+            raise RuntimeError(
+                f"Pi0 returned an invalid action chunk: {actions.shape}."
+            )
         # create_trained_policy's output transform has already restored the
         # chunk-origin joint delta to absolute joint targets. Do not add state.
         return {**result, "actions": actions}
@@ -230,18 +257,24 @@ class Pi0JsonWebsocketServer:
         import websockets
 
         if self._active_client:
-            await websocket.close(code=1013, reason="Pi0 history already has an active client")
+            await websocket.close(
+                code=1013, reason="Pi0 history already has an active client"
+            )
             return
         self._active_client = True
         self.policy.reset()
-        logging.info("Pi0 executor connected from %s; history reset", websocket.remote_address)
+        logging.info(
+            "Pi0 executor connected from %s; history reset", websocket.remote_address
+        )
         try:
             await websocket.send(json.dumps(self.policy.metadata))
             async for message in websocket:
                 try:
                     request = json.loads(message)
                     result = await asyncio.to_thread(self.policy.infer, request)
-                    await websocket.send(json.dumps({"actions": result["actions"].tolist()}))
+                    await websocket.send(
+                        json.dumps({"actions": result["actions"].tolist()})
+                    )
                 except Exception as exc:
                     logging.error("Pi0 inference request failed: %s", exc)
                     logging.debug(traceback.format_exc())
@@ -261,6 +294,81 @@ class Pi0JsonWebsocketServer:
             await server.serve_forever()
 
 
+def create_checkpoint_policy(
+    checkpoint: Path,
+    contract: dict,
+    *,
+    default_prompt: str,
+    history_overflow: str,
+) -> object:
+    """Build the OpenPI model and native Franka transforms for a resolved contract."""
+    from openpi import transforms
+    from openpi.models import history
+    from openpi.policies import policy_config
+    from openpi.training import config
+
+    base = config.get_config(PI0_TRAIN_CONFIG)
+    if contract["train_config"] == PI0_TRAIN_CONFIG:
+        train_config = base
+    else:
+        history_path = checkpoint / "assets" / "history_config.json"
+        if not history_path.is_file():
+            raise FileNotFoundError(
+                f"Auto-detected Pi0 profile requires {history_path} to reconstruct the model."
+            )
+        saved_history = json.loads(history_path.read_text())
+        history_fields = {
+            field.name for field in dataclasses.fields(history.HistoryEncoderConfig)
+        }
+        history_config = history.HistoryEncoderConfig(
+            **{
+                key: value
+                for key, value in saved_history.items()
+                if key in history_fields
+            }
+        )
+        action_dim = int(contract["trajectory_config"]["action_dim"])
+        if history_config.action_target_dim != action_dim:
+            raise ValueError(
+                f"Checkpoint history action_target_dim={history_config.action_target_dim} "
+                f"does not match detected action_dim={action_dim}."
+            )
+        model = dataclasses.replace(base.model, history=history_config)
+        mask_parts: list[int] = []
+        for _ in contract["trajectory_config"]["arms"]:
+            mask_parts.extend((7, -1))
+        data = config.LeRobotAlohaDataConfig(
+            repo_id=contract["checkpoint_asset_id"],
+            assets=config.AssetsConfig(asset_id=contract["checkpoint_asset_id"]),
+            base_config=base.data.base_config,
+            use_delta_joint_actions=True,
+            delta_joint_mask=transforms.make_bool_mask(*mask_parts),
+            action_output_dim=action_dim,
+            default_prompt=default_prompt,
+            adapt_to_pi=False,
+        )
+        train_config = dataclasses.replace(
+            base,
+            name=f"pi0_auto_{contract['checkpoint_profile']}",
+            model=model,
+            data=data,
+            policy_metadata={
+                "robot": f"franka_{contract['trajectory_config']['arm_mode']}",
+                "action_output_dim": action_dim,
+                "action_representation": "absolute_joint_targets_and_absolute_gripper",
+                "training_action_representation": "joint_delta_from_chunk_origin",
+                "dataset_fps": contract["fps"],
+            },
+        )
+    return policy_config.create_trained_policy(
+        train_config,
+        checkpoint,
+        default_prompt=default_prompt,
+        asset_id=contract["checkpoint_asset_id"],
+        history_overflow=history_overflow,
+    )
+
+
 def main() -> None:
     args = parse_args()
     checkpoint = args.checkpoint.expanduser().resolve()
@@ -270,31 +378,33 @@ def main() -> None:
         raise ValueError("Websocket and metadata ports must differ.")
     if args.max_observation_age <= 0 or args.max_camera_skew <= 0:
         raise ValueError("Freshness and camera-skew limits must be positive.")
-    if not is_pi0_checkpoint(checkpoint):
-        raise FileNotFoundError(
-            f"{checkpoint} is not a complete {PI0_TRAIN_CONFIG} Orbax checkpoint "
-            "(expected _CHECKPOINT_METADATA, params/, and matching norm_stats.json)."
-        )
-
-    from openpi.policies import policy_config
-    from openpi.training import config
+    contract = load_pi0_deployment_contract(checkpoint)
+    default_prompt = args.default_prompt or str(contract["prompt"])
 
     logging.info("Loading Pi0 checkpoint %s", checkpoint)
-    trained_policy = policy_config.create_trained_policy(
-        config.get_config(PI0_TRAIN_CONFIG),
+    trained_policy = create_checkpoint_policy(
         checkpoint,
-        default_prompt=args.default_prompt,
+        contract,
+        default_prompt=default_prompt,
         history_overflow=args.history_overflow,
     )
     camera_cache = CameraBundleCache(args.camera_cache_address)
     camera_cache.start()
     policy = ValidatedPi0Policy(
-        trained_policy, camera_cache, args.max_observation_age, args.max_camera_skew
+        trained_policy,
+        camera_cache,
+        args.max_observation_age,
+        args.max_camera_skew,
+        contract,
     )
     policy.reset()
     MetadataHandler.contract = policy.metadata
-    metadata_server = ThreadingHTTPServer((args.host, args.metadata_port), MetadataHandler)
-    metadata_thread = threading.Thread(target=metadata_server.serve_forever, daemon=True)
+    metadata_server = ThreadingHTTPServer(
+        (args.host, args.metadata_port), MetadataHandler
+    )
+    metadata_thread = threading.Thread(
+        target=metadata_server.serve_forever, daemon=True
+    )
     metadata_thread.start()
     logging.info(
         "Pi0 checkpoint loaded; serving websocket :%d, metadata HTTP :%d",

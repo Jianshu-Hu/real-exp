@@ -1,11 +1,10 @@
 """Robot-side executor for the RMBench Franka Pi0 policy.
 
-The Pi0/JAX process and camera pixels stay on the inference computer. This
-executor sends only the current 8-D robot state plus the synchronized camera
-bundle sequence, receives a 50x8 absolute-target action chunk, and executes a
-short receding-horizon prefix. Overlapping future proposals from successive
-chunks are temporally aggregated. Passing ``--execute`` is the only operation
-that enables real robot commands.
+The Pi0/JAX process and camera pixels stay on the inference computer. The
+server metadata selects a left-only, right-only, or dual-arm Franka contract;
+this executor validates the live bridge and routes absolute targets to only
+the selected arm(s). Passing ``--execute`` is the only operation that enables
+real robot commands.
 """
 
 from __future__ import annotations
@@ -26,8 +25,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from deploy.action_aggregation import TemporalProposalAggregator
-from deploy.pi0_deployment import PI0_DEFAULT_ACTIONS_PER_CHUNK, PI0_HORIZON, PI0_PROMPT
+from deploy.action_aggregation import TemporalProposalAggregator  # noqa: E402
+from deploy.pi0_deployment import (  # noqa: E402
+    PI0_DEFAULT_ACTIONS_PER_CHUNK,
+    PI0_HORIZON,
+    pi0_deployment_contract,
+)
+from utils.trajectory_metadata import split_trajectory_vector  # noqa: E402
 
 
 DEFAULT_SERVER_IP = os.environ.get("DEPLOYMENT_SERVER_IP", "192.168.50.13")
@@ -41,9 +45,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zmq-port", type=int, default=5555)
     parser.add_argument("--command-zmq-host", default=DEFAULT_SERVER_IP)
     parser.add_argument("--command-zmq-port", type=int, default=5556)
-    parser.add_argument("--actions-per-chunk", type=int, default=PI0_DEFAULT_ACTIONS_PER_CHUNK)
+    parser.add_argument(
+        "--actions-per-chunk", type=int, default=PI0_DEFAULT_ACTIONS_PER_CHUNK
+    )
     parser.add_argument("--fps", type=float, default=None)
-    parser.add_argument("--task", default=PI0_PROMPT, help="Language prompt sent to Pi0.")
+    parser.add_argument(
+        "--task",
+        default=None,
+        help="Optional language prompt override; defaults to checkpoint metadata.",
+    )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument(
         "--debug",
@@ -71,19 +81,25 @@ def import_zmq_runtime():
     try:
         import zmq
     except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError("pyzmq is required in the robot-side environment.") from exc
+        raise ModuleNotFoundError(
+            "pyzmq is required in the robot-side environment."
+        ) from exc
     return zmq
 
 
-def validate_live_packet(packet: dict[str, Any]) -> None:
+def validate_live_packet(
+    packet: dict[str, Any], metadata: dict[str, Any] | None = None
+) -> None:
+    metadata = metadata or pi0_deployment_contract()
+    trajectory = metadata["trajectory_config"]
     expected = {
-        "arm_mode": "left",
-        "include_right_arm": False,
+        "arm_mode": trajectory["arm_mode"],
+        "include_right_arm": trajectory["arm_mode"] == "duo",
         "include_gripper": True,
         "include_hand": False,
         "state_action_mode": "joint",
-        "robot_state_dim": 8,
-        "action_dim": 8,
+        "robot_state_dim": trajectory["robot_state_dim"],
+        "action_dim": trajectory["action_dim"],
     }
     mismatches = [
         f"{key}: live={packet.get(key)!r}, Pi0={value!r}"
@@ -91,14 +107,17 @@ def validate_live_packet(packet: dict[str, Any]) -> None:
         if packet.get(key) != value
     ]
     live_cameras = set(packet.get("camera_names", ()))
-    expected_cameras = {"cam_front", "cam_left"}
+    expected_cameras = set(metadata["camera_names"])
     if live_cameras != expected_cameras:
         mismatches.append(
             f"cameras: live={sorted(live_cameras)!r}, Pi0={sorted(expected_cameras)!r}"
         )
+    state_dim = int(trajectory["robot_state_dim"])
     state = np.asarray(packet.get("state"), dtype=np.float32)
-    if state.shape != (8,) or not np.isfinite(state).all():
-        mismatches.append(f"state must be finite shape (8,), got {state.shape}")
+    if state.shape != (state_dim,) or not np.isfinite(state).all():
+        mismatches.append(
+            f"state must be finite shape ({state_dim},), got {state.shape}"
+        )
     try:
         state_stamp = float(packet["robot_state_stamp_s"])
     except (KeyError, TypeError, ValueError):
@@ -107,7 +126,9 @@ def validate_live_packet(packet: dict[str, Any]) -> None:
         if not np.isfinite(state_stamp):
             mismatches.append("robot_state_stamp_s must be finite")
     if mismatches:
-        raise ValueError("Live bridge does not match the Pi0 contract: " + "; ".join(mismatches))
+        raise ValueError(
+            "Live bridge does not match the Pi0 contract: " + "; ".join(mismatches)
+        )
 
 
 def validate_server_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -122,7 +143,25 @@ def validate_server_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         for key, value in required.items()
         if metadata.get(key) != value
     ]
-    if set(metadata.get("camera_names", ())) != {"cam_front", "cam_left"}:
+    trajectory = metadata.get("trajectory_config") or {}
+    arm_mode = trajectory.get("arm_mode")
+    expected_arms = ["left", "right"] if arm_mode == "duo" else [arm_mode]
+    if (
+        arm_mode not in {"left", "right", "duo"}
+        or trajectory.get("arms") != expected_arms
+    ):
+        mismatches.append(f"arm layout={arm_mode!r}/{trajectory.get('arms')!r}")
+    expected_dim = 16 if arm_mode == "duo" else 8
+    if (
+        trajectory.get("robot_state_dim") != expected_dim
+        or trajectory.get("action_dim") != expected_dim
+    ):
+        mismatches.append(
+            "state/action dimensions="
+            f"{trajectory.get('robot_state_dim')!r}/{trajectory.get('action_dim')!r}"
+        )
+    expected_cameras = {"cam_front", *(f"cam_{side}" for side in expected_arms)}
+    if set(metadata.get("camera_names", ())) != expected_cameras:
         mismatches.append(f"camera_names={metadata.get('camera_names')!r}")
     if mismatches:
         raise ValueError("Pi0 server metadata mismatch: " + "; ".join(mismatches))
@@ -147,22 +186,41 @@ class FrankaPi0PolicyExecutor:
         self.command_socket = None
         self.bridge_active = False
         self.fps = 15.0
+        self.metadata = pi0_deployment_contract()
+        self.trajectory_config = self.metadata["trajectory_config"]
+        self.action_dim = int(self.trajectory_config["action_dim"])
+        self.prompt = str(self.metadata["prompt"])
         self.log_file = None
         self.log_path: Path | None = None
         self._last_chunk_received_at: float | None = None
-        self.action_aggregator = TemporalProposalAggregator(args.temporal_proposal_decay)
+        self.action_aggregator = TemporalProposalAggregator(
+            args.temporal_proposal_decay
+        )
         self.action_queue: dict[int, np.ndarray] = {}
 
     @staticmethod
-    def _command_payload_from_action(action: Any) -> dict[str, Any]:
+    def _command_payload_from_action(
+        action: Any, trajectory_config: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        trajectory_config = (
+            trajectory_config or pi0_deployment_contract()["trajectory_config"]
+        )
         values = np.asarray(action, dtype=float)
-        if values.shape != (8,) or not np.isfinite(values).all():
-            raise ValueError(f"Pi0 action must be finite with shape (8,), got {values.shape}.")
-        return {
-            "timestamp": time.time(),
-            "left_joint_target": values[:7].tolist(),
-            "left_gripper_command": float(np.clip(values[7], 0.0, 1.0)),
-        }
+        action_dim = int(trajectory_config["action_dim"])
+        if values.shape != (action_dim,) or not np.isfinite(values).all():
+            raise ValueError(
+                f"Pi0 action must be finite with shape ({action_dim},), got {values.shape}."
+            )
+        split = split_trajectory_vector(values, trajectory_config)
+        payload: dict[str, Any] = {"timestamp": time.time()}
+        for side in trajectory_config["arms"]:
+            payload[f"{side}_joint_target"] = np.asarray(
+                split[f"{side}_arm"], dtype=float
+            ).tolist()
+            payload[f"{side}_gripper_command"] = float(
+                np.clip(split[f"{side}_gripper"], 0.0, 1.0)
+            )
+        return payload
 
     def _set_bridge_active(self, active: bool) -> None:
         if self.args.no_auto_activate_bridge or self.bridge_active == active:
@@ -180,7 +238,12 @@ class FrankaPi0PolicyExecutor:
         environment["ROS_LOCALHOST_ONLY"] = "0"
         environment["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "SUBNET"
         result = subprocess.run(  # nosec B603
-            command, check=False, capture_output=True, text=True, timeout=15.0, env=environment
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+            env=environment,
         )
         if result.returncode != 0 or "success=True" not in result.stdout:
             raise RuntimeError(
@@ -197,11 +260,19 @@ class FrankaPi0PolicyExecutor:
                 "websocket-client is required in the robot-side environment."
             ) from exc
         uri = f"ws://{self.args.server_address}"
-        self.websocket = websocket.create_connection(uri, timeout=300, enable_multithread=False)
+        self.websocket = websocket.create_connection(
+            uri, timeout=300, enable_multithread=False
+        )
         metadata = validate_server_metadata(json.loads(self.websocket.recv()))
+        self.metadata = metadata
+        self.trajectory_config = metadata["trajectory_config"]
+        self.action_dim = int(self.trajectory_config["action_dim"])
+        self.prompt = self.args.task or str(metadata["prompt"])
         self.fps = float(metadata["fps"])
         if self.args.fps is not None and not np.isclose(self.args.fps, self.fps):
-            raise ValueError(f"--fps={self.args.fps:g} does not match Pi0 server fps={self.fps:g}.")
+            raise ValueError(
+                f"--fps={self.args.fps:g} does not match Pi0 server fps={self.fps:g}."
+            )
         return metadata
 
     def _infer(self, packet: dict[str, Any]) -> np.ndarray:
@@ -211,7 +282,7 @@ class FrankaPi0PolicyExecutor:
             "state": np.asarray(packet["state"], dtype=float).tolist(),
             "camera_bundle_sequence": int(packet["camera_bundle_sequence"]),
             "robot_state_stamp_s": float(packet["robot_state_stamp_s"]),
-            "prompt": self.args.task,
+            "prompt": self.prompt,
         }
         started = time.perf_counter()
         self.websocket.send(json.dumps(request, separators=(",", ":")))
@@ -220,12 +291,18 @@ class FrankaPi0PolicyExecutor:
         if "error" in response:
             raise RuntimeError(f"Pi0 server rejected inference: {response['error']}")
         actions = np.asarray(response.get("actions"), dtype=np.float32)
-        if actions.shape != (PI0_HORIZON, 8) or not np.isfinite(actions).all():
+        if (
+            actions.shape != (PI0_HORIZON, self.action_dim)
+            or not np.isfinite(actions).all()
+        ):
             raise RuntimeError(f"Pi0 server returned invalid actions {actions.shape}.")
         inference_s = chunk_received_at - started
         if self.args.debug:
             if self._last_chunk_received_at is None:
-                print(f"[debug] first action chunk: inference={inference_s:.3f}s", flush=True)
+                print(
+                    f"[debug] first action chunk: inference={inference_s:.3f}s",
+                    flush=True,
+                )
             else:
                 chunk_interval_s = chunk_received_at - self._last_chunk_received_at
                 print(
@@ -245,7 +322,9 @@ class FrankaPi0PolicyExecutor:
         )
         return actions
 
-    def _merge_action_chunk(self, actions: np.ndarray, first_timestep: int) -> dict[str, Any]:
+    def _merge_action_chunk(
+        self, actions: np.ndarray, first_timestep: int
+    ) -> dict[str, Any]:
         """Merge a chunk into the future action queue by execution timestep."""
         generation = self.action_aggregator.begin_chunk()
         blended = 0
@@ -290,7 +369,9 @@ class FrankaPi0PolicyExecutor:
                     "fps": self.fps,
                     "actions_per_chunk": self.args.actions_per_chunk,
                     "temporal_proposal_decay": self.args.temporal_proposal_decay,
-                    "prompt": self.args.task,
+                    "prompt": self.prompt,
+                    "arm_mode": self.trajectory_config["arm_mode"],
+                    "state_action_dim": self.action_dim,
                     "execute": self.args.execute,
                     "action_representation": "absolute_target",
                 },
@@ -320,6 +401,7 @@ class FrankaPi0PolicyExecutor:
         print("--------------------------")
         print(f"server_address: {self.args.server_address}")
         print(f"train_config: {metadata['train_config']}")
+        print(f"arm_mode: {self.trajectory_config['arm_mode']}")
         print(f"fps: {self.fps:g}")
         print(f"actions_per_chunk: {self.args.actions_per_chunk} / {PI0_HORIZON}")
         print(f"temporal_proposal_decay: {self.args.temporal_proposal_decay:g}")
@@ -341,30 +423,35 @@ class FrankaPi0PolicyExecutor:
         print("Waiting for the live bridge...")
         try:
             first_packet = observation_socket.recv_pyobj()
-            validate_live_packet(first_packet)
+            validate_live_packet(first_packet, metadata)
             print(
-                "Live contract: state/action=8/8, cameras=['cam_front', 'cam_left'], "
-                "absolute targets"
+                f"Live contract: arm_mode={self.trajectory_config['arm_mode']}, "
+                f"state/action={self.action_dim}/{self.action_dim}, "
+                f"cameras={metadata['camera_names']}, absolute targets"
             )
             self._init_log()
             current_packet = first_packet
             next_timestep = 0
             while True:
-                validate_live_packet(current_packet)
+                validate_live_packet(current_packet, metadata)
                 chunk = self._infer(current_packet)
                 merge_stats = self._merge_action_chunk(chunk, next_timestep)
                 self._log({"event": "action_chunk_merged", **merge_stats})
                 for chunk_index in range(self.args.actions_per_chunk):
                     loop_started = time.perf_counter()
                     current_packet = self._recv_latest(observation_socket, zmq)
-                    validate_live_packet(current_packet)
+                    validate_live_packet(current_packet, metadata)
                     action = self._pop_action(next_timestep)
-                    payload = self._command_payload_from_action(action)
+                    payload = self._command_payload_from_action(
+                        action, self.trajectory_config
+                    )
                     if self.args.execute:
                         command_socket.send_pyobj(payload)
                     self._log(
                         {
-                            "event": "action_executed" if self.args.execute else "action_predicted",
+                            "event": "action_executed"
+                            if self.args.execute
+                            else "action_predicted",
                             "chunk_index": chunk_index,
                             "timestep": next_timestep,
                             "action": np.asarray(action, dtype=float).tolist(),
@@ -373,7 +460,9 @@ class FrankaPi0PolicyExecutor:
                         }
                     )
                     next_timestep += 1
-                    time.sleep(max(0.0, 1.0 / self.fps - (time.perf_counter() - loop_started)))
+                    time.sleep(
+                        max(0.0, 1.0 / self.fps - (time.perf_counter() - loop_started))
+                    )
                 current_packet = self._recv_latest(observation_socket, zmq)
         except KeyboardInterrupt:
             print("\nStopping Franka Pi0 policy executor...")

@@ -72,14 +72,18 @@ cd /home/pair1/gzy/real-exp
 ./scripts/create_rmbench_env.sh
 ```
 
-The Pi0 contract is fixed by its training configuration: 15 Hz; left Franka
-arm plus gripper (8-D state/action); `cam_front` and `cam_left`; 50 absolute
-targets per inference. The executor runs an 8-target receding-horizon prefix by
-default. Successive chunks overlap in their future 50-target horizons and are
-merged with normalized generation-age weights; use `--temporal-proposal-decay`
-to control that weighting. The output transform has already restored the joint
-deltas to absolute joint targets, so the executor must not add the measured
-joints again.
+The Pi0 deployment profile is resolved from the checkpoint normalization asset.
+Single-arm policies use 8-D state/action and `cam_front` plus the selected
+arm's wrist camera. Duo policies use 16-D state/action and all three cameras.
+The server publishes the detected `left`, `right`, or `duo` contract; the
+hardware client selects matching controllers, and the executor sends commands
+only to those arms. All profiles run at 15 Hz and return 50 absolute targets per
+inference. The executor runs an 8-target receding-horizon prefix by default.
+Successive chunks overlap in their future 50-target horizons and are merged
+with normalized generation-age weights; use `--temporal-proposal-decay` to
+control that weighting. The output transform has already restored the joint
+deltas to absolute joint targets, so the executor must not add measured joints
+again.
 
 Start the server with the extracted step directory, then start the hardware
 client and finally the dedicated Pi0 executor on the robot computer:
@@ -97,10 +101,11 @@ python deploy/franka_pi0_policy_executor.py \
   --temporal-proposal-decay 0.5
 ```
 
-The executor is dry-run by default. Confirm finite predictions and matching
-`state/action=8/8`, `cam_front`, and `cam_left` before stopping it and rerunning
-the same command with `--execute`. Use only one Pi0 executor per server: Pi0
-maintains a temporal history which is reset when its websocket client connects.
+The executor is dry-run by default. Confirm finite predictions and that its
+reported `arm_mode`, state/action dimensions, and cameras match the intended
+checkpoint before stopping it and rerunning the same command with `--execute`.
+Use only one Pi0 executor per server: Pi0 maintains a temporal history which is
+reset when its websocket client connects.
 
 RTX 50xx/SM 12.0 deployment uses JAX 0.5.3 and CUDA 12.8 `ptxas`, both pinned
 by the `rmbench` environment. When `/usr/local/cuda-12.8` exists, the launcher

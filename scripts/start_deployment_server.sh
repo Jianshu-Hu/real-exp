@@ -15,11 +15,12 @@ Options:
   --publish-port PORT  Observation ZMQ port (default: 5555)
   --command-port PORT  Command ZMQ port (default: 5556)
   --camera-cache-port PORT  Loopback full-camera cache port (default: 5557)
-  --policy-port PORT   gRPC policy port (default: 8080)
+  --policy-port PORT   Policy service port (WebSocket for Pi0, gRPC otherwise; default: 8080)
   --metadata-port PORT Read-only deployment metadata HTTP port (default: 8081)
   --fps HZ             Optional override; must match checkpoint metadata
   --hand-telemetry-port PORT  Wuji hand telemetry port (default: 5558)
   --bridge-config FILE Bridge config (default: deployment_duo.yaml)
+  --camera-config FILE RealSense camera config (default: example_three_cameras.yaml)
   --ros-domain-id ID   Set ROS_DOMAIN_ID
   --ros-distro NAME    ROS distribution under /opt/ros
   --python PATH        Explicit policy Python interpreter (default: rmbench uv env for Pi0,
@@ -27,8 +28,8 @@ Options:
   --print-config       Resolve and print metadata-selected settings, then exit
   --help               Show this help
 
-Pi0 checkpoints are recognized by their Orbax structure and use the fixed contract
-documented in libs/RMBench/policy/pi0/README_REAL.md. Other checkpoints use their
+Pi0 checkpoints are recognized by their Orbax structure; their left, right, or duo
+deployment profile is inferred from checkpoint assets. Other checkpoints use their
 embedded LeRobot deployment contract. The robot client needs neither checkpoint.
 EOF
 }
@@ -60,6 +61,7 @@ policy_path=""; metadata_port=8081; requested_fps=""
 server_ip="${DEPLOYMENT_SERVER_IP:-192.168.50.13}"
 publish_port=5555; command_port=5556; camera_cache_port=5557; policy_port=8080; hand_telemetry_port=5558
 bridge_config=deployment_duo.yaml; ros_domain_id="${ROS_DOMAIN_ID:-0}"
+camera_config=example_three_cameras.yaml
 ros_distro="${DEPLOYMENT_ROS_DISTRO:-${ROS_DISTRO:-}}"
 policy_python="${DEPLOYMENT_PYTHON:-}"
 print_config=0
@@ -77,6 +79,7 @@ while [[ "$#" -gt 0 ]]; do
     --fps) [[ "$#" -ge 2 ]] || die "$1 requires a value"; requested_fps="$2"; shift 2 ;;
     --hand-telemetry-port) [[ "$#" -ge 2 ]] || die "$1 requires a value"; hand_telemetry_port="$2"; shift 2 ;;
     --bridge-config) [[ "$#" -ge 2 ]] || die "$1 requires a value"; bridge_config="$2"; shift 2 ;;
+    --camera-config) [[ "$#" -ge 2 ]] || die "$1 requires a value"; camera_config="$2"; shift 2 ;;
     --ros-domain-id) [[ "$#" -ge 2 ]] || die "$1 requires a value"; ros_domain_id="$2"; shift 2 ;;
     --ros-distro) [[ "$#" -ge 2 ]] || die "$1 requires a value"; ros_distro="$2"; shift 2 ;;
     --python) [[ "$#" -ge 2 ]] || die "$1 requires a value"; policy_python="$2"; shift 2 ;;
@@ -111,10 +114,11 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
 policy_path="$(cd -- "${policy_path}" 2>/dev/null && pwd)" || die "policy path not found: ${policy_path}"
 policy_backend=lerobot
-if [[ -f "${policy_path}/_CHECKPOINT_METADATA" && -d "${policy_path}/params" && \
-      -f "${policy_path}/assets/memory_260915-franka-left-2view-v1/norm_stats.json" ]]; then
+if [[ -f "${policy_path}/_CHECKPOINT_METADATA" && -d "${policy_path}/params" ]] && \
+     compgen -G "${policy_path}/assets/*/norm_stats.json" >/dev/null; then
   policy_backend=pi0
-  trajectory_output="$(PYTHONPATH="${repository_root}" python3 "${repository_root}/deploy/pi0_deployment.py" --deployment-lines)" \
+  trajectory_output="$(PYTHONPATH="${repository_root}" python3 "${repository_root}/deploy/pi0_deployment.py" \
+    --checkpoint "${policy_path}" --deployment-lines)" \
     || die "could not resolve the Pi0 deployment contract"
 else
   trajectory_output="$(PYTHONPATH="${repository_root}" python3 "${repository_root}/utils/deployment_metadata.py" --checkpoint "${policy_path}" --deployment-lines)" \
@@ -232,8 +236,12 @@ fi
 bridge_config_source="${repository_root}/gello_software/ros2/src/franka_lerobot_data_bridge/config/${bridge_config}"
 if [[ "${bridge_config}" = /* ]]; then bridge_config_source="${bridge_config}"; fi
 [[ -f "${bridge_config_source}" ]] || die "bridge config not found: ${bridge_config}"
+camera_config_source="${repository_root}/gello_software/ros2/src/franka_realsense_camera_publisher/config/${camera_config}"
+if [[ "${camera_config}" = /* ]]; then camera_config_source="${camera_config}"; fi
+[[ -f "${camera_config_source}" ]] || die "camera config not found: ${camera_config}"
 runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
 bridge_config_runtime="$(mktemp "${runtime_dir}/real-exp-deployment-bridge.XXXXXX.yaml")"
+camera_config_runtime="$(mktemp "${runtime_dir}/real-exp-deployment-camera.XXXXXX.yaml")"
 if ! python3 "${repository_root}/deploy/build_deployment_bridge_config.py" \
   --base-config "${bridge_config_source}" --output "${bridge_config_runtime}" \
   --sample-rate-hz "${fps}" --publish-host "${server_ip}" --publish-port "${publish_port}" \
@@ -246,7 +254,16 @@ if ! python3 "${repository_root}/deploy/build_deployment_bridge_config.py" \
   --camera-1-enabled "${camera_left}" --camera-2-enabled "${camera_front}" \
   --camera-3-enabled "${camera_right}"; then
   rm -f -- "${bridge_config_runtime}"
+  rm -f -- "${camera_config_runtime}"
   die "could not build runtime deployment bridge config"
+fi
+if ! python3 "${repository_root}/deploy/build_deployment_camera_config.py" \
+  --base-config "${camera_config_source}" --output "${camera_config_runtime}" \
+  --camera-1-enabled "${camera_left}" --camera-2-enabled "${camera_right}" \
+  --camera-3-enabled "${camera_front}"; then
+  rm -f -- "${bridge_config_runtime}"
+  rm -f -- "${camera_config_runtime}"
+  die "could not build runtime deployment camera config"
 fi
 
 declare -a child_pids=(); declare -A child_names=(); shutdown_started=0
@@ -260,7 +277,7 @@ shutdown() {
   local status=$?; [[ "${shutdown_started}" -eq 1 ]] && return; shutdown_started=1
   trap - EXIT INT TERM; signal_groups INT; sleep 1; signal_groups TERM
   for pid in "${child_pids[@]}"; do wait "${pid}" 2>/dev/null || true; done
-  rm -f -- "${bridge_config_runtime}"
+  rm -f -- "${bridge_config_runtime}" "${camera_config_runtime}"
   exit "${status}"
 }
 trap shutdown EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
@@ -268,7 +285,8 @@ trap shutdown EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 echo "Deployment contract: ${end_effector}/${arm_mode}, mode=${state_action_mode}, state/action=${state_dim}/${action_dim}, cameras=${camera_names}, fps=${fps}"
 if [[ "${policy_backend}" == "pi0" ]]; then policy_transport=websocket; else policy_transport=gRPC; fi
 echo "Deployment server: observation tcp://${server_ip}:${publish_port}, command tcp://${server_ip}:${command_port}, hand telemetry tcp://${server_ip}:${hand_telemetry_port}, camera cache tcp://127.0.0.1:${camera_cache_port}, ${policy_transport} :${policy_port}"
-start_process "RealSense camera publisher" ros2 launch franka_realsense_camera_publisher cameras.launch.py
+start_process "RealSense camera publisher" ros2 launch franka_realsense_camera_publisher cameras.launch.py \
+  "config_file:=${camera_config_runtime}"
 start_process "Deployment observation bridge" ros2 launch franka_lerobot_data_bridge bridge.launch.py \
   "config_file:=${bridge_config_runtime}"
 if [[ "${policy_backend}" == "pi0" ]]; then

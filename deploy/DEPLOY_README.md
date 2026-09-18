@@ -13,7 +13,7 @@ Both computers use ROS 2 domain `0`. The default server address is
 | Robot/gripper state and deployment commands | ROS 2 DDS between computers | `ROS_DOMAIN_ID=0` |
 | State and camera-bundle metadata | server bridge to robot executor | ZMQ `192.168.50.13:5555` |
 | Policy commands | robot executor to server bridge | ZMQ `192.168.50.13:5556` |
-| Policy inference | robot executor to policy server | gRPC `192.168.50.13:8080` |
+| Policy inference | robot executor to policy server | gRPC `192.168.50.13:8080` for LeRobot, WebSocket for Pi0 |
 | Full synchronized camera bundles | bridge to policy-server cache, server-local only | ZMQ `127.0.0.1:5557` |
 | Wuji measured-state telemetry (hand datasets only) | robot hand worker to server bridge | ZMQ `192.168.50.13:5558` |
 | Wuji policy targets (hand datasets only) | robot executor to robot hand worker | ZMQ `127.0.0.1:5561` (left), `127.0.0.1:5562` (right) |
@@ -60,6 +60,51 @@ Set `DEPLOYMENT_SERVER_IP` or pass `--server-ip` only if the inference server
 address differs from `192.168.50.13`.
 
 ## Run Deployment
+
+### Pi0 (`pi0_15000`)
+
+`pi0_15000` is a complete RMBench/OpenPI Orbax checkpoint, not a LeRobot
+checkpoint. It runs in the repository-local uv environment named `rmbench`.
+Create it once on the server computer:
+
+```bash
+cd /home/pair1/gzy/real-exp
+./scripts/create_rmbench_env.sh
+```
+
+The Pi0 contract is fixed by its training configuration: 15 Hz; left Franka
+arm plus gripper (8-D state/action); `cam_front` and `cam_left`; 50 absolute
+targets per inference. The executor runs an 8-target receding-horizon prefix by
+default. The output transform has already restored the joint deltas to absolute
+joint targets, so the executor must not add the measured joints again.
+
+Start the server with the extracted step directory, then start the hardware
+client and finally the dedicated Pi0 executor on the robot computer:
+
+```bash
+./scripts/start_deployment_server.sh --policy-path /home/pair1/real-exp/pi0_15000 --print-config
+./scripts/start_deployment_server.sh --policy-path /home/pair1/real-exp/pi0_15000
+
+# Robot computer
+./scripts/start_deployment_client.sh --server-ip 192.168.50.13
+python deploy/franka_pi0_policy_executor.py --server-address 192.168.50.13:8080
+```
+
+The executor is dry-run by default. Confirm finite predictions and matching
+`state/action=8/8`, `cam_front`, and `cam_left` before stopping it and rerunning
+the same command with `--execute`. Use only one Pi0 executor per server: Pi0
+maintains a temporal history which is reset when its websocket client connects.
+
+RTX 50xx/SM 12.0 deployment uses JAX 0.5.3 and CUDA 12.8 `ptxas`, both pinned
+by the `rmbench` environment. When `/usr/local/cuda-12.8` exists, the launcher
+also points XLA at that complete toolkit. If CUDA lives elsewhere, set
+`PATH=<toolkit>/bin:$PATH` and
+`XLA_FLAGS=--xla_gpu_cuda_data_dir=<toolkit>` before starting the server.
+Verify the complete checkpoint on GPU before deployment with:
+
+```bash
+.venvs/rmbench/bin/python scripts/smoke_test_pi0_gpu.py --checkpoint pi0_15000
+```
 
 ### 1. Start the deployment server
 

@@ -27,7 +27,7 @@ Options:
   --ros-distro NAME       ROS distribution under /opt/ros
   --help                  Show this help
 
-The policy server metadata controls arm mode, end effector, dimensions, cameras, and FPS.
+The policy server metadata controls policy type, arm mode, end effector, dimensions, cameras, and FPS.
 This does not start franka_gello_state_publisher. Deployment targets are sent
 by the bridge to deployment controllers; teleoperation publishers may conflict.
 EOF
@@ -161,6 +161,12 @@ if [[ "${end_effector}" == "hand" ]]; then
   fi
 fi
 echo "Deployment contract: ${end_effector}/${arm_mode}, mode=${state_action_mode}, state/action=${state_dim}/${action_dim}, cameras=${camera_names}, fps=${fps}"
-echo "Deployment client is running. Start the policy executor here; press Ctrl-C to stop controllers."
+if [[ "${policy_type}" == "pi0" ]]; then
+  echo "Deployment client is running. In another robot-side shell start:"
+  echo "  python deploy/franka_pi0_policy_executor.py --server-address ${server_address}"
+  echo "Add --execute only after validating a dry run. Press Ctrl-C here to stop controllers."
+else
+  echo "Deployment client is running. Start the ${policy_type} policy executor here; press Ctrl-C to stop controllers."
+fi
 set +e; completed_pid=""; wait -n -p completed_pid "${child_pids[@]}"; status=$?; set -e
 echo "${child_names[${completed_pid}]} exited with status ${status}." >&2; exit "${status}"

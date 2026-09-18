@@ -8,7 +8,7 @@ usage() {
 Usage: ./scripts/start_deployment_server.sh [options]
 
 Required:
-  --policy-path DIR     Checkpoint whose embedded metadata configures the bridge and policy server
+  --policy-path DIR     LeRobot checkpoint or complete RMBench Pi0 Orbax step directory
 
 Options:
   --server-ip IP       ZMQ bind address (default: DEPLOYMENT_SERVER_IP or 192.168.50.13)
@@ -22,12 +22,14 @@ Options:
   --bridge-config FILE Bridge config (default: deployment_duo.yaml)
   --ros-domain-id ID   Set ROS_DOMAIN_ID
   --ros-distro NAME    ROS distribution under /opt/ros
-  --python PATH        Explicit policy Python interpreter (default: lerobot Conda environment)
+  --python PATH        Explicit policy Python interpreter (default: rmbench uv env for Pi0,
+                       otherwise the lerobot Conda environment)
   --print-config       Resolve and print metadata-selected settings, then exit
   --help               Show this help
 
-The server owns the checkpoint path and publishes its embedded deployment contract
-on the metadata HTTP endpoint. The robot client does not need the dataset or checkpoint.
+Pi0 checkpoints are recognized by their Orbax structure and use the fixed contract
+documented in libs/RMBench/policy/pi0/README_REAL.md. Other checkpoints use their
+embedded LeRobot deployment contract. The robot client needs neither checkpoint.
 EOF
 }
 die() { echo "Error: $*" >&2; exit 1; }
@@ -108,8 +110,16 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
 policy_path="$(cd -- "${policy_path}" 2>/dev/null && pwd)" || die "policy path not found: ${policy_path}"
-trajectory_output="$(PYTHONPATH="${repository_root}" python3 "${repository_root}/utils/deployment_metadata.py" --checkpoint "${policy_path}" --deployment-lines)" \
-  || die "could not resolve deployment metadata from ${policy_path}"
+policy_backend=lerobot
+if [[ -f "${policy_path}/_CHECKPOINT_METADATA" && -d "${policy_path}/params" && \
+      -f "${policy_path}/assets/memory_260915-franka-left-2view-v1/norm_stats.json" ]]; then
+  policy_backend=pi0
+  trajectory_output="$(PYTHONPATH="${repository_root}" python3 "${repository_root}/deploy/pi0_deployment.py" --deployment-lines)" \
+    || die "could not resolve the Pi0 deployment contract"
+else
+  trajectory_output="$(PYTHONPATH="${repository_root}" python3 "${repository_root}/utils/deployment_metadata.py" --checkpoint "${policy_path}" --deployment-lines)" \
+    || die "could not resolve deployment metadata from ${policy_path}"
+fi
 mapfile -t trajectory_lines <<<"${trajectory_output}"
 (( ${#trajectory_lines[@]} == 9 )) || die "deployment metadata resolver returned an unexpected number of fields"
 arm_mode="${trajectory_lines[0]}"; end_effector="${trajectory_lines[1]}"; fps="${trajectory_lines[2]}"
@@ -136,8 +146,8 @@ if [[ "${camera_names}" != "" ]]; then
   done
 fi
 if [[ "${print_config}" -eq 1 ]]; then
-  printf 'policy_path=%s\narm_mode=%s\nend_effector=%s\nfps=%s\nstate_dim=%s\naction_dim=%s\nstate_action_mode=%s\ncameras=%s\npolicy_type=%s\nactions_per_chunk=%s\ninclude_right_arm=%s\ninclude_gripper=%s\ninclude_hand=%s\ncamera_1_enabled=%s\ncamera_2_enabled=%s\ncamera_3_enabled=%s\nserver_ip=%s\nmetadata_port=%s\n' \
-    "${policy_path}" "${arm_mode}" "${end_effector}" "${fps}" "${state_dim}" "${action_dim}" "${state_action_mode}" \
+  printf 'policy_path=%s\npolicy_backend=%s\narm_mode=%s\nend_effector=%s\nfps=%s\nstate_dim=%s\naction_dim=%s\nstate_action_mode=%s\ncameras=%s\npolicy_type=%s\nactions_per_chunk=%s\ninclude_right_arm=%s\ninclude_gripper=%s\ninclude_hand=%s\ncamera_1_enabled=%s\ncamera_2_enabled=%s\ncamera_3_enabled=%s\nserver_ip=%s\nmetadata_port=%s\n' \
+    "${policy_path}" "${policy_backend}" "${arm_mode}" "${end_effector}" "${fps}" "${state_dim}" "${action_dim}" "${state_action_mode}" \
     "${camera_names}" "${policy_type}" "${actions_per_chunk}" "${include_right_arm}" "${include_gripper}" "${include_hand}" \
     "${camera_left}" "${camera_front}" "${camera_right}" "${server_ip}" "${metadata_port}"
   exit 0
@@ -190,8 +200,29 @@ declare -a policy_command=()
 if [[ -n "${policy_python}" ]]; then
   command -v "${policy_python}" >/dev/null || die "policy Python not found: ${policy_python}"
   policy_command=("${policy_python}")
-  "${policy_command[@]}" -c 'import grpc, torch, zmq' >/dev/null 2>&1 || die \
-    "policy Python is missing grpc, torch, or zmq: ${policy_python}"
+  if [[ "${policy_backend}" == "pi0" ]]; then
+    "${policy_command[@]}" -c 'import jax, openpi, websockets, zmq' >/dev/null 2>&1 || die \
+      "Pi0 policy Python is missing jax, openpi, websockets, or zmq: ${policy_python}"
+  else
+    "${policy_command[@]}" -c 'import grpc, torch, zmq' >/dev/null 2>&1 || die \
+      "policy Python is missing grpc, torch, or zmq: ${policy_python}"
+  fi
+elif [[ "${policy_backend}" == "pi0" ]]; then
+  rmbench_python="${repository_root}/.venvs/rmbench/bin/python"
+  [[ -x "${rmbench_python}" ]] || die \
+    "Pi0 requires the rmbench uv environment; run ./scripts/create_rmbench_env.sh"
+  # RTX 50xx/SM 12.0 requires CUDA 12.8 ptxas. The rmbench environment pins
+  # the matching wheel, and a complete host toolkit is preferred when present.
+  rmbench_path="${PATH}"
+  rmbench_xla_flags="${XLA_FLAGS:-}"
+  if [[ -x /usr/local/cuda-12.8/bin/ptxas ]]; then
+    rmbench_path="/usr/local/cuda-12.8/bin:${rmbench_path}"
+    [[ "${rmbench_xla_flags}" == *xla_gpu_cuda_data_dir* ]] || \
+      rmbench_xla_flags="--xla_gpu_cuda_data_dir=/usr/local/cuda-12.8 ${rmbench_xla_flags}"
+  fi
+  policy_command=(env PYTHONPATH= LD_LIBRARY_PATH= PATH="${rmbench_path}" XLA_FLAGS="${rmbench_xla_flags}" "${rmbench_python}")
+  "${policy_command[@]}" -c 'import jax, openpi, websockets, zmq' >/dev/null 2>&1 || die \
+    "the rmbench uv environment is incomplete; rerun ./scripts/create_rmbench_env.sh"
 else
   deployment_conda_env="${DEPLOYMENT_CONDA_ENV:-${LEROBOT_CONDA_ENV:-lerobot}}"
   real_exp_build_conda_python_command "${deployment_conda_env}" policy_command || exit 1
@@ -235,13 +266,20 @@ shutdown() {
 trap shutdown EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 
 echo "Deployment contract: ${end_effector}/${arm_mode}, mode=${state_action_mode}, state/action=${state_dim}/${action_dim}, cameras=${camera_names}, fps=${fps}"
-echo "Deployment server: observation tcp://${server_ip}:${publish_port}, command tcp://${server_ip}:${command_port}, hand telemetry tcp://${server_ip}:${hand_telemetry_port}, camera cache tcp://127.0.0.1:${camera_cache_port}, gRPC :${policy_port}"
+if [[ "${policy_backend}" == "pi0" ]]; then policy_transport=websocket; else policy_transport=gRPC; fi
+echo "Deployment server: observation tcp://${server_ip}:${publish_port}, command tcp://${server_ip}:${command_port}, hand telemetry tcp://${server_ip}:${hand_telemetry_port}, camera cache tcp://127.0.0.1:${camera_cache_port}, ${policy_transport} :${policy_port}"
 start_process "RealSense camera publisher" ros2 launch franka_realsense_camera_publisher cameras.launch.py
 start_process "Deployment observation bridge" ros2 launch franka_lerobot_data_bridge bridge.launch.py \
   "config_file:=${bridge_config_runtime}"
-start_process "Policy server" "${policy_command[@]}" "${repository_root}/deploy/deploy_lerobot_policy.py" server \
-  --host 0.0.0.0 --port "${policy_port}" --metadata-port "${metadata_port}" --policy-path "${policy_path}" --fps "${fps}" \
-  --camera-cache-address "tcp://127.0.0.1:${camera_cache_port}"
+if [[ "${policy_backend}" == "pi0" ]]; then
+  start_process "Pi0 policy server" "${policy_command[@]}" "${repository_root}/deploy/serve_pi0_policy.py" \
+    --host 0.0.0.0 --port "${policy_port}" --metadata-port "${metadata_port}" \
+    --checkpoint "${policy_path}" --camera-cache-address "tcp://127.0.0.1:${camera_cache_port}"
+else
+  start_process "LeRobot policy server" "${policy_command[@]}" "${repository_root}/deploy/deploy_lerobot_policy.py" server \
+    --host 0.0.0.0 --port "${policy_port}" --metadata-port "${metadata_port}" --policy-path "${policy_path}" --fps "${fps}" \
+    --camera-cache-address "tcp://127.0.0.1:${camera_cache_port}"
+fi
 echo "Deployment server is running. Press Ctrl-C to stop all children."
 set +e; completed_pid=""; wait -n -p completed_pid "${child_pids[@]}"; status=$?; set -e
 echo "${child_names[${completed_pid}]} exited with status ${status}." >&2; exit "${status}"

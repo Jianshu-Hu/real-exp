@@ -18,9 +18,6 @@ PI0_TRAIN_CONFIG = "pi0_base_franka_left_memory_260915_anchor_adaln_h50_30k_v1"
 PI0_PRESS_BUTTON_TRAIN_CONFIG = (
     "pi0_base_franka_press_button_260917_anchor_adaln_bz32_h50_30k"
 )
-PI0_PRESS_BUTTON_DEDUP_TRAIN_CONFIG = (
-    "pi0_base_franka_press_button_260917_dedup_anchor_adaln_bz32_h50_30k"
-)
 PI0_PRESS_BUTTON_DEDUP_PROMPT = (
     "Press the left button three times, then press the right button once"
 )
@@ -55,11 +52,15 @@ PI0_CHECKPOINT_PROFILES: dict[str, dict[str, Any]] = {
         "prompt": "Press the button.",
     },
     "press_button-memory-260917-franka-3view-dedup-v1": {
-        "train_config": PI0_PRESS_BUTTON_DEDUP_TRAIN_CONFIG,
+        # Deduplication changes the dataset asset ID, not the model architecture.
+        # No separate RMBench config is registered for this asset; reconstruct the
+        # model from the checkpoint's saved history_config.json instead.
+        "train_config": "auto",
         "arm_mode": "duo",
         "camera_names": ["cam_front", "cam_left", "cam_right"],
         "prompt": PI0_PRESS_BUTTON_DEDUP_PROMPT,
-        "fps": 5.0,
+        # The deduplicated dataset and recorded camera streams remain 15 Hz.
+        "fps": PI0_FPS,
     },
 }
 

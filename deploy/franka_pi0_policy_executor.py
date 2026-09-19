@@ -145,6 +145,17 @@ def validate_server_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         for key, value in required.items()
         if metadata.get(key) != value
     ]
+    for key in ("checkpoint_asset_id", "train_config", "prompt"):
+        value = metadata.get(key)
+        if not isinstance(value, str) or not value.strip():
+            mismatches.append(f"{key}={value!r}")
+    try:
+        fps = float(metadata["fps"])
+    except (KeyError, TypeError, ValueError):
+        mismatches.append(f"fps={metadata.get('fps')!r}")
+    else:
+        if not np.isfinite(fps) or fps <= 0:
+            mismatches.append(f"fps={metadata.get('fps')!r}")
     try:
         max_actions_per_chunk = int(metadata["max_actions_per_chunk"])
         actions_per_chunk = int(metadata["actions_per_chunk"])
@@ -408,6 +419,8 @@ class FrankaPi0PolicyExecutor:
             json.dumps(
                 {
                     "server_address": self.args.server_address,
+                    "checkpoint_asset_id": self.metadata["checkpoint_asset_id"],
+                    "train_config": self.metadata["train_config"],
                     "fps": self.fps,
                     "actions_per_chunk": self.actions_per_chunk,
                     "temporal_proposal_decay": self.args.temporal_proposal_decay,
@@ -442,7 +455,9 @@ class FrankaPi0PolicyExecutor:
         print("Franka Pi0 policy executor")
         print("--------------------------")
         print(f"server_address: {self.args.server_address}")
+        print(f"checkpoint_asset_id: {metadata['checkpoint_asset_id']}")
         print(f"train_config: {metadata['train_config']}")
+        print(f"prompt: {self.prompt}")
         print(f"arm_mode: {self.trajectory_config['arm_mode']}")
         print(f"fps: {self.fps:g}")
         print(f"actions_per_chunk: {self.actions_per_chunk} / {self.horizon}")

@@ -18,6 +18,12 @@ PI0_TRAIN_CONFIG = "pi0_base_franka_left_memory_260915_anchor_adaln_h50_30k_v1"
 PI0_PRESS_BUTTON_TRAIN_CONFIG = (
     "pi0_base_franka_press_button_260917_anchor_adaln_bz32_h50_30k"
 )
+PI0_PRESS_BUTTON_DEDUP_TRAIN_CONFIG = (
+    "pi0_base_franka_press_button_260917_dedup_anchor_adaln_bz32_h50_30k"
+)
+PI0_PRESS_BUTTON_DEDUP_PROMPT = (
+    "Press the left button three times, then press the right button once"
+)
 PI0_PROMPT = (
     "There are four mats, one block, and a button on the table. "
     "One block is on one of the mats. First, put the block to the center, "
@@ -48,6 +54,13 @@ PI0_CHECKPOINT_PROFILES: dict[str, dict[str, Any]] = {
         "camera_names": ["cam_front", "cam_left", "cam_right"],
         "prompt": "Press the button.",
     },
+    "press_button-memory-260917-franka-3view-dedup-v1": {
+        "train_config": PI0_PRESS_BUTTON_DEDUP_TRAIN_CONFIG,
+        "arm_mode": "duo",
+        "camera_names": ["cam_front", "cam_left", "cam_right"],
+        "prompt": PI0_PRESS_BUTTON_DEDUP_PROMPT,
+        "fps": 5.0,
+    },
 }
 
 
@@ -58,6 +71,7 @@ def _franka_contract(
     train_config: str,
     prompt: str,
     camera_names: list[str] | None = None,
+    fps: float = PI0_FPS,
 ) -> dict[str, Any]:
     if arm_mode not in {"left", "right", "duo"}:
         raise ValueError(f"Unsupported Franka Pi0 arm mode {arm_mode!r}.")
@@ -134,7 +148,7 @@ def _franka_contract(
         "actions_per_chunk": PI0_DEFAULT_ACTIONS_PER_CHUNK,
         "max_actions_per_chunk": PI0_HORIZON,
         "n_obs_steps": 1,
-        "fps": PI0_FPS,
+        "fps": float(fps),
         "camera_names": camera_names,
         "camera_key_map": camera_key_map,
         "features": features,
@@ -218,6 +232,7 @@ def load_pi0_deployment_contract(checkpoint: Path | str) -> dict[str, Any]:
         train_config = str(profile["train_config"])
         camera_names = list(profile["camera_names"])
         prompt = str(profile["prompt"])
+        fps = float(profile.get("fps", PI0_FPS))
     else:
         asset_lower = asset_id.lower()
         if state_dim == 16:
@@ -234,12 +249,14 @@ def load_pi0_deployment_contract(checkpoint: Path | str) -> dict[str, Any]:
         train_config = "auto"
         camera_names = None
         prompt = PI0_PROMPT
+        fps = PI0_FPS
     contract = _franka_contract(
         arm_mode=arm_mode,
         asset_id=asset_id,
         train_config=train_config,
         prompt=prompt,
         camera_names=camera_names,
+        fps=fps,
     )
     contract["checkpoint_profile"] = (
         f"franka_{arm_mode}_{len(contract['camera_names'])}view"

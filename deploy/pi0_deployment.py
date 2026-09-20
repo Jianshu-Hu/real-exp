@@ -31,6 +31,13 @@ PI0_HORIZON = 50
 PI0_DEFAULT_ACTIONS_PER_CHUNK = 8
 
 PI0_CHECKPOINT_PROFILES: dict[str, dict[str, Any]] = {
+    "memory_0919-press-button-franka-left-2view-v1": {
+        "train_config": "pi0_base_franka_left_press_button_260919_anchor_adaln_bz32_h50_30k",
+        "arm_mode": "left",
+        "camera_names": ["cam_front", "cam_left"],
+        "prompt": "press the button three times",
+        "fps": 15.0,
+    },
     "memory_260915-franka-left-2view-v1": {
         "train_config": PI0_TRAIN_CONFIG,
         "arm_mode": "left",

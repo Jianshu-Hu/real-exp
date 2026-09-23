@@ -18,6 +18,9 @@ PI0_TRAIN_CONFIG = "pi0_base_franka_left_memory_260915_anchor_adaln_h50_30k_v1"
 PI0_PRESS_BUTTON_TRAIN_CONFIG = (
     "pi0_base_franka_press_button_260917_anchor_adaln_bz32_h50_30k"
 )
+PI0_PRESS_BUTTON_DEDUP_TRAIN_CONFIG = (
+    "pi0_base_franka_press_button_260917_dedup_anchor_adaln_bz32_h50_30k"
+)
 PI0_PRESS_BUTTON_DEDUP_PROMPT = (
     "Press the left button three times, then press the right button once"
 )
@@ -31,6 +34,25 @@ PI0_HORIZON = 50
 PI0_DEFAULT_ACTIONS_PER_CHUNK = 8
 
 PI0_CHECKPOINT_PROFILES: dict[str, dict[str, Any]] = {
+    "memory_0922-putback-block-franka-left-2view-v1": {
+        "train_config": "pi0_base_franka_left_putback_block_260922_anchor_adaln_bz32_h50_30k",
+        "arm_mode": "left",
+        "camera_names": ["cam_front", "cam_left"],
+        "prompt": (
+            "Move the block from the left or right side to the center, "
+            "then return it to its original position."
+        ),
+        "fps": 15.0,
+        "gripper_state_clamp_zero": True,
+    },
+    "memory_0922-swap-block-franka-left-2view-v1": {
+        "train_config": "pi0_base_franka_left_swap_block_260922_anchor_adaln_bz32_h50_30k",
+        "arm_mode": "left",
+        "camera_names": ["cam_front", "cam_left"],
+        "prompt": "Swap the left and right blocks by moving them through the center.",
+        "fps": 15.0,
+        "gripper_state_clamp_zero": True,
+    },
     "memory_0919-press-button-franka-left-2view-v1": {
         "train_config": "pi0_base_franka_left_press_button_260919_anchor_adaln_bz32_h50_30k",
         "arm_mode": "left",
@@ -59,15 +81,11 @@ PI0_CHECKPOINT_PROFILES: dict[str, dict[str, Any]] = {
         "prompt": "Press the button.",
     },
     "press_button-memory-260917-franka-3view-dedup-v1": {
-        # Deduplication changes the dataset asset ID, not the model architecture.
-        # No separate RMBench config is registered for this asset; reconstruct the
-        # model from the checkpoint's saved history_config.json instead.
-        "train_config": "auto",
+        "train_config": PI0_PRESS_BUTTON_DEDUP_TRAIN_CONFIG,
         "arm_mode": "duo",
         "camera_names": ["cam_front", "cam_left", "cam_right"],
         "prompt": PI0_PRESS_BUTTON_DEDUP_PROMPT,
-        # The deduplicated dataset and recorded camera streams remain 15 Hz.
-        "fps": PI0_FPS,
+        "fps": 5.0,
     },
 }
 
@@ -269,6 +287,8 @@ def load_pi0_deployment_contract(checkpoint: Path | str) -> dict[str, Any]:
     contract["checkpoint_profile"] = (
         f"franka_{arm_mode}_{len(contract['camera_names'])}view"
     )
+    if profile is not None and profile.get("gripper_state_clamp_zero", False):
+        contract["gripper_state_clamp_zero"] = True
     return contract
 
 

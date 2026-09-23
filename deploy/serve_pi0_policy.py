@@ -192,6 +192,11 @@ class ValidatedPi0Policy:
             raise ValueError(
                 f"Pi0 state must be finite with shape ({state_dim},), got {state.shape}."
             )
+        if self.metadata.get("gripper_state_clamp_zero", False):
+            # Match the September 22 exports before normalization/history input.
+            state = state.copy()
+            state[7::8] = np.maximum(state[7::8], 0.0)
+        observation["state"] = state
         images = observation.get("images")
         if not isinstance(images, dict):
             raise ValueError("Pi0 observation must contain an images mapping.")

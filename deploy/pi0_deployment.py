@@ -53,6 +53,17 @@ PI0_CHECKPOINT_PROFILES: dict[str, dict[str, Any]] = {
         "fps": 15.0,
         "gripper_state_clamp_zero": True,
     },
+    "memory_0923-putback-block-franka-right-2view-v1": {
+        "train_config": "pi0_base_franka_right_putback_block_260923_anchor_adaln_bz32_h50_30k",
+        "arm_mode": "right",
+        "camera_names": ["cam_front", "cam_right"],
+        "prompt": (
+            "Move the block from the left or right side to the center, "
+            "then return it to its original position."
+        ),
+        "fps": 15.0,
+        "gripper_state_clamp_zero": True,
+    },
     "memory_0919-press-button-franka-left-2view-v1": {
         "train_config": "pi0_base_franka_left_press_button_260919_anchor_adaln_bz32_h50_30k",
         "arm_mode": "left",

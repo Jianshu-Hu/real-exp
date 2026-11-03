@@ -19,3 +19,6 @@
 [submodule "libs/openpi"]
 	path = libs/openpi
 	url = http://github.com/Jianshu-Hu/openpi
+[submodule "PneumaticSystem"]
+	path = PneumaticSystem
+	url = git@github.com:Jianshu-Hu/PneumaticSystem.git

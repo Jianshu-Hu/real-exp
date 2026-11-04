@@ -54,6 +54,11 @@ CARTESIAN_MIN_SEGMENT_DURATION_S = 0.05
 IK_POSITION_TOLERANCE_M = 5e-3
 IK_ORIENTATION_TOLERANCE_RAD = 3e-3
 IK_MAX_FUNCTION_EVALUATIONS = 1200
+# Dimensionless Jacobian after scaling linear velocity by a 0.4 m length.
+# Application guardrails, not Franka Desk's unpublished warning thresholds.
+JACOBIAN_CHARACTERISTIC_LENGTH_M = 0.4
+JACOBIAN_MAX_CONDITION = 40.0
+JACOBIAN_CHECK_STEP_RAD = 0.01
 END_EFFECTOR_MOVE_TIMEOUT_S = 30.0
 
 # Match JointReferenceGenerator's operational envelope in the ROS controller.
@@ -94,6 +99,57 @@ class IkResult:
 
 class IkSolveError(RuntimeError):
     """A bounded IK solve failed, before any trajectory was sent."""
+
+
+class SingularityProximityError(RuntimeError):
+    """A path exceeds the application's Jacobian conditioning guardrail."""
+
+
+def joint_conditioning(q, flange_to_ee, *, kinematics=None):
+    """Check full-arm and fixed-joint-3 Cartesian dexterity separately.
+
+    The fixed-joint-3 metric is diagnostic only; this arm does not hold that
+    joint fixed. Neither metric reproduces Franka Desk's diagnostics.
+    """
+    if kinematics is None:
+        from utils.fr3_kinematics import Fr3ForwardKinematics
+        kinematics = Fr3ForwardKinematics()
+    jacobian = kinematics.geometric_jacobian(q, flange_to_ee).copy()
+    if jacobian.shape != (6, 7) or not np.isfinite(jacobian).all():
+        raise ValueError("Expected a finite 6x7 EE Jacobian")
+    jacobian[:3] /= JACOBIAN_CHARACTERISTIC_LENGTH_M
+    elbow = np.delete(jacobian, 2, axis=1)
+    return {"full_condition": float(np.linalg.cond(jacobian)),
+            "elbow_condition": float(np.linalg.cond(elbow)),
+            "elbow_branch": float(np.linalg.slogdet(elbow)[0])}
+
+
+def check_trajectory_conditioning(side, trajectory, flange_to_ee, *, kinematics=None):
+    """Reject ill-conditioned states, including between controller waypoints."""
+    if kinematics is None:
+        from utils.fr3_kinematics import Fr3ForwardKinematics
+        kinematics = Fr3ForwardKinematics()
+    path = [trajectory_joint_positions(side, trajectory, index)
+            for index in range(len(trajectory.points))]
+    if not path or not np.isfinite(path).all():
+        raise ValueError("Conditioning check requires a finite nonempty joint path")
+    worst = dict(full_condition=0., elbow_condition=0.)
+    for edge in range(max(1, len(path) - 1)):
+        start, end = path[edge], path[min(edge + 1, len(path) - 1)]
+        count = max(1, int(np.ceil(np.max(np.abs(end - start)) / JACOBIAN_CHECK_STEP_RAD)))
+        for fraction in np.linspace(0., 1., count + 1):
+            q = start + fraction * (end - start)
+            metrics = joint_conditioning(q, flange_to_ee, kinematics=kinematics)
+            for name in worst:
+                worst[name] = max(worst[name], metrics[name])
+            if metrics["full_condition"] > JACOBIAN_MAX_CONDITION:
+                raise SingularityProximityError(
+                    f"[{side}] singularity guard rejected edge {edge}: "
+                    f"full condition={metrics['full_condition']:.1f}, "
+                    f"fixed-joint-3 condition={metrics['elbow_condition']:.1f} "
+                    f"(full-arm limit {JACOBIAN_MAX_CONDITION:g}). "
+                    "No trajectory was executed; try another plan or initial posture.")
+    return worst
 
 
 @dataclass(frozen=True)
@@ -804,6 +860,41 @@ def prepare_joint_transit(
     time_parameterize_cartesian_trajectory(side, trajectory)
 
 
+def plan_conditioned_joint_transit(
+    rclpy, node, side, target_pose, flange_to_ee, start_q, target_q, message_types,
+    *, attempts=3,
+):
+    """Retry plan-only OMPL paths; accept only a well-conditioned route."""
+    from utils.fr3_kinematics import Fr3ForwardKinematics
+
+    kinematics = Fr3ForwardKinematics()
+    start = joint_conditioning(start_q, flange_to_ee, kinematics=kinematics)
+    goal = joint_conditioning(target_q, flange_to_ee, kinematics=kinematics)
+    if max(start["full_condition"], goal["full_condition"]) > JACOBIAN_MAX_CONDITION:
+        raise SingularityProximityError(
+            f"[{side}] initial/approach endpoint condition exceeds "
+            f"{JACOBIAN_MAX_CONDITION:g}. Re-teach the initial joints on a "
+            "better-conditioned grasp branch. "
+            "No transit was executed.")
+    started = time.monotonic()
+    last_error = None
+    for attempt in range(attempts):
+        trajectory, _ = plan_moveit_trajectory(
+            rclpy, node, side, target_pose, flange_to_ee, start_q, message_types,
+            target_q=target_q)
+        prepare_joint_transit(rclpy, node, side, trajectory, start_q, target_q, message_types)
+        try:
+            check_trajectory_conditioning(side, trajectory, flange_to_ee, kinematics=kinematics)
+        except SingularityProximityError as exc:
+            last_error = exc
+            print(f"[{side}] rejecting near-singular transit {attempt + 1}/{attempts}: {exc}",
+                  flush=True)
+            continue
+        return trajectory, time.monotonic() - started
+    raise SingularityProximityError(
+        f"[{side}] no acceptable transit after {attempts} plans: {last_error}")
+
+
 def plan_fr3_trajectory(
     rclpy: Any, node: Any, side: str, start_pose: np.ndarray,
     target_pose: np.ndarray, flange_to_ee: np.ndarray, start_q: np.ndarray,
@@ -840,11 +931,9 @@ def plan_fr3_trajectory(
         start_q, target_pose, flange_to_ee, model, frame_id,
         try_alternative_seeds=True, position_lower_rad=lower, position_upper_rad=upper,
     )
-    trajectory, _ = plan_moveit_trajectory(
-        rclpy, node, side, target_pose, flange_to_ee, start_q, message_types,
-        target_q=reference.q,
+    trajectory, _ = plan_conditioned_joint_transit(
+        rclpy, node, side, target_pose, flange_to_ee, start_q, reference.q, message_types,
     )
-    prepare_joint_transit(rclpy, node, side, trajectory, start_q, reference.q, message_types)
     return trajectory, time.monotonic() - started, reference.q, False
 
 
@@ -869,6 +958,7 @@ def audit_trajectory(
     require_cartesian: bool = True,
 ) -> TrajectoryAudit:
     """Reject joint jumps and any unexpected departure from the requested EE line."""
+    conditioning = check_trajectory_conditioning(side, trajectory, flange_to_ee)
     model, frame_id = build_fr3_model()
     joint_path = np.stack(
         [
@@ -954,6 +1044,9 @@ def audit_trajectory(
         )
     if problems:
         raise RuntimeError(f"[{side}] unsafe trajectory rejected: " + "; ".join(problems))
+    print(f"{side} path Jacobian condition: {conditioning['full_condition']:.1f} "
+          f"(guard {JACOBIAN_MAX_CONDITION:.0f}); "
+          f"fixed-joint-3 diagnostic={conditioning['elbow_condition']:.1f}", flush=True)
     return TrajectoryAudit(
         max_joint_change_rad=max_joint_change,
         allowed_joint_change_rad=allowed_joint_change,

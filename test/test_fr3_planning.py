@@ -1,6 +1,8 @@
 """Offline regression coverage for grasp IK and bounded transit fallback."""
 
 from types import SimpleNamespace
+import json
+from pathlib import Path
 import sys
 
 import numpy as np
@@ -53,6 +55,33 @@ def test_reachable_local_ik_skips_alternative_search(monkeypatch):
     monkeypatch.setattr(scipy.optimize, "least_squares", solve)
     move.solve_fr3_ik(q, fk.flange_pose(q), np.eye(4), kinematics=fk)
     assert len(calls) == 1
+
+
+def test_jacobian_guard_rejects_recorded_singular_transition_and_accepts_alternate_posture():
+    from types import SimpleNamespace
+
+    fk = Fr3ForwardKinematics(backend="numpy")
+    config = json.loads(
+        (Path(__file__).parents[1] / "PneumaticSystem/softhand_grasp/client_config.json").read_text())
+    tool = np.asarray(config["initial_pose_source"]["flange_T_ee"])
+    original = np.asarray(config["initial_joint_positions_rad"])
+    logged_approach = np.asarray(
+        [0.746377, 0.651597, -0.779955, -2.472413, 0.321654, 4.041389, -2.788165])
+    points = [SimpleNamespace(positions=q.tolist()) for q in (original, logged_approach)]
+    trajectory = SimpleNamespace(
+        joint_names=[f"right_{name}" for name in move.JOINT_NAMES], points=points)
+    with pytest.raises(move.SingularityProximityError, match="fixed-joint-3 condition"):
+        move.check_trajectory_conditioning("right", trajectory, tool, kinematics=fk)
+
+    alternate = np.asarray(
+        [0.845362, 0.871579, -1.753391, -1.428259, -1.485453, 3.812796, -0.721804])
+    alternate_approach = np.asarray(
+        [1.172100, 1.482309, -1.484100, -2.471969, -0.323719, 4.042277, -1.489976])
+    points = [SimpleNamespace(positions=q.tolist()) for q in (alternate, alternate_approach)]
+    trajectory.points = points
+    result = move.check_trajectory_conditioning("right", trajectory, tool, kinematics=fk)
+    assert result["full_condition"] < move.JACOBIAN_MAX_CONDITION
+    assert result["elbow_condition"] < move.JACOBIAN_MAX_CONDITION
 
 
 def test_transit_goal_uses_explicit_joints_and_bounded_path_constraints():
@@ -130,6 +159,7 @@ def test_ik_failure_can_use_joint_transit_only_when_allowed(monkeypatch, failure
     monkeypatch.setattr(move, "plan_deterministic_cartesian_trajectory", cartesian)
     monkeypatch.setattr(move, "plan_moveit_trajectory", transit)
     monkeypatch.setattr(move, "prepare_joint_transit", prepare)
+    monkeypatch.setattr(move, "check_trajectory_conditioning", lambda *a, **kw: None)
     args = (object(), object(), "right", np.eye(4), np.eye(4), np.eye(4), q,
             dict(GetStateValidity=object, JointConstraint=object, Constraints=object))
     with pytest.raises(move.IkSolveError):
@@ -227,6 +257,8 @@ def test_joint_transit_audit_allows_curvature_but_still_rejects_joint_jumps(monk
     )
     monkeypatch.setattr(move, "build_fr3_model", lambda: (object(), 7))
     monkeypatch.setattr(move, "forward_end_effector_pose", lambda m, f, joints, tool: fk.end_effector_pose(joints, tool))
+    monkeypatch.setattr(move, "check_trajectory_conditioning", lambda *a, **kw: {
+        "full_condition": 10., "elbow_condition": 10.})
     with pytest.raises(RuntimeError, match="deviation"):
         move.audit_trajectory("right", trajectory, target, target, np.eye(4), q)
     move.audit_trajectory("right", trajectory, target, target, np.eye(4), q, require_cartesian=False)

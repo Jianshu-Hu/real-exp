@@ -304,6 +304,29 @@ class Fr3ForwardKinematics:
             raise ValueError("F_T_EE must be a finite 4x4 transform.")
         return self.flange_pose(q) @ tool
 
+    def geometric_jacobian(self, q: Any, flange_to_ee: Any) -> np.ndarray:
+        """Base-expressed EE Jacobian, linear rows first, including tool offset."""
+        joints = np.asarray(q, dtype=float)
+        pose = self.end_effector_pose(joints, flange_to_ee)
+        if self.backend == "numpy":
+            transform = np.eye(4)
+            origins, axes = [], []
+            for origin, angle in zip(_FR3_JOINT_ORIGINS, joints, strict=True):
+                transform = transform @ origin
+                origins.append(transform[:3, 3].copy())
+                axes.append(transform[:3, 2].copy())
+                transform = transform @ _rotation_about_z(float(angle))
+            axes = np.asarray(axes)
+            return np.vstack((np.cross(axes, pose[:3, 3] - origins).T, axes.T))
+        import pinocchio as pin
+
+        jacobian = np.asarray(pin.computeFrameJacobian(
+            self.model, self.data, joints, self.frame_id,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)).copy()
+        offset = pose[:3, 3] - np.asarray(self.data.oMf[self.frame_id].translation)
+        jacobian[:3] += np.cross(jacobian[3:].T, offset).T
+        return jacobian
+
 
 def infer_flange_to_ee(
     kinematics: Fr3ForwardKinematics,

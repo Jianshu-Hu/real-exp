@@ -10,19 +10,25 @@ This repository groups the code and notes used for real-world Franka FR3 experim
 - `utils/`: shared dataset-statistics and image-preprocessing helpers.
 - `lerobot/`: vendored LeRobot codebase used by the local collection and training workflow.
 - `gello_software/`: GELLO and ROS 2 integration code, tracked as a git submodule.
+- [`PneumaticSystem/softhand_grasp/`](PneumaticSystem/softhand_grasp/README.md): pneumatic soft-hand grasp client/server and launchers, inside the `PneumaticSystem` submodule.
 - `libs/hand-tracking-streamer/`: upstream Meta Quest tracking application, tracked as a git submodule.
 - `data_collection/meta_quest/`: standalone, robot-disconnected Quest pose transport and monitor.
 - `data/`: local datasets and experiment outputs.
 
 ## Submodules
 
-The repo expects its submodules, including `lerobot/`, `gello_software/`, and
+The repo expects its submodules, including `PneumaticSystem/`, `lerobot/`, `gello_software/`, and
 `libs/hand-tracking-streamer/`, to be available locally. If a submodule is
 empty after cloning, initialize all submodules:
 
 ```bash
 git submodule update --init --recursive
 ```
+
+`PneumaticSystem` uses `main` for remote updates. To advance it to the latest
+remote revision, run `git submodule update --remote --merge PneumaticSystem`
+and commit the updated submodule pointer in this repository. Regular submodule
+initialization checks out the revision recorded by this repository.
 
 ## Environment Split
 

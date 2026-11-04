@@ -22,3 +22,4 @@
 [submodule "PneumaticSystem"]
 	path = PneumaticSystem
 	url = git@github.com:Jianshu-Hu/PneumaticSystem.git
+	branch = main

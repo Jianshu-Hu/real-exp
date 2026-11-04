@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Unified GELLO/FR3 arm, Franka-gripper, and Wuji-hand teleoperation launcher.
+# Unified GELLO/FR3 arm, Franka-gripper, Wuji-hand, and Softhand teleoperation launcher.
 
 process_start_time() {
   local process_pid="$1"
@@ -695,7 +695,7 @@ esac
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/start_teleoperation.sh --arm|--gripper|--hand --duo|--left|--right [Wuji options]
+Usage: ./scripts/start_teleoperation.sh --arm|--gripper|--hand|--softhand --duo|--left|--right [Wuji options]
 
 Arm selection:
   --duo                    Use both left and right arms.
@@ -706,6 +706,8 @@ End effector:
   --arm                    Use the arm only; no end-effector process.
   --gripper                Use the matching Franka gripper(s).
   --hand                   Use the matching Wuji glove/hand pair(s).
+  --softhand               Use the GELLO gripper to control the pneumatic Softhand.
+  --serial-port PATH       Override Softhand USB serial auto-detection.
 
 Wuji options (used only with --hand):
   --left-glove-sn SN       Left Wuji Glove serial.
@@ -720,6 +722,7 @@ Wuji options (used only with --hand):
 Examples:
   ./scripts/start_teleoperation.sh --gripper --left
   ./scripts/start_teleoperation.sh --hand --right
+  ./scripts/start_teleoperation.sh --softhand --left
   ./scripts/start_teleoperation.sh --arm --duo
   ./scripts/start_teleoperation.sh --hand --duo \
     --left-glove-sn <LEFT_SN> --right-glove-sn <RIGHT_SN> \
@@ -739,6 +742,7 @@ die() {
 
 side_mode=""
 end_effector=""
+softhand_serial_port=""
 declare -a wuji_options=()
 
 while [[ "$#" -gt 0 ]]; do
@@ -748,10 +752,16 @@ while [[ "$#" -gt 0 ]]; do
       side_mode="${1#--}"
       shift
       ;;
-    --arm|--gripper|--hand)
-      [[ -z "${end_effector}" ]] || die "choose only one of --arm, --gripper, or --hand"
+    --arm|--gripper|--hand|--softhand)
+      [[ -z "${end_effector}" ]] || die "choose only one of --arm, --gripper, --hand, or --softhand"
       end_effector="${1#--}"
       shift
+      ;;
+    --serial-port)
+      [[ "$#" -ge 2 ]] || die "--serial-port requires a path"
+      [[ -z "${softhand_serial_port}" ]] || die "--serial-port may be specified only once"
+      softhand_serial_port="$2"
+      shift 2
       ;;
     --left-glove-sn|--right-glove-sn|--left-hand-ip|--right-hand-ip|--telemetry-host|--telemetry-port)
       [[ "$#" -ge 2 ]] || die "$1 requires a value"
@@ -774,6 +784,8 @@ done
 }
 [[ "${end_effector}" == "hand" || "${#wuji_options[@]}" -eq 0 ]] || die \
   "Wuji and telemetry options are valid only with --hand"
+[[ "${end_effector}" == "softhand" || -z "${softhand_serial_port}" ]] || die \
+  "--serial-port is valid only with --softhand"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
@@ -867,6 +879,33 @@ elif [[ "${end_effector}" == "gripper" ]]; then
   start_component "FR3 arm and Franka gripper" \
     bash "${script_dir}/start_teleoperation.sh" \
     --internal-arm-stack "--${side_mode}" --gripper
+elif [[ "${end_effector}" == "softhand" ]]; then
+  [[ -r "${script_dir}/softhand_gripper_teleop.py" ]] || die \
+    "Softhand teleoperation node is missing: ${script_dir}/softhand_gripper_teleop.py"
+  [[ -r "${script_dir}/../PneumaticSystem/Service/publisher.py" ]] || die \
+    "Pneumatic publisher is missing: ${script_dir}/../PneumaticSystem/Service/publisher.py (initialize the PneumaticSystem submodule)"
+  softhand_args=("--${side_mode}")
+  [[ -z "${softhand_serial_port}" ]] || softhand_args+=(--serial-port "${softhand_serial_port}")
+  # Discover the controller before starting any robot process. This only
+  # enumerates ports; it does not open the serial device or send commands.
+  softhand_selected_port="$(/usr/bin/python3 "${script_dir}/softhand_gripper_teleop.py" \
+    "${softhand_args[@]}" --detect-port-only)" || die \
+    "Softhand serial-port selection failed; the FR3 arm was not started."
+  echo "Softhand serial port: ${softhand_selected_port}"
+  softhand_args=("--${side_mode}" --serial-port "${softhand_selected_port}")
+  start_component "FR3 arm" \
+    bash "${script_dir}/start_teleoperation.sh" \
+    --internal-arm-stack "--${side_mode}" --no-gripper
+  start_component "GELLO Softhand gripper" \
+    bash -c '
+      set -e
+      source /opt/ros/humble/setup.bash
+      source "$1"
+      teleop_script="$2"
+      shift 2
+      exec /usr/bin/python3 "${teleop_script}" "$@"
+    ' _ "${script_dir}/../gello_software/ros2/install/local_setup.bash" \
+    "${script_dir}/softhand_gripper_teleop.py" "${softhand_args[@]}"
 else
   bash "${script_dir}/start_teleoperation.sh" \
     --internal-wuji-stack "--${side_mode}" "${wuji_options[@]}" --validate-only

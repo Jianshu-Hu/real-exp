@@ -5,6 +5,8 @@ Pose values are ``x,y,z,roll,pitch,yaw`` in the Franka base frame, using meters
 and radians. The utility solves a linearly interpolated Cartesian path with
 bounded, previous-solution-seeded IK, checks every state against MoveIt's
 planning scene, and sends the resulting joint trajectory to the controller.
+An optional joint-reconfiguration fallback uses a bounded OMPL transit when
+Cartesian IK is infeasible; this transit need not follow a straight EE path.
 
 Running this program without ``--dry-run`` commands real hardware.
 """
@@ -88,6 +90,10 @@ class IkResult:
     position_error_m: float
     orientation_error_rad: float
     function_evaluations: int
+
+
+class IkSolveError(RuntimeError):
+    """A bounded IK solve failed, before any trajectory was sent."""
 
 
 @dataclass(frozen=True)
@@ -186,6 +192,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Validate targets and print current/target hardware state without commanding motion.",
+    )
+    parser.add_argument(
+        "--allow-joint-reconfiguration", action="store_true",
+        help="Allow a bounded OMPL joint transit if Cartesian IK fails; EE path may curve.",
     )
     return parser
 
@@ -401,8 +411,9 @@ def build_move_group_goal(
     flange_to_ee: np.ndarray,
     message_types: dict[str, Any],
     current_q: np.ndarray | None = None,
+    target_q: np.ndarray | None = None,
 ) -> Any:
-    """Create a plan-only OMPL request for the flange pose behind an EE goal."""
+    """Create a plan-only OMPL pose request or an explicit bounded joint goal."""
     MoveGroup = message_types["MoveGroup"]
     Constraints = message_types["Constraints"]
     OrientationConstraint = message_types["OrientationConstraint"]
@@ -453,6 +464,32 @@ def build_move_group_goal(
     goal.request.max_velocity_scaling_factor = MOVEIT_VELOCITY_SCALING
     goal.request.max_acceleration_scaling_factor = MOVEIT_ACCELERATION_SCALING
     goal.request.goal_constraints = [constraints]
+    if target_q is not None:
+        # Explicit verified joint goals avoid asking MoveIt's pose sampler to
+        # rediscover the same failed IK branch. Bound transit travel as well.
+        if current_q is None:
+            raise ValueError("A joint planning goal requires the measured start state")
+        lower, upper = cartesian_joint_corridor(current_q, target_q)
+        joint_goal = Constraints()
+        joint_goal.name = "verified_ik_joint_goal"
+        corridor = Constraints()
+        corridor.name = "bounded_joint_transit"
+        for index, name in enumerate(JOINT_NAMES):
+            joint = message_types["JointConstraint"]()
+            joint.joint_name = f"{side}_{name}"
+            joint.position = float(target_q[index])
+            joint.tolerance_above = joint.tolerance_below = 1e-4
+            joint.weight = 1.0
+            joint_goal.joint_constraints.append(joint)
+            bound = message_types["JointConstraint"]()
+            bound.joint_name = joint.joint_name
+            bound.position = float((lower[index] + upper[index]) / 2)
+            bound.tolerance_below = float(bound.position - lower[index])
+            bound.tolerance_above = float(upper[index] - bound.position)
+            bound.weight = 1.0
+            corridor.joint_constraints.append(bound)
+        goal.request.goal_constraints = [joint_goal]
+        goal.request.path_constraints = corridor
     if current_q is not None:
         measured_q = np.asarray(current_q, dtype=float)
         if measured_q.shape != (7,) or not np.all(np.isfinite(measured_q)):
@@ -497,6 +534,8 @@ def plan_moveit_trajectory(
     flange_to_ee: np.ndarray,
     current_q: np.ndarray,
     message_types: dict[str, Any],
+    *,
+    target_q: np.ndarray | None = None,
 ) -> tuple[Any, float]:
     """Request a collision-checked, time-parameterized joint trajectory."""
     from rclpy.action import ActionClient
@@ -507,7 +546,8 @@ def plan_moveit_trajectory(
     if not client.wait_for_server(timeout_sec=MOVEIT_SERVER_TIMEOUT_S):
         raise TimeoutError(f"MoveIt action server is unavailable: {action_name}")
     goal = build_move_group_goal(
-        side, target_ee_pose, flange_to_ee, message_types, current_q=current_q
+        side, target_ee_pose, flange_to_ee, message_types, current_q=current_q,
+        target_q=target_q,
     )
     goal_handle = spin_until_future(
         rclpy,
@@ -612,7 +652,7 @@ def check_moveit_state_validity(
             f"{item.contact_body_1}/{item.contact_body_2}" for item in response.contacts[:3]
         )
         raise RuntimeError(
-            f"[{side}] deterministic Cartesian IK produced a state invalid in the "
+            f"[{side}] planned joint state is invalid in the "
             f"MoveIt planning scene{': ' + contacts if contacts else ''}"
         )
 
@@ -686,7 +726,7 @@ def plan_deterministic_cartesian_trajectory(
             corridor_upper, q + CARTESIAN_REVOLUTE_JUMP_THRESHOLD_RAD
         )
         if np.any(step_lower >= step_upper):
-            raise RuntimeError(
+            raise IkSolveError(
                 f"[{side}] deterministic Cartesian IK stopped at waypoint "
                 f"{waypoint_index}/{len(waypoints)}: no non-empty per-step joint "
                 "bounds remain inside the solve-time corridor"
@@ -703,8 +743,8 @@ def plan_deterministic_cartesian_trajectory(
                 position_lower_rad=step_lower,
                 position_upper_rad=step_upper,
             )
-        except RuntimeError as exc:
-            raise RuntimeError(
+        except IkSolveError as exc:
+            raise IkSolveError(
                 f"[{side}] deterministic Cartesian IK stopped at waypoint "
                 f"{waypoint_index}/{len(waypoints)} inside the solve-time joint "
                 f"corridor: {exc}"
@@ -726,6 +766,88 @@ def trajectory_duration_s(trajectory: Any) -> float:
     return float(duration.sec) + 1e-9 * float(duration.nanosec)
 
 
+def prepare_joint_transit(
+    rclpy: Any, node: Any, side: str, trajectory: Any,
+    current_q: np.ndarray, target_q: np.ndarray, message_types: dict[str, Any],
+) -> None:
+    """Resample and independently collision-check an OMPL joint path."""
+    from trajectory_msgs.msg import JointTrajectoryPoint
+
+    path = [trajectory_joint_positions(side, trajectory, index)
+            for index in range(len(trajectory.points))]
+    if not path or not np.all(np.isfinite(path)):
+        raise RuntimeError("MoveIt returned an empty or nonfinite joint path")
+    if np.max(np.abs(path[0] - current_q)) > 0.03:
+        raise RuntimeError("MoveIt joint path does not start at the measured state")
+    lower, upper = cartesian_joint_corridor(current_q, target_q)
+    points = [JointTrajectoryPoint(positions=path[0].tolist())]
+    for start, end in zip(path, path[1:]):
+        count = max(1, int(np.ceil(np.max(np.abs(end - start)) / 0.05)))
+        for index in range(1, count + 1):
+            q = start + (end - start) * index / count
+            points.append(JointTrajectoryPoint(positions=q.tolist()))
+    constraints = message_types["Constraints"]()
+    client = node.create_client(message_types["GetStateValidity"], f"/{side}/check_state_validity")
+    try:
+        if not client.wait_for_service(timeout_sec=MOVEIT_SERVER_TIMEOUT_S):
+            raise TimeoutError("MoveIt state-validity service is unavailable for joint transit")
+        for point in points:
+            q = np.asarray(point.positions)
+            if np.any(q < lower - 1e-6) or np.any(q > upper + 1e-6):
+                raise RuntimeError("MoveIt joint transit escaped the permitted joint corridor")
+            check_moveit_state_validity(rclpy, node, side, q, client, constraints)
+    finally:
+        node.destroy_client(client)
+    # Use the same positions-only controller interpolation and timing envelope
+    # as Cartesian moves, including when the caller applies its speed scale.
+    trajectory.points = points
+    time_parameterize_cartesian_trajectory(side, trajectory)
+
+
+def plan_fr3_trajectory(
+    rclpy: Any, node: Any, side: str, start_pose: np.ndarray,
+    target_pose: np.ndarray, flange_to_ee: np.ndarray, start_q: np.ndarray,
+    message_types: dict[str, Any], *, allow_joint_reconfiguration: bool = False,
+    model: Any | None = None, frame_id: int | None = None,
+) -> tuple[Any, float, np.ndarray, bool]:
+    """Prefer Cartesian motion; optionally route around an IK branch failure.
+
+    Only IK infeasibility enables fallback. Scene/collision failures propagate.
+    The bool result identifies whether the returned path is Cartesian.
+    """
+    started = time.monotonic()
+    if model is None or frame_id is None:
+        model, frame_id = build_fr3_model()
+    lower = np.maximum(ARM_POSITION_LOWER_RAD, start_q - CARTESIAN_REFERENCE_MAX_JOINT_CHANGE_RAD)
+    upper = np.minimum(ARM_POSITION_UPPER_RAD, start_q + CARTESIAN_REFERENCE_MAX_JOINT_CHANGE_RAD)
+    try:
+        reference = solve_fr3_ik(
+            start_q, target_pose, flange_to_ee, model, frame_id,
+            try_alternative_seeds=False, position_lower_rad=lower, position_upper_rad=upper,
+        )
+        trajectory, _, _ = plan_deterministic_cartesian_trajectory(
+            rclpy, node, side, start_pose, target_pose, flange_to_ee, start_q,
+            reference.q, message_types["GetStateValidity"], message_types["JointConstraint"],
+            message_types["Constraints"],
+        )
+        return trajectory, time.monotonic() - started, reference.q, True
+    except IkSolveError as exc:
+        if not allow_joint_reconfiguration:
+            raise
+        print(f"[{side}] Cartesian IK unavailable: {exc}", flush=True)
+        print(f"[{side}] Planning a bounded OMPL joint transit; EE motion may curve.", flush=True)
+    reference = solve_fr3_ik(
+        start_q, target_pose, flange_to_ee, model, frame_id,
+        try_alternative_seeds=True, position_lower_rad=lower, position_upper_rad=upper,
+    )
+    trajectory, _ = plan_moveit_trajectory(
+        rclpy, node, side, target_pose, flange_to_ee, start_q, message_types,
+        target_q=reference.q,
+    )
+    prepare_joint_transit(rclpy, node, side, trajectory, start_q, reference.q, message_types)
+    return trajectory, time.monotonic() - started, reference.q, False
+
+
 def trajectory_joint_positions(side: str, trajectory: Any, point_index: int) -> np.ndarray:
     """Return one trajectory point in canonical FR3 joint order."""
     positions_by_name = dict(
@@ -743,6 +865,8 @@ def audit_trajectory(
     target_pose: np.ndarray,
     flange_to_ee: np.ndarray,
     reference_final_q: np.ndarray,
+    *,
+    require_cartesian: bool = True,
 ) -> TrajectoryAudit:
     """Reject joint jumps and any unexpected departure from the requested EE line."""
     model, frame_id = build_fr3_model()
@@ -752,6 +876,8 @@ def audit_trajectory(
             for index in range(len(trajectory.points))
         ]
     )
+    if joint_path.shape[1:] != (7,) or not np.all(np.isfinite(joint_path)):
+        raise RuntimeError(f"[{side}] unsafe trajectory rejected: nonfinite or malformed joints")
     joint_steps = np.abs(np.diff(joint_path, axis=0))
     max_joint_step = float(np.max(joint_steps)) if joint_steps.size else 0.0
     joint_change = np.abs(joint_path - joint_path[0])
@@ -815,12 +941,12 @@ def audit_trajectory(
         joint_path > corridor_upper + 1e-6
     ):
         problems.append("one or more states escaped the solve-time joint corridor")
-    if max_line_deviation > CARTESIAN_MAX_LINE_DEVIATION_M:
+    if require_cartesian and max_line_deviation > CARTESIAN_MAX_LINE_DEVIATION_M:
         problems.append(
             f"EE line deviation {max_line_deviation:.4f} m exceeds "
             f"{CARTESIAN_MAX_LINE_DEVIATION_M:.4f} m"
         )
-    if max_orientation_deviation > CARTESIAN_MAX_ORIENTATION_DEVIATION_RAD:
+    if require_cartesian and max_orientation_deviation > CARTESIAN_MAX_ORIENTATION_DEVIATION_RAD:
         problems.append(
             f"EE orientation interpolation deviation "
             f"{max_orientation_deviation:.3f} rad exceeds "
@@ -875,10 +1001,12 @@ def print_trajectory_summary(
     trajectory: Any,
     planning_time_s: float,
     audit: TrajectoryAudit,
+    *,
+    cartesian: bool = True,
 ) -> None:
     final = trajectory.points[-1]
     print(
-        f"{side} deterministic collision-checked Cartesian plan: "
+        f"{side} collision-checked {'Cartesian' if cartesian else 'OMPL joint transit'} plan: "
         f"{len(trajectory.points)} points, "
         f"duration={trajectory_duration_s(trajectory):.3f} s, "
         f"planning_time={planning_time_s:.3f} s",
@@ -1145,7 +1273,8 @@ def solve_fr3_ik(
 
     candidate_seeds = [seed]
     if try_alternative_seeds:
-        for joint, delta in ((6, 0.45), (6, -0.45), (2, 0.30), (2, -0.30)):
+        for joint, delta in ((6, 0.45), (6, -0.45), (2, 0.30), (2, -0.30),
+                             (4, 1.0), (4, -1.0), (1, 0.60), (1, -0.60)):
             candidate = seed.copy()
             candidate[joint] = np.clip(
                 candidate[joint] + delta,
@@ -1153,6 +1282,10 @@ def solve_fr3_ik(
                 upper[joint] - 1e-6,
             )
             candidate_seeds.append(candidate)
+        for wrist_delta in (1.0, -1.0):
+            candidate = seed.copy()
+            candidate[4:6] += wrist_delta
+            candidate_seeds.append(np.clip(candidate, lower + 1e-6, upper - 1e-6))
 
     results: list[IkResult] = []
     total_evaluations = 0
@@ -1179,6 +1312,12 @@ def solve_fr3_ik(
                 function_evaluations=int(solution.nfev),
             )
         )
+        # Most Cartesian waypoints are already on a reachable local branch.
+        # Avoid exploring redundant solutions when the live seed succeeds.
+        if (len(results) == 1
+                and position_error <= IK_POSITION_TOLERANCE_M
+                and orientation_error <= IK_ORIENTATION_TOLERANCE_RAD):
+            return results[0]
 
     valid = [
         result
@@ -1188,13 +1327,18 @@ def solve_fr3_ik(
     ]
     if not valid:
         best = min(results, key=lambda item: item.position_error_m + item.orientation_error_rad)
-        raise RuntimeError(
+        raise IkSolveError(
             "No FR3 IK solution satisfies the verified pose tolerance: "
             f"best position error={best.position_error_m:.6f} m, "
             f"orientation error={best.orientation_error_rad:.6f} rad after "
             f"{total_evaluations} function evaluations. No arm command was published."
         )
-    return min(valid, key=lambda item: float(np.linalg.norm(item.q - seed)))
+    # When changing IK branches, avoid choosing a slightly nearer endpoint
+    # sitting on an operational joint limit if an interior solution exists.
+    interior = [result for result in valid
+                if np.all(result.q >= ARM_POSITION_LOWER_RAD + 0.05)
+                and np.all(result.q <= ARM_POSITION_UPPER_RAD - 0.05)]
+    return min(interior or valid, key=lambda item: float(np.linalg.norm(item.q - seed)))
 
 
 def move_gripper(robot_ip: str, side: str, target_width: float) -> None:
@@ -1438,7 +1582,10 @@ def main() -> None:
         from franka_msgs.msg import FrankaRobotState
         from geometry_msgs.msg import Pose
         from moveit_msgs.msg import Constraints, JointConstraint
+        from moveit_msgs.msg import OrientationConstraint, PositionConstraint
+        from moveit_msgs.action import MoveGroup
         from moveit_msgs.srv import GetStateValidity
+        from shape_msgs.msg import SolidPrimitive
         from rclpy.node import Node
         from sensor_msgs.msg import JointState
     except ModuleNotFoundError as exc:
@@ -1474,26 +1621,12 @@ def main() -> None:
             start_pose = np.asarray(start_pose, dtype=float).copy()
             start_q = np.asarray(start_q, dtype=float).copy()
             flange_to_ee = np.asarray(flange_to_ee, dtype=float).copy()
-            ik_model, ik_frame_id = build_fr3_model()
-            reference_lower = np.maximum(
-                ARM_POSITION_LOWER_RAD,
-                start_q - CARTESIAN_REFERENCE_MAX_JOINT_CHANGE_RAD,
+            message_types = dict(
+                MoveGroup=MoveGroup, Constraints=Constraints, JointConstraint=JointConstraint,
+                OrientationConstraint=OrientationConstraint, PositionConstraint=PositionConstraint,
+                Pose=Pose, SolidPrimitive=SolidPrimitive, GetStateValidity=GetStateValidity,
             )
-            reference_upper = np.minimum(
-                ARM_POSITION_UPPER_RAD,
-                start_q + CARTESIAN_REFERENCE_MAX_JOINT_CHANGE_RAD,
-            )
-            reference_ik = solve_fr3_ik(
-                start_q,
-                target_matrix,
-                flange_to_ee,
-                ik_model,
-                ik_frame_id,
-                try_alternative_seeds=False,
-                position_lower_rad=reference_lower,
-                position_upper_rad=reference_upper,
-            )
-            trajectory, planning_time, _ = plan_deterministic_cartesian_trajectory(
+            trajectory, planning_time, reference_q, cartesian = plan_fr3_trajectory(
                 rclpy,
                 node,
                 target.side,
@@ -1501,10 +1634,8 @@ def main() -> None:
                 target_matrix,
                 flange_to_ee,
                 start_q,
-                reference_ik.q,
-                GetStateValidity,
-                JointConstraint,
-                Constraints,
+                message_types,
+                allow_joint_reconfiguration=args.allow_joint_reconfiguration,
             )
             audit = audit_trajectory(
                 target.side,
@@ -1512,9 +1643,10 @@ def main() -> None:
                 start_pose,
                 target_matrix,
                 flange_to_ee,
-                reference_ik.q,
+                reference_q,
+                require_cartesian=cartesian,
             )
-            print_trajectory_summary(target.side, trajectory, planning_time, audit)
+            print_trajectory_summary(target.side, trajectory, planning_time, audit, cartesian=cartesian)
             planned_final_q = verify_planned_endpoint(
                 target.side,
                 trajectory,
@@ -1525,8 +1657,8 @@ def main() -> None:
 
         trajectory, planned_final_q = plan_from_live_state()
         print(
-            "The Cartesian plan was checked against the MoveIt self-collision model, the "
-            "current planning scene, joint-jump limits, and the requested EE interpolation. "
+            "The plan was checked against the MoveIt self-collision model, the "
+            "current planning scene and joint-motion limits. "
             "Confirm that the scene contains every real obstacle before moving."
         )
         if args.dry_run:

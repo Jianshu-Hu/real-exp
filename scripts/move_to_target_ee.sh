@@ -22,6 +22,8 @@ Options:
   --left-hand-ip ADDR  Left Wuji Hand 2 SDK address (or WUJI_LEFT_HAND_IP).
   --right-hand-ip ADDR Right Wuji Hand 2 SDK address (or WUJI_RIGHT_HAND_IP).
   --dry-run            Plan and preview the motion, but do not execute it.
+  --allow-joint-reconfiguration
+                       Allow OMPL joint transit when Cartesian IK fails.
   --help               Show this help.
 
 Examples:
@@ -38,6 +40,10 @@ during bounded, previous-solution-seeded Cartesian IK relative to the live
 configuration. Every generated state is checked against MoveIt's planning scene,
 then independently audited afterward. It previews the plan and requires explicit
 y/yes confirmation before FollowJointTrajectory execution.
+
+With --allow-joint-reconfiguration, an IK failure can instead use a bounded,
+collision-checked OMPL joint path to another verified IK solution. The EE path
+may curve. Collision-check failures never enable this fallback.
 
 Measured execution succeeds within 20 mm and 0.08 rad. If the first execution
 does not reach that tolerance, the utility replans once from the measured

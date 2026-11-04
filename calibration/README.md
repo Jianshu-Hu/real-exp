@@ -1,469 +1,143 @@
-# Calibration Data Collection
+# Camera and robot calibration
 
-## D435i + L515 pair calibration for grasp fusion
+Calibrate the front D435i and both wrist D405 cameras against the **same fixed
+95 mm tag36h11 AprilTag, ID 0**. Run commands from the repository root.
 
-The RealSense devices already contain factory-calibrated intrinsics and
-depth-to-color extrinsics. The calibration needed for two-camera point-cloud
-fusion is the rigid transform between the installed D435i and L515. Re-run
-this calibration whenever either camera mount moves.
+`A_T_B` maps coordinates from B into A, with translation in metres. World W
+is centred on the tag with +X forward, +Y left, +Z up. The physical tag axes
+are different; the scripts save their relationship as `world_T_tag`.
+Camera coordinates are color optical frames (+X right, +Y down, +Z forward).
 
-Keep both cameras mounted in their final grasping positions. Place the same
-flat AprilTag where both color cameras see it clearly. The tag may be tilted
-or raised and does not need to be at the robot world origin, but the tag and
-both cameras must remain completely fixed throughout both captures. Use a
-large rigidly backed tag, measure its black-square side length accurately, and
-avoid a nearly edge-on view.
+## 1. Prepare the camera computer
 
-The complete capture, detection, solve, and matrix-composition workflow can be
-run with one command. The defaults below select this installation's D435i and
-L515 and its 95 mm tag36h11 marker, ID 0:
+Keep the tag and camera mounts fixed throughout calibration. Stop other camera
+applications, including `start_data_collection_server.sh`; the calibration
+scripts open the cameras directly. Both computers need synchronized system
+clocks and the same ROS domain.
 
 ```bash
-python calibration/run_realsense_pair_calibration.py
+source /opt/ros/jazzy/setup.bash
+source /home/pair1/franka_ros2_ws/install/local_setup.bash
+source gello_software/ros2/install/local_setup.bash
+export ROS_DOMAIN_ID=0
+export ROS_LOCALHOST_ONLY=0
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+
+calib_run="calibration/runs/calibration_$(date +%Y%m%d_%H%M%S)"
 ```
 
-Use `--tag-size-m`, `--tag-family`, `--tag-id`, `--d435i-serial`, and
-`--l515-serial` when the hardware differs. Every run receives a timestamped
-output name under `calibration/runs`; existing evidence is never overwritten.
-The script stops on insufficient detections, inconsistent Tag conventions,
-invalid transforms, or median reprojection RMSE above 0.5 px. On success it
-saves `d435i_T_l515_<timestamp>.json` and prints `CALIBRATED_L515_SERIAL` and
-`CALIBRATED_D435I_T_L515` as a copyable Python snippet. It intentionally does
-not edit `calibration/matrix.md` or `grasp/inference_client.py`.
+Use this camera terminal for the remaining steps so `$calib_run` stays set.
+The installed `/usr/bin/python3` has the recording and solver dependencies.
+Use `/usr/bin/python3` even when a Conda environment is active. In a new
+terminal, set `calib_run` again to your chosen run directory before continuing.
+All captures and solver JSON files go under the ignored `calibration/runs/`.
 
-The individual commands below document and support manual execution of the
-same workflow.
+## 2. Calibrate the front D435i to world
 
-First list the devices and note the L515 serial (the D435i serial used by the
-grasp pipeline is `401622071701`):
+Make the whole tag visible in the front camera and hold everything still.
+On the camera computer:
 
 ```bash
-rs-enumerate-devices -s
+/usr/bin/python3 calibration/collect_camera_world_data.py \
+  --camera-serial 401622071701 --output "${calib_run:?Set calib_run in step 1}/front" --frames 100
+
+/usr/bin/python3 calibration/calibrate_camera_to_world.py \
+  --input "${calib_run:?Set calib_run in step 1}/front" \
+  --tag-size-m 0.095 --tag-family tag36h11 --tag-id 0
 ```
 
-The L515 is discontinued and is not exposed by the system's current
-librealsense 2.58 SDK even though `lsusb` sees it. This installation uses the
-last L500-compatible Python binding, 2.54.2, isolated from the system SDK:
+Result: `$calib_run/front/camera_to_world.json`, field `world_T_camera`.
+Check that many detections agree and median reprojection RMSE is below about
+0.5 pixels. If needed, the camera pose in the physical AprilTag frame is
+`tag_T_camera = inverse(world_T_tag) @ world_T_camera`.
+
+## 3. Record the left wrist camera and measured EE poses
+
+On the **robot-control computer**, start left-arm teleoperation:
 
 ```bash
-conda run -n pose python -m pip install \
-  --target "$PWD/.vendor/l515_realsense" \
-  pyrealsense2==2.54.2.5684
+./scripts/start_data_collection_client.sh --left --arm
 ```
 
-On this computer, that binding reports L515 serial `f1480539`, firmware
-`1.5.4.1`. It supports `1280x720@30` color and `640x480@30` depth; aligned
-depth is saved at the color resolution. Do not request native `640x480` color
-from this L515 firmware.
-
-Capture 100 frames from each device. Replace `L515_SERIAL` and use a new
-output directory name on every attempt because the collector refuses to
-overwrite calibration evidence:
+On the **camera computer**:
 
 ```bash
-PYTHONPATH="$PWD/.vendor/l515_realsense" \
-conda run --no-capture-output -n pose python \
-  calibration/collect_camera_world_data.py \
-  --camera-serial 401622071701 \
-  --output calibration/runs/pair_d435i \
-  --frames 100 --width 640 --height 480 --fps 30
-
-PYTHONPATH="$PWD/.vendor/l515_realsense" \
-conda run --no-capture-output -n pose python \
-  calibration/collect_camera_world_data.py \
-  --camera-serial f1480539 \
-  --output calibration/runs/pair_l515 \
-  --frames 100 --width 1280 --height 720 \
-  --depth-width 640 --depth-height 480 --fps 30
+/usr/bin/python3 calibration/record_wrist_calibration.py \
+  --side left --fps 5 --output "${calib_run:?Set calib_run in step 1}/left"
 ```
 
-Process both captures with identical tag parameters. The example below is for
-the repository's 94 mm tag36h11 marker, ID 0; use the measured size and actual
-ID of your marker:
+Wait for saved frame counts and left-arm `matched` counts to increase. Move
+through **15–20 distinct poses**, keeping the entire tag visible to the wrist
+camera and pausing **three seconds** at each pose (at least eight images at
+5 FPS). Include translations and
+roughly 15–30 degree rotations about at least two axes. Press **Ctrl-C** to
+finish; there is no per-pose keypress.
+
+The recorder defaults to **1280x720 at 5 FPS**, opening only the selected arm's
+wrist camera to reduce USB load. The front camera was calibrated in step 2.
+Use `--cameras left front` to add front video, or `--side both` for both wrists;
+each selected camera must support the requested profile. A lower recording rate
+keeps image resolution but does not itself guarantee sharp, well-exposed images.
+
+It saves color video, camera intrinsics, source timestamps,
+and available measured EE states. It pairs each image with interpolated measured
+poses; unmatched images are excluded during sample preparation. Keep the
+controller's EE definition (`F_T_E`) fixed throughout the recording.
+If a camera times out, stop other users of that device and check its USB
+connection. Restart with a new output directory; failed recordings are preserved.
+
+## 4. Solve the left arm base and wrist camera mount
+
+On the camera computer:
 
 ```bash
-conda run -n wjh_grasp python calibration/calibrate_camera_to_world.py \
-  --input calibration/runs/pair_d435i \
-  --tag-size-m 0.094 --tag-family tag36h11 --tag-id 0
+/usr/bin/python3 calibration/prepare_wrist_recording.py \
+  --input "${calib_run:?Set calib_run in step 1}/left" --side left
 
-conda run -n wjh_grasp python calibration/calibrate_camera_to_world.py \
-  --input calibration/runs/pair_l515 \
-  --tag-size-m 0.094 --tag-family tag36h11 --tag-id 0
+/usr/bin/python3 calibration/calibrate_wrist_camera.py \
+  --input "${calib_run:?Set calib_run in step 1}/left/samples_left" \
+  --front-calibration "${calib_run:?Set calib_run in step 1}/front/camera_to_world.json"
 ```
 
-Inspect both solver summaries. Require many detections spread over the capture
-and a small reprojection RMSE (less than about 0.5 px is a useful starting
-criterion). Read `world_T_camera` from each generated `camera_to_world.json`
-and compose the required relative transform using:
+Result: `$calib_run/left/samples_left/wrist_calibration.json`, containing
+`world_T_base` and the fixed mount `ee_T_camera`. The solver selects clear tag
+observations and reserves three poses for validation. Accept results only when
+`status` is `validated_on_holdout`; collect more varied, clear poses if it fails.
+
+## 5. Repeat for the right arm
+
+Stop the left teleoperation session and start the client with `--right --arm`.
+Repeat steps 3–4, replacing `--side left` with `--side right`,
+`$calib_run/left` with `$calib_run/right`, and `samples_left` with `samples_right`.
+Keep the same tag and front-camera calibration.
+
+## 6. Store the validated matrices in [matrix.md](matrix.md)
+
+Copy the latest results using these names:
+
+| Matrix in `matrix.md` | Source |
+| --- | --- |
+| `W_T_D435I` | Front JSON: `world_T_camera` |
+| `TAG_T_D435I` (if needed) | `inverse(world_T_tag) @ W_T_D435I` |
+| `W_T_BASE_LEFT` | Left wrist JSON: `world_T_base` |
+| `W_T_BASE_RIGHT` | Right wrist JSON: `world_T_base` |
+| `EE_LEFT_T_D405_LEFT` | Left wrist JSON: `ee_T_camera` |
+| `EE_RIGHT_T_D405_RIGHT` | Right wrist JSON: `ee_T_camera` |
+
+The wrist camera pose **in its arm base changes as the arm moves**. Store the
+fixed EE-to-camera mount above and use the measured `B_T_E(q)` to compute:
 
 ```text
-D435I_T_L515 = inverse(WORLD_T_D435I_PAIR) @ WORLD_T_L515_PAIR
+BASE_LEFT_T_D405_LEFT(q)   = B_LEFT_T_EE_LEFT(q)   @ EE_LEFT_T_D405_LEFT
+BASE_RIGHT_T_D405_RIGHT(q) = B_RIGHT_T_EE_RIGHT(q) @ EE_RIGHT_T_D405_RIGHT
 ```
 
-Here both `WORLD_T_*_PAIR` matrices are estimates against the same unmoved tag
-and therefore share an arbitrary calibration-target frame; this composition
-cancels that frame. Record the result in the L515 section of
-`calibration/matrix.md`, then copy the same serial and matrix into
-`CALIBRATED_L515_SERIAL` and `CALIBRATED_D435I_T_L515` in
-`grasp/inference_client.py`:
-
-```python
-CALIBRATED_L515_SERIAL = "L515_SERIAL"
-CALIBRATED_D435I_T_L515 = np.asarray(
-    [
-        [r11, r12, r13, tx],
-        [r21, r22, r23, ty],
-        [r31, r32, r33, tz],
-        [0.0, 0.0, 0.0, 1.0],
-    ],
-    dtype=np.float64,
-)
-```
-
-Inference validates the requested serial against that constant and validates
-the matrix as a rigid transform before opening either camera. Reprojection
-error checks image fitting, not final 3-D alignment, so always perform the
-fused-cloud check described in `grasp/README.md` before allowing robot
-execution.
-
-`collect_camera_world_data.py` records the inputs needed for a later
-camera-to-world AprilTag pose solve. It does not estimate or apply any
-transform.
-
-On the machine with the D435 connected and the RealSense/OpenCV dependencies
-installed:
-
-```bash
-python calibration/collect_camera_world_data.py \
-  --camera-serial 401622071701 \
-  --output calibration/runs/table_tag_20260824 \
-  --frames 100 \
-  --fps 30
-```
-
-The output contains:
-
-- `metadata.json`: device identity, stream configuration, color/depth factory
-  intrinsics, depth scale, native depth-to-color extrinsics, and timestamps.
-- `rgb/######.npy`: captured BGR RGB arrays. NumPy storage keeps this collector
-  independent of OpenCV; a later processing script can decode or visualize them.
-- `depth/######.npy`: uint16 depth frames aligned to the color stream.
-
-Because depth is aligned to color, the saved depth pixels use the recorded
-`color_intrinsics` for later RGB-frame back-projection. The native
-`depth_intrinsics` and `depth_to_color` are retained for auditing.
-
-AprilTag detection, tag-corner extraction, and the final `W_T_C` computation are
-performed by a separate calibration script. The tabletop Tag center is the
-world origin, but their axes differ. World axes are `+x` forward, `+y` left,
-`+z` up; Tag axes are `+x` right, `+y` backward, `+z` down. The collector stores
-the resulting fixed `world_T_tag` transform in `metadata.json`. It intentionally
-does not depend on OpenCV and does not estimate camera transforms.
-
-The stored Tag axes describe the physical printed marker: `+x` points toward
-the marker's right edge, `+y` toward its bottom edge, and `+z` into the paper.
-For the installed marker, OpenCV's decoded corner order makes the
-`SOLVEPNP_IPPE_SQUARE` frame point `+x` toward the physical marker's left edge,
-`+y` toward its bottom edge, and `+z` out of the paper. The processing script
-therefore applies the required fixed 180 degree rotation about physical Tag
-`+y` before composing the PnP pose with `world_T_tag`.
-
-Run the separate processing step after installing OpenCV contrib and SciPy:
-
-```bash
-python calibration/calibrate_camera_to_world.py \
-  --input calibration/runs/table_tag_20260824 \
-  --tag-size-m 0.094 \
-  --tag-family tag36h11 \
-  --tag-id 0
-```
-
-This writes `camera_to_world.json` containing per-frame detections and the
-aggregated `world_T_camera` estimate. The processing script reads `world_T_tag`
-from the capture metadata. For older captures without that field, it uses the
-fixed Tag/world convention above.
-
-## Eye-to-hand data collection across two hosts
-
-For camera-to-robot-base calibration, run one collector on the camera/data
-server. The robot-control host only needs the normal teleoperation stack. Both
-hosts must use the same ROS 2 domain and a DDS interface reachable from both
-hosts.
-
-On the camera/data server, where the D435 is connected:
-
-```bash
-python calibration/collect_camera_samples.py \
-  --output calibration/runs/eye_to_hand_camera \
-  --side right
-```
-
-The collector always enables the top `cam_front` D435 from the Gello camera
-configuration: serial `401622071701`, at `640x480` RGB-D and 30 FPS. The serial
-is hard-coded in the collector so other connected RealSense devices are not
-selected accidentally.
-
-Do not start the normal `franka_realsense_camera_publisher` for this same
-device at the same time as the collector; two librealsense pipelines cannot
-reliably own the same camera concurrently. The mapping comes from
-`gello_software/ros2/src/franka_realsense_camera_publisher/config/example_three_cameras.yaml`:
-`camera_3_name=cam_front`, `camera_3_serial=401622071701`, and
-`camera_3_topic=/cameras/cam_front/image_raw`.
-
-After the robot is held at a static pose, press Enter in the camera-host
-terminal. The camera collector reads the latest robot state received over ROS
-2 from `/<side>/franka_robot_state_broadcaster/robot_state`, captures one local
-RGB-D frame, and writes both to the same local `sample_######` directory. It
-also records the latest joint state from `/<side>/franka/joint_states`. No
-collector process is needed on the robot-control host beyond
-`scripts/start_teleoperation.sh`.
-
-The collector intentionally does not detect AprilTags or solve any transforms.
-
-### AprilTag frame orientation
-
-Tag orientation is part of the calibration contract. For the tabletop Tag, its
-center is the world origin. Viewed on the table, Tag `+x` points right, Tag `+y`
-points backward, and Tag `+z` points down. These map to world `-y`, `-x`, and
-`-z`, respectively. Rotating, flipping, or mirroring the tabletop Tag changes
-the resulting `world_T_camera` frame even if PnP reports a small reprojection
-error.
-
-For the end-effector Tag, its absolute orientation does not need to match the
-robot axes because the hand-eye solve estimates the fixed `ee_T_tag` transform.
-It must, however, remain rigidly mounted and use one consistent right-handed
-Tag frame for every sample. The processing scripts use the AprilTag corner
-order top-left, top-right, bottom-right, bottom-left with Tag-frame corners
-`(-s/2,+s/2)`, `(+s/2,+s/2)`, `(+s/2,-s/2)`, `(-s/2,-s/2)` at `z=0`.
-
-### RoboDex nominal EE-to-Wuji transform
-
-The nominal Wuji mounting transform was read from:
-
-`data/githubRepo/RoboDex/task/assets/urdf/panda_wuji_hand_right.urdf`
-
-Its fixed chain is:
-
-```text
-panda_link8 --panda_to_wuji_docking_joint--> hand_docking_link
-hand_docking_link --wuji_docking_to_palm_joint--> right_palm_link
-```
-
-The first joint has `xyz="0 0 0"` and
-`rpy="0 0 2.3561944902"`; the second joint is identity. Thus:
-
-```text
-panda_link8_T_hand_docking =
-[[-0.70710678, -0.70710678, 0.0, 0.0],
- [ 0.70710678, -0.70710678, 0.0, 0.0],
- [ 0.0,         0.0,        1.0, 0.0],
- [ 0.0,         0.0,        0.0, 1.0]]
-
-panda_link8_T_right_palm = panda_link8_T_hand_docking
-```
-
-`hand_docking_link` is the root link of the Wuji hand-only URDF used by the
-retargeting adapter, and `right_palm_link` is the palm landmark link. This is
-only the nominal CAD transform; verify it against the physical mount and the
-real FR3 `fr3_link8`/flange/controller EE frame. The end-effector AprilTag
-hand-eye calibration remains the source of truth for the installed transform.
-
-For the current grasp experiment, `grasp/ee_to_wuji_nominal.json` does not use
-this nominal CAD rotation. Its `ee_T_hand` transform was obtained through
-experimental measurement on the installed controller EE and Wuji hand mount.
-
-## Selecting samples from a LeRobot recording
-
-Recordings made by `scripts/start_data_collection_client.sh` and
-`scripts/start_data_collection_server.sh` store synchronized robot poses in
-Parquet and `cam_front` images in a video. Use the interactive selector to
-choose exactly 20 frames and convert them to the `sample_######` format expected
-by `calibrate_camera_to_robot_base.py`.
-
-The selector contains the live D435 Color 640x480 intrinsics for `cam_front`
-serial `401622071701`: `fx=606.1522`, `fy=605.6415`, `cx=322.8838`, and
-`cy=255.9408`, with zero reported distortion coefficients. These are the same
-profile values recorded by the camera-to-world collector and grasp inference.
-It checks that the `cam_front` video is exactly 640x480 before exporting and
-writes both the serial number and intrinsics into each sample and the selection
-manifest. If the camera profile, resolution, crop, or resize changes, update
-the intrinsics before exporting samples.
-
-`calibration/runs/D435内参表.txt` is retained as a historical device/profile
-dump, but its 640x480 color entry is not the active profile used for these
-calibration images and must not be copied into the sample metadata.
-
-Run the selector once for each arm:
-
-```bash
-python calibration/select_camera_calibration_samples.py \
-  --input calibration/runs/left_arm_camera_calibration \
-  --output calibration/runs/left_arm_camera_calibration_samples
-
-python calibration/select_camera_calibration_samples.py \
-  --input calibration/runs/right_arm_camera_calibration \
-  --output calibration/runs/right_arm_camera_calibration_samples
-```
-
-The selector additionally requires `pyarrow`, Pillow, Tkinter, and the
-`ffmpeg`/`ffprobe` executables. These are only needed to read the LeRobot
-Parquet/video recording and display the selection interface; the calibration
-solver's dependencies remain unchanged.
-
-Use the timeline or arrow keys to locate a pose, then click **Add frame** (or
-press Space). The interface enables **Export samples** after exactly 20 distinct
-frames have been selected. Each exported `sample.json` records the source
-episode, frame index, timestamp, camera serial, built-in camera intrinsics, and
-the synchronized `B_T_E` converted from `observation.ee_pose`.
-
-After selection, run the existing calibration solver manually:
-
-```bash
-python calibration/calibrate_camera_to_robot_base.py \
-  --input calibration/runs/left_arm_camera_calibration_samples \
-  --tag-size-m 0.037 \
-  --tag-family tag36h11 \
-  --tag-id 2
-
-python calibration/calibrate_camera_to_robot_base.py \
-  --input calibration/runs/right_arm_camera_calibration_samples \
-  --tag-size-m 0.037 \
-  --tag-family tag36h11 \
-  --tag-id 1 \
-  --exclude-sample 000014
-```
-
-The right-arm command explicitly excludes `sample_000014`, whose planar PnP
-solution is an outlier. `--exclude-sample` may be repeated when another dataset
-has multiple independently identified outliers; the excluded IDs are stored in
-the output JSON.
-
-The processing script reads the measured `B_T_E` stored in each sample,
-detects the end-effector Tag, and jointly estimates:
-
-```text
-camera_T_base
-base_T_camera
-ee_T_tag
-```
-
-It also writes per-sample Tag reprojection errors and hand-eye translation/
-rotation residuals to `camera_to_robot_base.json`. It requires
-`opencv-contrib-python`, SciPy, and NumPy, but does not require a live robot or
-camera.
-
-## Processing-script dependencies
-
-The two offline computation scripts share the same processing environment:
-
-| Dependency | Purpose | Required by |
-| --- | --- | --- |
-| Python 3.10+ | Script runtime | Both scripts |
-| NumPy | RGB array loading, matrices, point/pose data | Both scripts |
-| `opencv-contrib-python` | AprilTag dictionaries, detection, `solvePnP`, Rodrigues, reprojection | Both scripts |
-| SciPy | SO(3) rotation averaging and rotation-vector conversions | Both scripts |
-
-Use the contrib OpenCV package, not the minimal `opencv-python` package:
-
-```bash
-python -m pip install numpy scipy opencv-contrib-python
-```
-
-No ROS 2, `rclpy`, `franka_msgs`, `pyrealsense2`, Gello, or live robot/camera
-connection is required by either processing script. Those dependencies are only
-needed by `collect_camera_samples.py`, which runs on the camera host.
-
-## Moving the right-arm flange, controller EE, or hand from a world-frame pose
-
-`move_right_ee_from_world.sh` accepts a world-frame `fr3_link8`/flange target,
-a world-frame default controller-EE target, or a world-frame Wuji hand-root
-target. Exactly one of the three options is required. It converts the target to
-the controller-EE pose expected by `scripts/move_to_target_ee.sh` using the
-matrices in `matrix.md`.
-
-For a flange target:
-
-```text
-W_T_B_R = W_T_C @ C_T_B_R
-B_R_T_F = inverse(W_T_B_R) @ W_T_F
-B_R_T_EE = B_R_T_F @ F_T_EE
-```
-
-For a default controller-EE target, no tool-coordinate transform is applied:
-
-```text
-W_T_EE = input pose
-B_R_T_EE = inverse(W_T_B_R) @ W_T_EE
-```
-
-`F_T_EE` is inverted only to calculate the corresponding flange pose printed
-for diagnostics; it does not change the requested controller-EE target.
-
-For a hand target, it additionally reads `EE_T_H` from
-`grasp/ee_to_wuji_nominal.json` and accounts for both mount transforms:
-
-```text
-W_T_EE = W_T_H @ inverse(EE_T_H)
-W_T_F = W_T_EE @ inverse(F_T_EE)
-B_R_T_EE = inverse(W_T_B_R) @ W_T_EE
-```
-
-Here `F_T_EE` is the current controller configuration's fixed transform from
-`fr3_link8`/flange to controller EE: translation `[0, 0, 0.1034]` metres and a
-`-pi/4` rotation about flange z. The launcher prints both the right-base flange
-pose and the derived controller-EE pose before invoking the unchanged lower-level
-move script. If the robot's configured `F_T_EE` changes, update the fixed value
-in this launcher to match it.
-
-Both input and output use `x y z roll pitch yaw` in metres/radians, with the
-same `Rz(yaw) @ Ry(pitch) @ Rx(roll)` convention as
-`scripts/move_to_target_ee.sh`. The launcher performs the NumPy conversion in
-the Conda environment selected by `--conda-env`, `CALIBRATION_CONDA_ENV`, or
-`LEROBOT_CONDA_ENV` (default `lerobot`). It then delegates ROS control to
-`scripts/move_to_target_ee.sh`, which uses system `/usr/bin/python3`; Conda and
-ROS Python dependencies therefore run in separate processes.
-
-First inspect a conversion without starting the controller:
-
-```bash
-./calibration/move_right_ee_from_world.sh \
-  --world-flange-pose 0.20 -0.10 0.30 3.14159 0 0
-```
-
-To specify the desired Wuji hand-root pose instead:
-
-```bash
-./calibration/move_right_ee_from_world.sh \
-  --world-hand-pose 0.20 -0.10 0.30 3.14159 0 0
-```
-
-To specify the default controller EE directly, without applying a hand/tool
-transform:
-
-```bash
-./calibration/move_right_ee_from_world.sh \
-  --world-ee-pose 0.20 -0.10 0.30 3.14159 0 0
-```
-
-Then request the controller's live-state/IK dry run (no movement):
-
-```bash
-./calibration/move_right_ee_from_world.sh \
-  --world-flange-pose 0.20 -0.10 0.30 3.14159 0 0 \
-  --controller-dry-run
-```
-
-Use `--execute` only when the converted target and dry run have been checked.
-It calls `scripts/move_to_target_ee.sh --right --arm`; the existing controller
-utility still prints current/target state and requires an explicit `y`/`yes`
-before commanding real motion.
-
-The input formats differ:
-
-- `calibrate_camera_to_world.py` reads the older sequence collector format:
-  one `metadata.json` containing a `frames` list, with each frame pointing to
-  an RGB `.npy` file.
-- `calibrate_camera_to_robot_base.py` reads the current eye-to-hand format:
-  `sample_######/sample.json` plus `sample_######/rgb.npy`, including the
-  measured `B_T_E` matrix in each sample. The interactive selector above
-  converts LeRobot recordings into this format.
+If storing a camera-to-base snapshot, include its measured EE pose and timestamp.
+For front-camera points in either robot base, use
+`base_T_front = inverse(world_T_base) @ W_T_D435I`.
+
+Keep only the latest calibrated results and a short dated record in `matrix.md`:
+calibration time, tag ID/size, camera serials, source JSON paths, and validation
+summary. Replace superseded snapshots; scripts save JSON but do not edit
+`matrix.md` automatically. Recalibrate after moving a camera mount or robot
+base; moving the tag changes the shared world reference for all results.

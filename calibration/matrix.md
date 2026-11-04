@@ -1,179 +1,111 @@
 # Calibration Matrices
 
-The robot-base matrices below were recomputed on 2026-08-28 after correcting
-the hand-eye sample intrinsics to the active 640x480 `cam_front` profile.
+`A_T_B` maps coordinates from B to A; translation is in metres.
+W is centred on the tabletop AprilTag, with +X forward, +Y left, +Z up.
+Camera frames are color optical frames: +X right, +Y down, +Z forward.
+EE is the measured controller end-effector frame from Franka `o_t_ee`.
 
-Notation: `A_T_B` transforms coordinates from frame `B` into frame `A`:
+## Calibration record — 2026-11-04
 
-```text
-p_A = A_T_B @ p_B
-```
+Reference: tag36h11, ID 0, black-square side length 0.095 m.
+Times below are China Standard Time (UTC+08:00).
 
-The translation entries are in metres. Frames used below:
+| Calibration | Camera serial | Capture time |
+| --- | --- | --- |
+| Front D435i to world | `401622071701` | 2026-11-04 10:44:29 |
+| Left base to world and left EE-to-D405 mount | `260322270745` | 2026-11-04 13:57:35–13:59:31 and 14:04:07–14:05:21 |
+| Right base to world and right EE-to-D405 mount | `260322272504` | 2026-11-04 14:08:04–14:11:21 |
 
-- `C`: `cam_front` D435 optical camera frame
-- `L`: L515 optical color-camera frame
-- `B_L`: left Franka base frame
-- `B_R`: right Franka base frame
-- `W`: tabletop world frame (`+x` forward, `+y` left, `+z` up)
+Left result: `validated_on_holdout`; combined two compatible recordings:
+9 + 6 distinct settled poses, 156 images, no duplicate poses or rejected samples.
+Used the default sample minimum: 12 training poses and 3 held-out poses, with
+all held-out poses from the new recording. Held-out median/max residual:
+1.80/4.32 mm and 0.245/0.348 degrees. Median selected-pose reprojection error:
+0.153 px. Additional leave-one-pose-out checks: maximum prediction residual
+3.99 mm / 0.369 degrees; estimated base position varied by up to 4.15 mm and
+mount position by 2.69 mm relative to the saved fit (rotation differences below
+0.36 degrees). These consistency checks do not measure absolute accuracy
+against an independent reference.
 
-Both robot-base calibrations use the `cam_front` color profile for serial
-`401622071701` at 640x480: `fx=606.1522`, `fy=605.6415`, `cx=322.8838`,
-`cy=255.9408`, with zero reported distortion coefficients.
+Right result: `validated_on_holdout`; 22 accepted settled poses and 243 tag
+inlier images from 25 selected poses (286 images). Three poses were rejected
+for fewer than five clear tag observations. Used the default sample minimum:
+19 training poses and 3 held-out poses. Held-out median/max residual:
+3.11/3.17 mm and 0.151/0.214 degrees. Median selected-pose reprojection error:
+0.097 px. Additional leave-one-pose-out checks: maximum prediction residual
+5.27 mm / 0.541 degrees; estimated base position varied by up to 2.94 mm and
+mount position by 1.25 mm relative to the saved fit (rotation differences below
+0.24 degrees).
 
-## L515 to D435i
+Sources:
 
-The installed L515 is serial `f1480539`, firmware `1.5.4.1`. The current pair
-calibration was recaptured on 2026-09-12 at 13:03 CST with both fixed
-cameras observing the same unmoved 95 mm tag36h11 marker, ID 0.
+- Front: `calibration/runs/tag_world_20261104_104307/d435i_hd/camera_to_world.json`.
+- Left: `calibration/runs/calibration_20261104_140402/left/samples_left_combined/wrist_calibration.json`.
+- Left provenance: `calibration/runs/calibration_20261104_140402/left/samples_left_combined/merge_manifest.json`.
+- Left validation: `calibration/runs/calibration_20261104_140402/left/samples_left_combined/validation_audit.json`.
+- Right: `calibration/runs/calibration_20261104_140735/right/samples_right/wrist_calibration.json`.
+- Right validation: `calibration/runs/calibration_20261104_140735/right/samples_right/validation_audit.json`.
 
-- D435i reference serial: `401622071701`
-- L515 serial: `f1480539`
-- Required direction: `L515 -> D435i`
-- Runtime copies: `CALIBRATED_L515_SERIAL` and
-  `CALIBRATED_D435I_T_L515` in `grasp/inference_client.py`
-
-```text
-D435I_T_L515 =
-[[ -0.325302673, -0.685909022,  0.650927787, -0.359028168],
- [  0.848951697,  0.091342298,  0.520516667, -0.331052357],
- [ -0.416484319,  0.721931713,  0.552589735,  0.749659696],
- [  0.000000000,  0.000000000,  0.000000000,  1.000000000]]
-
-p_D435I = D435I_T_L515 @ p_L515
-W_T_L515 = W_T_D435I @ D435I_T_L515
-```
-
-Calibration evidence:
-
-- D435i capture: `calibration/runs/d435i_recal_20260912_130341`
-- L515 capture: `calibration/runs/l515_recal_20260912_130341`
-- Pair result JSON: `calibration/runs/d435i_T_l515_20260912_130341.json`
-- Composition: `D435I_T_L515 = inverse(WORLD_T_D435I_PAIR) @
-  WORLD_T_L515_PAIR`, using `world_T_camera` from the two capture directories'
-  `camera_to_world.json` files
-- Tag parameters: `tag36h11`, ID `0`, measured black-square side `0.095 m`
-- Saved D435i RGB and aligned depth geometry: `640x480`
-- D435i native streams: `640x480@30` color and depth
-- L515 native streams: `1280x720@30` color, `640x480@30` depth; depth aligned
-  into the color pixel grid before saving
-- D435i color/depth timestamp gap: median/max `0.018/0.018 ms`
-- L515 color/depth timestamp gap: median/max `5.539/6.415 ms`
-- D435i Tag detections and dominant cluster: `100/100`; median/max reprojection
-  RMSE `0.272/0.272 px`
-- L515 Tag detections and dominant cluster: `100/98`; median/max reprojection
-  RMSE `0.467/0.521 px` (mean `0.455 px`); frames `2` and `40` were excluded
-  from the dominant pose cluster
-- Optical-origin baseline: `0.894699 m`
-- Independent fused-depth validation capture:
-  `calibration/runs/fusion_check_20260912_130418`
-- The validation used 15-frame per-pixel nonzero medians, a `0.2--2.0 m`
-  depth range, and 3 mm voxels. In the common robust-bounds region, the new
-  transform's symmetric nearest-neighbor distance was `6.803 mm` median and
-  `17.535 mm` at p90, with `85.212%` of points within `15 mm`.
-- On the same validation capture, the previous runtime transform produced
-  `46.048 mm` median, `148.120 mm` at p90, and `16.039%` within `15 mm`.
-  The new transform therefore materially improves independent depth alignment.
-- Relative to the previous runtime transform, this calibration changes the
-  camera-to-camera pose by `645.242 mm` and `72.822 deg`, consistent with the
-  L515 having been moved to its new installation position.
-
-The solver selects the largest pairwise SE(3) cluster within 10 mm and 1 degree
-before averaging, preventing low-reprojection planar-PnP branch flips from
-biasing the installed transform. The numerical fused-depth check passed, but
-the generated fused cloud should still be inspected visually for doubled edges
-before hardware execution.
-
-## Left Robot Base to Camera
-
-Direction: `B_L -> C`.
-
-Source field: `camera_T_base` in
-`calibration/runs/left_arm_camera_calibration_samples/camera_to_robot_base.json`.
+Both arm-base/world and fixed EE-to-wrist-camera transforms are calibrated
+against the same tabletop tag/world convention.
 
 ```text
-C_T_B_L =
-[[ -0.094872488, -0.705592508, -0.702238153, -0.194672067],
- [ -0.924629912,  0.323839306, -0.200468526,  0.571976021],
- [  0.368861407,  0.630291454, -0.683135379,  0.898757710],
+W_T_D435I =
+[[ 0.005654385, -0.918375380,  0.395669925, -0.548542816],
+ [-0.999980942, -0.006173662, -0.000039079,  0.109195776],
+ [ 0.002478622, -0.395662163, -0.918392786,  0.897067971],
  [ 0.000000000,  0.000000000,  0.000000000,  1.000000000]]
 
-p_C = C_T_B_L @ p_B_L
-```
-
-Calibration quality:
-
-- Used samples: `20/20`
-- Median Tag reprojection RMSE: `0.218 px`
-- Median hand-eye translation residual: `4.839 mm`
-- Median hand-eye rotation residual: `0.03353 rad` (`1.921 deg`)
-
-## Right Robot Base to Camera
-
-Direction: `B_R -> C`.
-
-Source field: `camera_T_base` in
-`calibration/runs/right_arm_camera_calibration_samples/camera_to_robot_base.json`.
-
-```text
-C_T_B_R =
-[[ 0.061077178, -0.724658647,  0.686395967,  0.162840030],
- [-0.927423222, -0.295425134, -0.229369041,  0.562456279],
- [ 0.368992880, -0.622570346, -0.690108991,  0.901632663],
+W_T_BASE_LEFT =
+[[ 0.999934071, -0.011367786, -0.001620985, -0.622264151],
+ [ 0.009222720,  0.710984613,  0.703147084,  0.274698354],
+ [-0.006840730, -0.703115676,  0.711042580,  0.099652877],
  [ 0.000000000,  0.000000000,  0.000000000,  1.000000000]]
 
-p_C = C_T_B_R @ p_B_R
-```
-
-Calibration quality (`sample_000014` excluded as a PnP pose outlier):
-
-- Used samples: `19/20` (`sample_000014` excluded)
-- Median Tag reprojection RMSE: `0.227 px`
-- Median hand-eye translation residual: `4.378 mm`
-- Median hand-eye rotation residual: `0.06000 rad` (`3.438 deg`)
-
-## Camera to World
-
-Direction: `C -> W`.
-
-Source field: `world_T_camera` in
-`calibration/runs/table_tag_20260824/camera_to_world.json`.
-
-```text
-W_T_C =
-[[ 0.016116505, -0.947169025,  0.320329670, -0.394891761],
- [-0.998707711,  0.000194370,  0.050821951, -0.041552817],
- [-0.048199240, -0.320734783, -0.945941876,  1.159142768],
+EE_LEFT_T_D405_LEFT =
+[[-0.047083886,  0.998889961, -0.001398027, -0.059730162],
+ [-0.998647703, -0.047041490,  0.022132852,  0.003957835],
+ [ 0.022042518,  0.002438237,  0.999754061, -0.077376097],
  [ 0.000000000,  0.000000000,  0.000000000,  1.000000000]]
 
-p_W = W_T_C @ p_C
+F_LEFT_T_EE_LEFT =
+[[ 0.707106789,  0.707106769,  0.000000000,  0.000000000],
+ [-0.707106769,  0.707106789, -0.000000000,  0.000000000],
+ [-0.000000000,  0.000000000,  1.000000000,  0.103399999],
+ [ 0.000000000,  0.000000000,  0.000000000,  1.000000000]]
+
+W_T_BASE_RIGHT =
+[[ 0.999848869,  0.000796985,  0.017366748, -0.620139737],
+ [ 0.011952964,  0.693865182, -0.720005719, -0.116235540],
+ [-0.012624015,  0.720104488,  0.693750791,  0.091266725],
+ [ 0.000000000,  0.000000000,  0.000000000,  1.000000000]]
+
+EE_RIGHT_T_D405_RIGHT =
+[[ 0.043820769, -0.999039244, -0.000574219,  0.065736692],
+ [ 0.999024164,  0.043823268, -0.005499240, -0.011985249],
+ [ 0.005519120, -0.000332678,  0.999984714, -0.076970965],
+ [ 0.000000000,  0.000000000,  0.000000000,  1.000000000]]
+
+F_RIGHT_T_EE_RIGHT =
+[[ 0.707106789,  0.707106769,  0.000000000,  0.000000000],
+ [-0.707106769,  0.707106789, -0.000000000,  0.000000000],
+ [-0.000000000,  0.000000000,  1.000000000,  0.103399999],
+ [ 0.000000000,  0.000000000,  0.000000000,  1.000000000]]
 ```
 
-Calibration quality:
+`F_LEFT_T_EE_LEFT` and `F_RIGHT_T_EE_RIGHT` record the configured
+flange-to-controller-EE transforms used during calibration. If a controller EE
+definition changes, convert its camera mount through the flange before using
+it with new measured EE poses. Calibration residuals are consistency checks;
+they do not establish independent absolute accuracy.
 
-- Valid Tag detections: `100/100`
-- Median Tag reprojection RMSE: `0.063 px`
-- Mean Tag reprojection RMSE: `0.068 px`
-- Maximum Tag reprojection RMSE: `0.244 px`
-- Dominant planar-PnP branch: `97/100` frames within `10 mm` and `1 deg` of the dominant pose
-- PnP pose outliers: frames `3`, `14`, and `38`
-- Maximum outlier deviation from the dominant pose: `754.7 mm`, `35.61 deg`
-- Reported aggregate rotation differs from the dominant pose by `0.654 deg`
-
-To transform a point from either robot base directly into the world frame:
+Each wrist camera pose in its arm base depends on the current measured arm pose:
 
 ```text
-p_W = W_T_C @ C_T_B_L @ p_B_L
-p_W = W_T_C @ C_T_B_R @ p_B_R
+BASE_LEFT_T_D405_LEFT(q) = B_LEFT_T_EE_LEFT(q) @ EE_LEFT_T_D405_LEFT
+BASE_RIGHT_T_D405_RIGHT(q) = B_RIGHT_T_EE_RIGHT(q) @ EE_RIGHT_T_D405_RIGHT
+W_T_D405_LEFT(q) = W_T_BASE_LEFT @ BASE_LEFT_T_D405_LEFT(q)
+W_T_D405_RIGHT(q) = W_T_BASE_RIGHT @ BASE_RIGHT_T_D405_RIGHT(q)
+BASE_LEFT_T_D435I = inverse(W_T_BASE_LEFT) @ W_T_D435I
+BASE_RIGHT_T_D435I = inverse(W_T_BASE_RIGHT) @ W_T_D435I
 ```
-
-As a cross-calibration check, the two hand-eye matrices imply:
-
-```text
-left_base_T_right_base translation = [-0.0241, -0.2535, -0.2511] m
-left_base_T_right_base RPY         = [87.96, 6.26, -6.40] deg
-```
-
-This derived relation is a useful consistency value, but should be compared
-against an independent measurement of the physical base mounting before it is
-used as a base-to-base calibration.

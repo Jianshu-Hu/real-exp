@@ -42,9 +42,62 @@ This repo uses two different Python environments:
 ### Data Collection
 
 Data collection and replay instructions live in [data_collection/DATA_COLLECTION_README.md](data_collection/DATA_COLLECTION_README.md).
-- [`scripts/start_teleoperation.sh`](scripts/start_teleoperation.sh): start left-, right-, or dual-arm GELLO/FR3 teleoperation with matching Franka grippers or Wuji hands.
+- [`scripts/start_teleoperation.sh`](scripts/start_teleoperation.sh): start left-, right-, or dual-arm GELLO/FR3 teleoperation with Franka grippers, Wuji hands, or a pneumatic Softhand.
 - [`scripts/start_meta_quest_pose_monitor.sh`](scripts/start_meta_quest_pose_monitor.sh): receive and display uncalibrated Quest wrist/controller poses without connecting to a robot. See [`data_collection/meta_quest/README.md`](data_collection/meta_quest/README.md).
-- `start_teleoperation.sh` accepts exactly one end-effector mode (`--arm`, `--gripper`, or `--hand`) and one arm selection (`--left`, `--right`, or `--duo`).
+- `start_teleoperation.sh` accepts exactly one end-effector mode (`--arm`, `--gripper`, `--hand`, `--softhand-gripper`, or `--softhand-manus`) and one arm selection (`--left`, `--right`, or `--duo`).
+
+For Softhand, `--softhand` is renamed to `--softhand-gripper`. This mode keeps
+the GELLO gripper's existing uniform 0–5 V command across all 20 channels.
+`--softhand-manus` uses GELLO for the arm and the MANUS glove for the hand:
+
+```bash
+./scripts/start_teleoperation.sh --softhand-gripper --right
+./scripts/start_teleoperation.sh --softhand-manus --right
+```
+
+MANUS mode starts `PneumaticSystem/Service/manus/bridge/build/manus_bridge`
+(override the executable with `MANUS_BRIDGE_PATH`) and runs
+`PneumaticSystem/teleop.py --target-source manus --manus-retarget none`.
+The bridge sends to `127.0.0.1:9878`; the controller listens on `0.0.0.0:9878`.
+Build the native bridge once in this checkout (adjust the SDK path for your
+installation; build outputs are ignored by Git):
+
+```bash
+cmake -S PneumaticSystem/Service/manus/bridge \
+  -B PneumaticSystem/Service/manus/bridge/build \
+  -DMANUS_SDK_ROOT="$HOME/jhu/ManusSDK_v3.1.1/SDKMinimalClient_Linux/ManusSDK" \
+  -DMANUS_INTEGRATED_ONLY=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build PneumaticSystem/Service/manus/bridge/build --parallel 2
+PneumaticSystem/Service/manus/bridge/build/manus_bridge --help
+```
+
+If a bridge already runs in another terminal or on a remote host, add
+`--manus-external-bridge` and direct that bridge's UDP stream to this machine's
+port 9878. For a bridge on this machine:
+
+```bash
+PneumaticSystem/Service/manus/bridge/build/manus_bridge --udp 127.0.0.1:9878
+# In another terminal:
+./scripts/start_teleoperation.sh --softhand-manus --right --manus-external-bridge
+```
+
+The glove side follows `--left`/`--right`; `--duo` defaults to the right glove.
+Use `--manus-hand left|right` to choose a different glove independently of the
+arm. Both Softhand modes operate **one pneumatic controller**, even with
+`--duo`. Both auto-detect the F407Driver USB device; `--serial-port PATH` or
+`SOFTHAND_SERIAL_PORT` overrides detection. MANUS uses system Python by default;
+set `SOFTHAND_PYTHON=/path/to/python` to use another interpreter with NumPy and
+pyserial installed.
+
+MANUS joint angles use the existing per-channel calibration and channel order
+in `PneumaticSystem/Service/voltage_mapping.py` and `Service/hand_joints.py`.
+As in `teleop.py --target-source manus`, direct skeleton geometry controls
+flexion while side-swing targets stay zero. Missing/stale glove data commands
+zero volts, and Ctrl-C stops the arm, hand controller, and launcher-owned
+bridge together.
+Routine joint-target and channel-voltage output is disabled by default; startup,
+shutdown, and target-loss messages remain visible. For standalone diagnostics,
+pass `--print-every N` to `PneumaticSystem/teleop.py` to print every N cycles.
 
 All launchers can be invoked from a bare shell; manually activating Conda is
 not required. ROS-only processes use the system ROS Python. LeRobot, policy,

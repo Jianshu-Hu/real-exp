@@ -111,7 +111,7 @@ def test_launcher_does_not_start_arm_when_port_discovery_fails(tmp_path):
     (service_dir / "publisher.py").touch()
 
     result = subprocess.run(
-        ["bash", str(launcher), "--right", "--softhand"],
+        ["bash", str(launcher), "--right", "--softhand-gripper"],
         capture_output=True, text=True, timeout=5,
     )
 

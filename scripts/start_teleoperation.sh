@@ -695,7 +695,7 @@ esac
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/start_teleoperation.sh --arm|--gripper|--hand|--softhand --duo|--left|--right [Wuji options]
+Usage: ./scripts/start_teleoperation.sh END_EFFECTOR --duo|--left|--right [options]
 
 Arm selection:
   --duo                    Use both left and right arms.
@@ -706,8 +706,21 @@ End effector:
   --arm                    Use the arm only; no end-effector process.
   --gripper                Use the matching Franka gripper(s).
   --hand                   Use the matching Wuji glove/hand pair(s).
-  --softhand               Use the GELLO gripper to control the pneumatic Softhand.
+  --softhand-gripper       Use the GELLO gripper to control all Softhand channels.
+  --softhand-manus         Use GELLO for the arm and MANUS joint angles for Softhand.
   --serial-port PATH       Override Softhand USB serial auto-detection.
+
+MANUS options (used only with --softhand-manus):
+  --manus-hand left|right  Glove side (default: arm side; right with --duo).
+  --manus-external-bridge  Receive an already-running/local or remote bridge.
+                           Otherwise start Service/manus/bridge/build/manus_bridge
+                           inside PneumaticSystem (override with MANUS_BRIDGE_PATH).
+                           UDP input uses 0.0.0.0:9878.
+
+Both Softhand modes control one pneumatic controller, including with --duo.
+MANUS uses teleop.py's calibrated per-channel mapping, stale-target shutdown,
+and direct joint angles (--manus-retarget none). SOFTHAND_PYTHON selects its
+Python interpreter (default: /usr/bin/python3; requires numpy and pyserial).
 
 Wuji options (used only with --hand):
   --left-glove-sn SN       Left Wuji Glove serial.
@@ -722,7 +735,10 @@ Wuji options (used only with --hand):
 Examples:
   ./scripts/start_teleoperation.sh --gripper --left
   ./scripts/start_teleoperation.sh --hand --right
-  ./scripts/start_teleoperation.sh --softhand --left
+  ./scripts/start_teleoperation.sh --softhand-gripper --left
+  ./scripts/start_teleoperation.sh --softhand-manus --right
+  ./scripts/start_teleoperation.sh --softhand-manus --left --manus-hand right \
+    --manus-external-bridge
   ./scripts/start_teleoperation.sh --arm --duo
   ./scripts/start_teleoperation.sh --hand --duo \
     --left-glove-sn <LEFT_SN> --right-glove-sn <RIGHT_SN> \
@@ -743,6 +759,8 @@ die() {
 side_mode=""
 end_effector=""
 softhand_serial_port=""
+manus_hand=""
+manus_external_bridge=0
 declare -a wuji_options=()
 
 while [[ "$#" -gt 0 ]]; do
@@ -752,9 +770,23 @@ while [[ "$#" -gt 0 ]]; do
       side_mode="${1#--}"
       shift
       ;;
-    --arm|--gripper|--hand|--softhand)
-      [[ -z "${end_effector}" ]] || die "choose only one of --arm, --gripper, --hand, or --softhand"
+    --arm|--gripper|--hand|--softhand-gripper|--softhand-manus)
+      [[ -z "${end_effector}" ]] || die "choose only one of --arm, --gripper, --hand, --softhand-gripper, or --softhand-manus"
       end_effector="${1#--}"
+      shift
+      ;;
+    --softhand)
+      die "--softhand has been renamed to --softhand-gripper; use --softhand-manus for glove control"
+      ;;
+    --manus-hand)
+      [[ "$#" -ge 2 ]] || die "--manus-hand requires left or right"
+      [[ -z "${manus_hand}" ]] || die "--manus-hand may be specified only once"
+      [[ "$2" == "left" || "$2" == "right" ]] || die "--manus-hand requires left or right"
+      manus_hand="$2"
+      shift 2
+      ;;
+    --manus-external-bridge)
+      manus_external_bridge=1
       shift
       ;;
     --serial-port)
@@ -784,8 +816,10 @@ done
 }
 [[ "${end_effector}" == "hand" || "${#wuji_options[@]}" -eq 0 ]] || die \
   "Wuji and telemetry options are valid only with --hand"
-[[ "${end_effector}" == "softhand" || -z "${softhand_serial_port}" ]] || die \
-  "--serial-port is valid only with --softhand"
+[[ "${end_effector}" == softhand-* || -z "${softhand_serial_port}" ]] || die \
+  "--serial-port is valid only with --softhand-gripper or --softhand-manus"
+[[ "${end_effector}" == "softhand-manus" || ( -z "${manus_hand}" && "${manus_external_bridge}" -eq 0 ) ]] || die \
+  "MANUS options are valid only with --softhand-manus"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 command -v setsid >/dev/null 2>&1 || die "required command not found: setsid"
@@ -879,33 +913,65 @@ elif [[ "${end_effector}" == "gripper" ]]; then
   start_component "FR3 arm and Franka gripper" \
     bash "${script_dir}/start_teleoperation.sh" \
     --internal-arm-stack "--${side_mode}" --gripper
-elif [[ "${end_effector}" == "softhand" ]]; then
+elif [[ "${end_effector}" == softhand-* ]]; then
   [[ -r "${script_dir}/softhand_gripper_teleop.py" ]] || die \
     "Softhand teleoperation node is missing: ${script_dir}/softhand_gripper_teleop.py"
   [[ -r "${script_dir}/../PneumaticSystem/Service/publisher.py" ]] || die \
     "Pneumatic publisher is missing: ${script_dir}/../PneumaticSystem/Service/publisher.py (initialize the PneumaticSystem submodule)"
   softhand_args=("--${side_mode}")
+  softhand_python=/usr/bin/python3
+  if [[ "${end_effector}" == "softhand-manus" ]]; then
+    softhand_python="${SOFTHAND_PYTHON:-/usr/bin/python3}"
+    pneumatic_root="$(cd -- "${script_dir}/../PneumaticSystem" && pwd)"
+    [[ -r "${pneumatic_root}/teleop.py" ]] || die "MANUS teleoperation program is missing: ${pneumatic_root}/teleop.py"
+    manus_bridge="${MANUS_BRIDGE_PATH:-${pneumatic_root}/Service/manus/bridge/build/manus_bridge}"
+    if [[ "${manus_external_bridge}" -eq 0 ]]; then
+      [[ -x "${manus_bridge}" ]] || die \
+        "MANUS bridge is missing or not executable: ${manus_bridge}. Build it first, set MANUS_BRIDGE_PATH, or use --manus-external-bridge for an existing bridge; the FR3 arm was not started."
+      "${manus_bridge}" --help >/dev/null || die "MANUS bridge cannot run; the FR3 arm was not started."
+    fi
+    # Import/argument checks only: --help never opens UDP, serial, or the robot.
+    if ! env PYTHONPATH= LD_LIBRARY_PATH= "${softhand_python}" -c 'import serial' || \
+       ! env PYTHONPATH= LD_LIBRARY_PATH= "${softhand_python}" "${pneumatic_root}/teleop.py" --help >/dev/null; then
+      die "MANUS teleoperation dependencies are unavailable; check SOFTHAND_PYTHON (numpy and pyserial required); the FR3 arm was not started."
+    fi
+  fi
   [[ -z "${softhand_serial_port}" ]] || softhand_args+=(--serial-port "${softhand_serial_port}")
   # Discover the controller before starting any robot process. This only
   # enumerates ports; it does not open the serial device or send commands.
-  softhand_selected_port="$(/usr/bin/python3 "${script_dir}/softhand_gripper_teleop.py" \
+  softhand_selected_port="$(env PYTHONPATH= LD_LIBRARY_PATH= "${softhand_python}" "${script_dir}/softhand_gripper_teleop.py" \
     "${softhand_args[@]}" --detect-port-only)" || die \
     "Softhand serial-port selection failed; the FR3 arm was not started."
   echo "Softhand serial port: ${softhand_selected_port}"
   softhand_args=("--${side_mode}" --serial-port "${softhand_selected_port}")
+  if [[ "${end_effector}" == "softhand-manus" ]]; then
+    [[ -n "${manus_hand}" ]] || {
+      manus_hand="${side_mode}"
+      [[ "${side_mode}" != "duo" ]] || manus_hand=right
+    }
+    start_component "MANUS Softhand joint teleoperation" \
+      bash -c 'set -e; cd -- "$1"; shift; exec env PYTHONPATH= LD_LIBRARY_PATH= "$@"' _ \
+      "${pneumatic_root}" "${softhand_python}" -u "${pneumatic_root}/teleop.py" \
+      --target-source manus --manus-retarget none --manus-hand "${manus_hand}" \
+      --manus-host 0.0.0.0 --manus-port 9878 --publisher-port "${softhand_selected_port}"
+    if [[ "${manus_external_bridge}" -eq 0 ]]; then
+      start_component "MANUS bridge" "${manus_bridge}" --udp 127.0.0.1:9878
+    fi
+  else
+    start_component "GELLO Softhand gripper" \
+      bash -c '
+        set -e
+        source /opt/ros/humble/setup.bash
+        source "$1"
+        teleop_script="$2"
+        shift 2
+        exec /usr/bin/python3 "${teleop_script}" "$@"
+      ' _ "${script_dir}/../gello_software/ros2/install/local_setup.bash" \
+      "${script_dir}/softhand_gripper_teleop.py" "${softhand_args[@]}"
+  fi
   start_component "FR3 arm" \
     bash "${script_dir}/start_teleoperation.sh" \
     --internal-arm-stack "--${side_mode}" --no-gripper
-  start_component "GELLO Softhand gripper" \
-    bash -c '
-      set -e
-      source /opt/ros/humble/setup.bash
-      source "$1"
-      teleop_script="$2"
-      shift 2
-      exec /usr/bin/python3 "${teleop_script}" "$@"
-    ' _ "${script_dir}/../gello_software/ros2/install/local_setup.bash" \
-    "${script_dir}/softhand_gripper_teleop.py" "${softhand_args[@]}"
 else
   bash "${script_dir}/start_teleoperation.sh" \
     --internal-wuji-stack "--${side_mode}" "${wuji_options[@]}" --validate-only

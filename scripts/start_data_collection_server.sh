@@ -32,7 +32,7 @@ Options:
   --local-dir PATH      Dataset directory for --record (default: ./lerobot_data).
   --repo-id ID          LeRobot repo id for --record.
   --bridge-host IP      Address on which the bridge publishes samples
-                        (default: ${DATA_COLLECTION_SERVER_IP:-192.168.50.13}).
+                        (default: ${DATA_COLLECTION_SERVER_IP:-192.168.1.50}).
   --bridge-port PORT    ZMQ sample port (default: 5555).
   --hand-telemetry-port PORT
                         ZMQ port for hand telemetry (default: 5558).
@@ -51,7 +51,7 @@ gripper_mode=""
 record=0
 local_dir="./lerobot_data"
 repo_id="local/franka_gello_teleop"
-bridge_host="${DATA_COLLECTION_SERVER_IP:-192.168.50.13}"
+bridge_host="${DATA_COLLECTION_SERVER_IP:-192.168.1.50}"
 bridge_port="5555"
 hand_telemetry_port="${HAND_TELEMETRY_PORT:-5558}"
 ros_domain_id="${ROS_DOMAIN_ID:-0}"

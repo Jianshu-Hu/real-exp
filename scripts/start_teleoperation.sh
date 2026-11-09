@@ -407,7 +407,7 @@ Device selection:
   --left-hand-ip ADDR      Left Wuji Hand 2 SDK address (IP:port).
   --right-hand-ip ADDR     Right Wuji Hand 2 SDK address (IP:port).
   --telemetry-host IP      Data-server host for hand telemetry (default:
-                           DATA_COLLECTION_SERVER_IP or 192.168.50.13).
+                           DATA_COLLECTION_SERVER_IP or 192.168.1.50).
   --telemetry-port PORT    Data-server ZMQ port for hand telemetry (default:
                            HAND_TELEMETRY_PORT or 5558).
 
@@ -438,7 +438,7 @@ left_glove_sn="${WUJI_LEFT_GLOVE_SN:-}"
 right_glove_sn="${WUJI_RIGHT_GLOVE_SN:-WG1KA06260623515}"
 left_hand_ip="${WUJI_LEFT_HAND_IP:-}"
 right_hand_ip="${WUJI_RIGHT_HAND_IP:-}"
-telemetry_host="${DATA_COLLECTION_SERVER_IP:-192.168.50.13}"
+telemetry_host="${DATA_COLLECTION_SERVER_IP:-192.168.1.50}"
 telemetry_port="${HAND_TELEMETRY_PORT:-5558}"
 
 while [[ "$#" -gt 0 ]]; do
@@ -734,7 +734,7 @@ Wuji options (used only with --hand):
   --left-hand-ip ADDR      Left Wuji Hand 2 SDK address (IP:port).
   --right-hand-ip ADDR     Right Wuji Hand 2 SDK address (IP:port).
   --telemetry-host IP      Data-server host for hand telemetry (default:
-                           DATA_COLLECTION_SERVER_IP or 192.168.50.13).
+                           DATA_COLLECTION_SERVER_IP or 192.168.1.50).
   --telemetry-port PORT    Data-server ZMQ port for hand telemetry (default:
                            HAND_TELEMETRY_PORT or 5558).
 

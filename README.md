@@ -55,20 +55,24 @@ the GELLO gripper's existing uniform 0–5 V command across all 20 channels.
 ./scripts/start_teleoperation.sh --softhand-manus --right
 ```
 
-MANUS mode starts `PneumaticSystem/Service/manus/bridge/build/manus_bridge`
+MANUS mode starts `PneumaticSystem/retargeting/manus/bridge/build/manus_bridge`
 (override the executable with `MANUS_BRIDGE_PATH`) and runs
-`PneumaticSystem/teleop.py --target-source manus --manus-retarget none`.
+`PneumaticSystem/teleop.py --target-source manus --manus-retarget direct`.
+This matches the submodule's native calibrated mapping and cooperative contact
+correction. Native `direct` and `shape` modes use the right glove, independent
+of which arm is selected. `--manus-retarget none` selects legacy geometric
+flexion and also supports `--manus-hand left`.
 The bridge sends to `127.0.0.1:9878`; the controller listens on `0.0.0.0:9878`.
 Build the native bridge once in this checkout (adjust the SDK path for your
 installation; build outputs are ignored by Git):
 
 ```bash
-cmake -S PneumaticSystem/Service/manus/bridge \
-  -B PneumaticSystem/Service/manus/bridge/build \
+cmake -S PneumaticSystem/retargeting/manus/bridge \
+  -B PneumaticSystem/retargeting/manus/bridge/build \
   -DMANUS_SDK_ROOT="$HOME/jhu/ManusSDK_v3.1.1/SDKMinimalClient_Linux/ManusSDK" \
   -DMANUS_INTEGRATED_ONLY=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build PneumaticSystem/Service/manus/bridge/build --parallel 2
-PneumaticSystem/Service/manus/bridge/build/manus_bridge --help
+cmake --build PneumaticSystem/retargeting/manus/bridge/build --parallel 2
+PneumaticSystem/retargeting/manus/bridge/build/manus_bridge --help
 ```
 
 If a bridge already runs in another terminal or on a remote host, add
@@ -76,28 +80,38 @@ If a bridge already runs in another terminal or on a remote host, add
 port 9878. For a bridge on this machine:
 
 ```bash
-PneumaticSystem/Service/manus/bridge/build/manus_bridge --udp 127.0.0.1:9878
+PneumaticSystem/retargeting/manus/bridge/build/manus_bridge --udp 127.0.0.1:9878
 # In another terminal:
 ./scripts/start_teleoperation.sh --softhand-manus --right --manus-external-bridge
 ```
 
-The glove side follows `--left`/`--right`; `--duo` defaults to the right glove.
-Use `--manus-hand left|right` to choose a different glove independently of the
-arm. Both Softhand modes operate **one pneumatic controller**, even with
+The glove defaults to the right hand for every arm selection.
+Use `--manus-hand left --manus-retarget none` for legacy left-glove control.
+Both Softhand modes operate **one pneumatic controller**, even with
 `--duo`. Both auto-detect the F407Driver USB device; `--serial-port PATH` or
 `SOFTHAND_SERIAL_PORT` overrides detection. MANUS uses system Python by default;
-set `SOFTHAND_PYTHON=/path/to/python` to use another interpreter with NumPy and
-pyserial installed.
+set `SOFTHAND_PYTHON=/path/to/python` to use another interpreter. Install
+`PneumaticSystem/retargeting/requirements.txt` and `pyserial` in that interpreter;
+native retargeting needs MuJoCo even without a viewer. The launcher validates
+the actual arguments, solver, and calibration before starting the arm.
 
 MANUS joint angles use the existing per-channel calibration and channel order
 in `PneumaticSystem/Service/voltage_mapping.py` and `Service/hand_joints.py`.
-As in `teleop.py --target-source manus`, direct skeleton geometry controls
-flexion while side-swing targets stay zero. Missing/stale glove data commands
+Native retargeting includes signed swing control relative to the measured
+zero-voltage pose. Legacy `none` mode keeps side swing at zero. Missing/stale glove data commands
 zero volts, and Ctrl-C stops the arm, hand controller, and launcher-owned
 bridge together.
 Routine joint-target and channel-voltage output is disabled by default; startup,
 shutdown, and target-loss messages remain visible. For standalone diagnostics,
-pass `--print-every N` to `PneumaticSystem/teleop.py` to print every N cycles.
+append `-- --print-every N` to the launcher to print every N cycles. Other
+`teleop.py` settings can follow `--`, for example:
+
+```bash
+./scripts/start_teleoperation.sh --softhand-manus --right -- \
+  --sim-display --thumb-mode shape --frequency-hz 20
+```
+
+Bridge transport, glove selection, and publisher port remain launcher options.
 
 All launchers can be invoked from a bare shell; manually activating Conda is
 not required. ROS-only processes use the system ROS Python. LeRobot, policy,

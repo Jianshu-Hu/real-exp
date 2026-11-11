@@ -707,20 +707,25 @@ End effector:
   --gripper                Use the matching Franka gripper(s).
   --hand                   Use the matching Wuji glove/hand pair(s).
   --softhand-gripper       Use the GELLO gripper to control all Softhand channels.
-  --softhand-manus         Use GELLO for the arm and MANUS joint angles for Softhand.
+  --softhand-manus         Use GELLO for the arm and MANUS retargeting for Softhand.
   --serial-port PATH       Override Softhand USB serial auto-detection.
 
 MANUS options (used only with --softhand-manus):
-  --manus-hand left|right  Glove side (default: arm side; right with --duo).
+  --manus-hand left|right  Glove side (default: right, independent of arm side).
+  --manus-retarget MODE    direct (default), shape, or legacy none. Native
+                           direct/shape retargeting requires the right glove.
   --manus-external-bridge  Receive an already-running/local or remote bridge.
-                           Otherwise start Service/manus/bridge/build/manus_bridge
+                           Otherwise start retargeting/manus/bridge/build/manus_bridge
                            inside PneumaticSystem (override with MANUS_BRIDGE_PATH).
                            UDP input uses 0.0.0.0:9878.
 
 Both Softhand modes control one pneumatic controller, including with --duo.
-MANUS uses teleop.py's calibrated per-channel mapping, stale-target shutdown,
-and direct joint angles (--manus-retarget none). SOFTHAND_PYTHON selects its
-Python interpreter (default: /usr/bin/python3; requires numpy and pyserial).
+MANUS uses teleop.py's native calibrated direct mapping, cooperative contact
+correction, and stale-target shutdown. --manus-retarget none selects legacy
+joint angles. SOFTHAND_PYTHON selects its Python interpreter (default:
+/usr/bin/python3; native modes require retargeting/requirements.txt and pyserial).
+Append -- followed by additional teleop.py options for calibration, display,
+retargeting, or output settings. These options are checked before arm startup.
 
 Wuji options (used only with --hand):
   --left-glove-sn SN       Left Wuji Glove serial.
@@ -739,6 +744,9 @@ Examples:
   ./scripts/start_teleoperation.sh --softhand-manus --right
   ./scripts/start_teleoperation.sh --softhand-manus --left --manus-hand right \
     --manus-external-bridge
+  ./scripts/start_teleoperation.sh --softhand-manus --left --manus-hand left \
+    --manus-retarget none
+  ./scripts/start_teleoperation.sh --softhand-manus --right -- --sim-display
   ./scripts/start_teleoperation.sh --arm --duo
   ./scripts/start_teleoperation.sh --hand --duo \
     --left-glove-sn <LEFT_SN> --right-glove-sn <RIGHT_SN> \
@@ -760,7 +768,10 @@ side_mode=""
 end_effector=""
 softhand_serial_port=""
 manus_hand=""
+manus_retarget="direct"
+manus_retarget_given=0
 manus_external_bridge=0
+declare -a manus_teleop_options=()
 declare -a wuji_options=()
 
 while [[ "$#" -gt 0 ]]; do
@@ -788,6 +799,21 @@ while [[ "$#" -gt 0 ]]; do
     --manus-external-bridge)
       manus_external_bridge=1
       shift
+      ;;
+    --manus-retarget)
+      [[ "$#" -ge 2 ]] || die "--manus-retarget requires direct, shape, or none"
+      [[ "${manus_retarget_given}" -eq 0 ]] || die "--manus-retarget may be specified only once"
+      case "$2" in
+        direct|shape|none) manus_retarget="$2" ;;
+        *) die "--manus-retarget requires direct, shape, or none" ;;
+      esac
+      manus_retarget_given=1
+      shift 2
+      ;;
+    --)
+      shift
+      manus_teleop_options=("$@")
+      break
       ;;
     --serial-port)
       [[ "$#" -ge 2 ]] || die "--serial-port requires a path"
@@ -818,7 +844,7 @@ done
   "Wuji and telemetry options are valid only with --hand"
 [[ "${end_effector}" == softhand-* || -z "${softhand_serial_port}" ]] || die \
   "--serial-port is valid only with --softhand-gripper or --softhand-manus"
-[[ "${end_effector}" == "softhand-manus" || ( -z "${manus_hand}" && "${manus_external_bridge}" -eq 0 ) ]] || die \
+[[ "${end_effector}" == "softhand-manus" || ( -z "${manus_hand}" && "${manus_external_bridge}" -eq 0 && "${manus_retarget_given}" -eq 0 && "${#manus_teleop_options[@]}" -eq 0 ) ]] || die \
   "MANUS options are valid only with --softhand-manus"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -924,16 +950,12 @@ elif [[ "${end_effector}" == softhand-* ]]; then
     softhand_python="${SOFTHAND_PYTHON:-/usr/bin/python3}"
     pneumatic_root="$(cd -- "${script_dir}/../PneumaticSystem" && pwd)"
     [[ -r "${pneumatic_root}/teleop.py" ]] || die "MANUS teleoperation program is missing: ${pneumatic_root}/teleop.py"
-    manus_bridge="${MANUS_BRIDGE_PATH:-${pneumatic_root}/Service/manus/bridge/build/manus_bridge}"
+    manus_hand="${manus_hand:-right}"
+    manus_bridge="${MANUS_BRIDGE_PATH:-${pneumatic_root}/retargeting/manus/bridge/build/manus_bridge}"
     if [[ "${manus_external_bridge}" -eq 0 ]]; then
       [[ -x "${manus_bridge}" ]] || die \
         "MANUS bridge is missing or not executable: ${manus_bridge}. Build it first, set MANUS_BRIDGE_PATH, or use --manus-external-bridge for an existing bridge; the FR3 arm was not started."
       "${manus_bridge}" --help >/dev/null || die "MANUS bridge cannot run; the FR3 arm was not started."
-    fi
-    # Import/argument checks only: --help never opens UDP, serial, or the robot.
-    if ! env PYTHONPATH= LD_LIBRARY_PATH= "${softhand_python}" -c 'import serial' || \
-       ! env PYTHONPATH= LD_LIBRARY_PATH= "${softhand_python}" "${pneumatic_root}/teleop.py" --help >/dev/null; then
-      die "MANUS teleoperation dependencies are unavailable; check SOFTHAND_PYTHON (numpy and pyserial required); the FR3 arm was not started."
     fi
   fi
   [[ -z "${softhand_serial_port}" ]] || softhand_args+=(--serial-port "${softhand_serial_port}")
@@ -945,15 +967,57 @@ elif [[ "${end_effector}" == softhand-* ]]; then
   echo "Softhand serial port: ${softhand_selected_port}"
   softhand_args=("--${side_mode}" --serial-port "${softhand_selected_port}")
   if [[ "${end_effector}" == "softhand-manus" ]]; then
-    [[ -n "${manus_hand}" ]] || {
-      manus_hand="${side_mode}"
-      [[ "${side_mode}" != "duo" ]] || manus_hand=right
-    }
-    start_component "MANUS Softhand joint teleoperation" \
+    # Launcher-owned transport and hand selection must not be overridden after
+    # --: the bridge destination and serial discovery must match the controller.
+    for option in "${manus_teleop_options[@]}"; do
+      # argparse accepts unambiguous abbreviations, so guard those as well.
+      for reserved in --target-source --manus-host --manus-port --publisher-port --manus-hand --manus-retarget --help -h; do
+        if [[ "${option}" == -* && "${reserved}" == "${option%%=*}"* ]]; then
+          die "${option} must be configured through launcher options, not after --; the FR3 arm was not started."
+        fi
+      done
+    done
+    manus_args=(
+      --target-source manus --manus-retarget "${manus_retarget}" --manus-hand "${manus_hand}"
+      --manus-host 0.0.0.0 --manus-port 9878 --publisher-port "${softhand_selected_port}"
+      "${manus_teleop_options[@]}"
+    )
+    # Validate the actual CLI, model, calibration and lazy solver dependencies.
+    # This builds only the retargeter; no UDP or serial output port is opened.
+    if ! env PYTHONPATH= LD_LIBRARY_PATH= "${softhand_python}" -c '
+import os
+import runpy
+import sys
+from types import SimpleNamespace
+
+import serial
+
+sys.path.insert(0, sys.argv[1])
+os.chdir(sys.argv[1])
+controller = runpy.run_path("teleop.py")
+args = controller["parse_args"](sys.argv[2:])
+controller["validate_args"](args)
+from retargeting.backends import create_retargeter
+from retargeting.options import direct_options
+from retargeting.targets import load_target_voltage_calibration
+
+retargeter = None
+if args.manus_retarget != "none":
+    retargeter = create_retargeter(
+        args.manus_retarget,
+        config_path=args.direct_reference if args.manus_retarget == "direct" else args.shape_config,
+        **(direct_options(args) if args.manus_retarget == "direct" else {}),
+    )
+load_target_voltage_calibration(SimpleNamespace(retargeter=retargeter), args.voltage_calibration)
+if args.sim_display:
+    __import__(args.sim_backend)
+' "${pneumatic_root}" "${manus_args[@]}"; then
+      die "MANUS teleoperation preflight failed; check options, calibration, and SOFTHAND_PYTHON (install retargeting/requirements.txt and pyserial for native modes); the FR3 arm was not started."
+    fi
+    start_component "MANUS Softhand teleoperation" \
       bash -c 'set -e; cd -- "$1"; shift; exec env PYTHONPATH= LD_LIBRARY_PATH= "$@"' _ \
       "${pneumatic_root}" "${softhand_python}" -u "${pneumatic_root}/teleop.py" \
-      --target-source manus --manus-retarget none --manus-hand "${manus_hand}" \
-      --manus-host 0.0.0.0 --manus-port 9878 --publisher-port "${softhand_selected_port}"
+      "${manus_args[@]}"
     if [[ "${manus_external_bridge}" -eq 0 ]]; then
       start_component "MANUS bridge" "${manus_bridge}" --udp 127.0.0.1:9878
     fi

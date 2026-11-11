@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import subprocess
 import time
+import textwrap
 
 import pytest
 
@@ -76,11 +77,20 @@ def sandbox_launcher(tmp_path, monkeypatch):
         'os.environ.get("SOFTHAND_SERIAL_PORT", "/dev/fake-f407"))\n'
     )
     pneumatic = tmp_path / 'PneumaticSystem'
-    bridge = pneumatic / 'Service/manus/bridge/build/manus_bridge'
+    bridge = pneumatic / 'retargeting/manus/bridge/build/manus_bridge'
     bridge.parent.mkdir(parents=True)
     bridge.write_text(WORKER)
     bridge.chmod(0o755)
-    (pneumatic / 'teleop.py').write_text(WORKER)
+    (pneumatic / 'teleop.py').write_text(
+        'if __name__ == "__main__":\n' + textwrap.indent(WORKER, '    ') +
+        '\nelse:\n'
+        '    import os, runpy, sys\n'
+        '    if os.environ.get("FAKE_FAIL_HELP") == "manus":\n'
+        '        raise RuntimeError("missing controller dependencies")\n'
+        f'    sys.path.insert(0, {str(ROOT / "PneumaticSystem")!r})\n'
+        f'    globals().update(runpy.run_path({str(ROOT / "PneumaticSystem/teleop.py")!r}))\n'
+    )
+    (pneumatic / 'Service').mkdir()
     (pneumatic / 'Service/publisher.py').touch()
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
@@ -132,7 +142,7 @@ def sandbox_launcher(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(
     ('side', 'options', 'glove', 'external'),
-    [('left', [], 'left', False), ('right', [], 'right', False),
+    [('left', [], 'right', False), ('right', [], 'right', False),
      ('duo', [], 'right', False), ('left', ['--manus-hand', 'right'], 'right', False),
      ('right', ['--manus-external-bridge'], 'right', True)],
 )
@@ -146,7 +156,7 @@ def test_manus_routes_arm_glove_and_serial_and_stops_every_worker(
         starts = {e['role']: e for e in read_events(log) if e['event'] == 'start'}
         assert starts['arm']['args'] == ['--' + side, '--no-gripper']
         assert starts['manus']['args'] == [
-            '--target-source', 'manus', '--manus-retarget', 'none',
+            '--target-source', 'manus', '--manus-retarget', 'direct',
             '--manus-hand', glove, '--manus-host', '0.0.0.0', '--manus-port', '9878',
             '--publisher-port', '/dev/selected-f407',
         ]
@@ -218,3 +228,40 @@ def test_manus_honors_serial_environment_override(sandbox_launcher):
                           SOFTHAND_SERIAL_PORT='/dev/environment-f407') as (_, log, _):
         manus = next(e for e in read_events(log) if e['role'] == 'manus')
         assert manus['args'][-2:] == ['--publisher-port', '/dev/environment-f407']
+
+
+@pytest.mark.parametrize('mode', ['none', 'shape'])
+def test_manus_can_select_legacy_or_shape_mapping(sandbox_launcher, mode):
+    glove = 'left' if mode == 'none' else 'right'
+    with sandbox_launcher('--softhand-manus', '--left', '--manus-hand', glove,
+                          '--manus-retarget', mode,
+                          expected_roles={'arm', 'manus', 'bridge'}) as (_, log, _):
+        manus = next(e for e in read_events(log) if e['role'] == 'manus')
+        assert manus['args'][2:6] == ['--manus-retarget', mode, '--manus-hand', glove]
+
+
+def test_manus_forwards_teleop_options(sandbox_launcher):
+    options = ['--thumb-mode', 'shape', '--frequency-hz', '10', '--print-every', '5']
+    with sandbox_launcher('--softhand-manus', '--right', '--', *options,
+                          expected_roles={'arm', 'manus', 'bridge'}) as (_, log, _):
+        manus = next(e for e in read_events(log) if e['role'] == 'manus')
+        assert manus['args'][-len(options):] == options
+
+
+@pytest.mark.parametrize('options', [
+    ['--manus-hand', 'left'],
+    ['--', '--frequency-hz', '0'],
+    ['--', '--direct-reference', '/missing/calibration.json'],
+    ['--', '--voltage-calibration', '/missing/voltages.json'],
+    ['--', '--unrecognized-option'],
+    ['--', '--publisher-port=/dev/other'],
+    ['--', '--publisher-p=/dev/other'],
+    ['--', '--help'],
+])
+def test_invalid_native_configuration_starts_no_workers(sandbox_launcher, options):
+    with sandbox_launcher('--softhand-manus', '--right', *options) as (proc, log, _):
+        stdout, stderr = proc.communicate(timeout=5)
+        assert proc.returncode != 0
+        assert 'the FR3 arm was not started' in stderr
+        assert 'Starting FR3' not in stdout
+        assert read_events(log) == []

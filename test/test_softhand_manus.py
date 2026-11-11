@@ -18,8 +18,9 @@ def test_manus_joint_targets_drive_independent_channels_and_shutdown(
     controller = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, controller)
     spec.loader.exec_module(controller)
-    from Service.manus.protocol import parse_frame
-    from Service.manus.reader import FrameSample
+    from retargeting.manus.protocol import parse_frame
+    from retargeting.manus.reader import FrameSample
+    from retargeting import targets
     from Service.publisher import Publisher
 
     def nodes(bend_base):
@@ -95,7 +96,7 @@ def test_manus_joint_targets_drive_independent_channels_and_shutdown(
         assert kwargs['port'] == '/dev/selected-f407'
         return Publisher(driver=driver, **kwargs)
 
-    monkeypatch.setattr(controller, 'UdpFrameSource', Source)
+    monkeypatch.setattr(targets, 'UdpFrameSource', Source)
     monkeypatch.setattr(controller, 'Publisher', publisher)
     monkeypatch.setattr(controller, 'StopFlag', StopFlag)
     monkeypatch.setattr(controller.time, 'sleep', lambda _delay: None)
@@ -111,13 +112,30 @@ def test_manus_joint_targets_drive_independent_channels_and_shutdown(
     controller.run_teleop(args)
 
     # A bent index changes only CH05/CH06; a bent middle changes CH09/CH10.
+    # Measured curves can require nonzero voltage at zero geometric flexion.
     # The final four hardware outputs are unused and always padded with zeros.
-    index_command = [0.0] * 24
-    # Index MCP calibration reaches 5 V at 93 degrees, so 90 degrees
-    # interpolates to 3 + (90 - 86) * (5 - 3) / (93 - 86) V.
-    index_command[4:6] = [5.0, 29.0 / 7.0]
-    middle_command = [0.0] * 24
-    middle_command[8:10] = [5.0, 5.0]
+    from Service.hand_joints import PNEUMATIC_CHANNELS
+    from Service.voltage_mapping import (
+        FEEDFORWARD_POINTS_BY_CHANNEL,
+        FEEDFORWARD_POINTS_INDEX_MCP, FEEDFORWARD_POINTS_INDEX_PIP,
+        FEEDFORWARD_POINTS_MIDDLE_MCP, FEEDFORWARD_POINTS_MIDDLE_PIP,
+        interpolate_voltage,
+    )
+    neutral_command = [
+        0.0 if channel.target_joint_name.endswith('_swing')
+        else interpolate_voltage(0.0, points)
+        for channel, points in zip(PNEUMATIC_CHANNELS, FEEDFORWARD_POINTS_BY_CHANNEL)
+    ] + [0.0] * 4
+    index_command = neutral_command.copy()
+    index_command[4:6] = [
+        interpolate_voltage(90.0, FEEDFORWARD_POINTS_INDEX_PIP),
+        interpolate_voltage(90.0, FEEDFORWARD_POINTS_INDEX_MCP),
+    ]
+    middle_command = neutral_command.copy()
+    middle_command[8:10] = [
+        interpolate_voltage(90.0, FEEDFORWARD_POINTS_MIDDLE_PIP),
+        interpolate_voltage(90.0, FEEDFORWARD_POINTS_MIDDLE_MCP),
+    ]
     assert driver.commands[0] == pytest.approx(index_command)
     assert driver.commands[1] == pytest.approx(middle_command)
     # Stale transport, lost hand, degenerate skeleton, and final shutdown.

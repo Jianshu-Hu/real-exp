@@ -89,7 +89,8 @@ The glove defaults to the right hand for every arm selection.
 Use `--manus-hand left --manus-retarget none` for legacy left-glove control.
 Both Softhand modes operate **one pneumatic controller**, even with
 `--duo`. Both auto-detect the F407Driver USB device; `--serial-port PATH` or
-`SOFTHAND_SERIAL_PORT` overrides detection. MANUS uses system Python by default;
+`SOFTHAND_SERIAL_PORT` overrides detection. MANUS uses `python3` from the active
+environment by default, including an activated Conda or virtual environment;
 set `SOFTHAND_PYTHON=/path/to/python` to use another interpreter. Install
 `PneumaticSystem/retargeting/requirements.txt` and `pyserial` in that interpreter;
 native retargeting needs MuJoCo even without a viewer. The launcher validates

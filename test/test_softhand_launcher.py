@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 import textwrap
 
@@ -13,6 +14,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / 'scripts/start_teleoperation.sh'
+PNEUMATIC_ROOT = ROOT / 'PneumaticSystem'
+if not (PNEUMATIC_ROOT / 'teleop.py').is_file():
+    PNEUMATIC_ROOT = ROOT.parent / 'PneumaticSystem'
+
 
 WORKER = r'''#!/usr/bin/python3
 import json
@@ -87,13 +92,26 @@ def sandbox_launcher(tmp_path, monkeypatch):
         '    import os, runpy, sys\n'
         '    if os.environ.get("FAKE_FAIL_HELP") == "manus":\n'
         '        raise RuntimeError("missing controller dependencies")\n'
-        f'    sys.path.insert(0, {str(ROOT / "PneumaticSystem")!r})\n'
-        f'    globals().update(runpy.run_path({str(ROOT / "PneumaticSystem/teleop.py")!r}))\n'
+        f'    sys.path.insert(0, {str(PNEUMATIC_ROOT)!r})\n'
+        f'    globals().update(runpy.run_path({str(PNEUMATIC_ROOT / "teleop.py")!r}))\n'
     )
     (pneumatic / 'Service').mkdir()
     (pneumatic / 'Service/publisher.py').touch()
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
+    # Model an activated environment independently of the test runner's PATH.
+    python_log = tmp_path / 'python-calls.jsonl'
+    python_wrapper = (
+        '#!/usr/bin/python3\n'
+        'import json, os, sys\n'
+        f'with open({str(python_log)!r}, "a") as log:\n'
+        '    log.write(json.dumps(dict(interpreter=sys.argv[0], args=sys.argv[1:])) + "\\n")\n'
+        f'os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n'
+    )
+    for name in ('python3', 'override-python'):
+        interpreter = bin_dir / name
+        interpreter.write_text(python_wrapper)
+        interpreter.chmod(0o755)
     bash = bin_dir / 'bash'
     bash.write_text(
         '#!/bin/bash\n'
@@ -105,7 +123,7 @@ def sandbox_launcher(tmp_path, monkeypatch):
     )
     bash.chmod(0o755)
     log = tmp_path / 'events.jsonl'
-    for name in ('SOFTHAND_SERIAL_PORT', 'SOFTHAND_PYTHON', 'MANUS_BRIDGE_PATH'):
+    for name in ('SOFTHAND_SERIAL_PORT', 'SOFTHAND_PYTHON', 'MANUS_BRIDGE_PATH', 'PNEUMATIC_SYSTEM_ROOT'):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('PATH', str(bin_dir) + ':' + os.environ['PATH'])
     monkeypatch.setenv('FAKE_WORKER', str(worker))
@@ -176,6 +194,21 @@ def test_renamed_gripper_mode_keeps_gello_worker(sandbox_launcher):
         assert starts['gripper']['args'] == ['--right', '--serial-port', '/dev/fake-f407']
 
 
+@pytest.mark.parametrize('override', [False, True])
+def test_manus_uses_selected_python_for_discovery_preflight_and_worker(sandbox_launcher, override):
+    env = {'SOFTHAND_PYTHON': 'override-python'} if override else {}
+    with sandbox_launcher('--softhand-manus', '--right',
+                          expected_roles={'arm', 'manus', 'bridge'}, **env) as (_, log, _):
+        calls = read_events(log.parent / 'python-calls.jsonl')
+        expected = str(log.parent / 'bin' / ('override-python' if override else 'python3'))
+        assert len(calls) == 3
+        assert {call['interpreter'] for call in calls} == {expected}
+        assert calls[0]['args'][0].endswith('/softhand_gripper_teleop.py')
+        assert '--detect-port-only' in calls[0]['args']
+        assert calls[1]['args'][0] == '-c'
+        assert calls[2]['args'][:2] == ['-u', str(log.parent / 'PneumaticSystem/teleop.py')]
+
+
 @pytest.mark.parametrize('role', ['manus', 'bridge', 'arm'])
 def test_worker_failure_stops_the_complete_stack(sandbox_launcher, role):
     with sandbox_launcher('--softhand-manus', '--right', expected_roles={'arm', 'manus', 'bridge'},
@@ -186,13 +219,15 @@ def test_worker_failure_stops_the_complete_stack(sandbox_launcher, role):
         assert {e['role'] for e in read_events(log) if e['event'] == 'stop'} == {'arm', 'manus', 'bridge'} - {role}
 
 
-@pytest.mark.parametrize('failure', ['discovery', 'python', 'bridge', 'missing-bridge'])
+@pytest.mark.parametrize('failure', ['discovery', 'python', 'missing-python', 'bridge', 'missing-bridge'])
 def test_preflight_failure_starts_no_workers(sandbox_launcher, failure):
     env = {}
     if failure == 'discovery':
         env['FAKE_DISCOVERY_FAIL'] = '1'
     elif failure == 'python':
         env['FAKE_FAIL_HELP'] = 'manus'
+    elif failure == 'missing-python':
+        env['SOFTHAND_PYTHON'] = '/missing/python'
     elif failure == 'bridge':
         env['FAKE_FAIL_HELP'] = 'bridge'
     else:

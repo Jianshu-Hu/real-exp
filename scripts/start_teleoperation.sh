@@ -722,8 +722,9 @@ MANUS options (used only with --softhand-manus):
 Both Softhand modes control one pneumatic controller, including with --duo.
 MANUS uses teleop.py's native calibrated direct mapping, cooperative contact
 correction, and stale-target shutdown. --manus-retarget none selects legacy
-joint angles. SOFTHAND_PYTHON selects its Python interpreter (default:
-/usr/bin/python3; native modes require retargeting/requirements.txt and pyserial).
+joint angles. SOFTHAND_PYTHON selects its Python interpreter (default: python3
+from the active environment; native modes require retargeting/requirements.txt
+and pyserial).
 Append -- followed by additional teleop.py options for calibration, display,
 retargeting, or output settings. These options are checked before arm startup.
 
@@ -947,7 +948,9 @@ elif [[ "${end_effector}" == softhand-* ]]; then
   softhand_args=("--${side_mode}")
   softhand_python=/usr/bin/python3
   if [[ "${end_effector}" == "softhand-manus" ]]; then
-    softhand_python="${SOFTHAND_PYTHON:-/usr/bin/python3}"
+    softhand_python="$(command -v "${SOFTHAND_PYTHON:-python3}")" || die \
+      "MANUS Python interpreter was not found: ${SOFTHAND_PYTHON:-python3}; the FR3 arm was not started."
+    echo "MANUS Python: ${softhand_python}"
     pneumatic_root="$(cd -- "${script_dir}/../PneumaticSystem" && pwd)"
     [[ -r "${pneumatic_root}/teleop.py" ]] || die "MANUS teleoperation program is missing: ${pneumatic_root}/teleop.py"
     manus_hand="${manus_hand:-right}"

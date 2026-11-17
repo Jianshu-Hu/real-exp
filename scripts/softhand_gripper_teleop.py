@@ -103,7 +103,8 @@ def main(argv=None) -> None:
         print(serial_port)
         return
 
-    sys.path.insert(0, str(ROOT / "PneumaticSystem"))
+    pneumatic_root = Path(os.environ.get("PNEUMATIC_SYSTEM_ROOT") or ROOT / "PneumaticSystem")
+    sys.path.insert(0, str(pneumatic_root))
     from Service.publisher import CHANNEL_COUNT, Publisher
 
     import rclpy

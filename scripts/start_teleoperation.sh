@@ -943,15 +943,23 @@ elif [[ "${end_effector}" == "gripper" ]]; then
 elif [[ "${end_effector}" == softhand-* ]]; then
   [[ -r "${script_dir}/softhand_gripper_teleop.py" ]] || die \
     "Softhand teleoperation node is missing: ${script_dir}/softhand_gripper_teleop.py"
-  [[ -r "${script_dir}/../PneumaticSystem/Service/publisher.py" ]] || die \
-    "Pneumatic publisher is missing: ${script_dir}/../PneumaticSystem/Service/publisher.py (initialize the PneumaticSystem submodule)"
+  pneumatic_root="${PNEUMATIC_SYSTEM_ROOT:-}"
+  if [[ -z "${pneumatic_root}" ]]; then
+    if [[ -r "${script_dir}/../PneumaticSystem/Service/publisher.py" ]]; then
+      pneumatic_root="$(cd -- "${script_dir}/../PneumaticSystem" && pwd)"
+    else
+      pneumatic_root="$(cd -- "${script_dir}/../../PneumaticSystem" && pwd)"
+    fi
+  fi
+  [[ -r "${pneumatic_root}/Service/publisher.py" ]] || die \
+    "Pneumatic publisher is missing: ${pneumatic_root}/Service/publisher.py (initialize the PneumaticSystem submodule or set PNEUMATIC_SYSTEM_ROOT)"
+  export PNEUMATIC_SYSTEM_ROOT="${pneumatic_root}"
   softhand_args=("--${side_mode}")
   softhand_python=/usr/bin/python3
   if [[ "${end_effector}" == "softhand-manus" ]]; then
     softhand_python="$(command -v "${SOFTHAND_PYTHON:-python3}")" || die \
       "MANUS Python interpreter was not found: ${SOFTHAND_PYTHON:-python3}; the FR3 arm was not started."
     echo "MANUS Python: ${softhand_python}"
-    pneumatic_root="$(cd -- "${script_dir}/../PneumaticSystem" && pwd)"
     [[ -r "${pneumatic_root}/teleop.py" ]] || die "MANUS teleoperation program is missing: ${pneumatic_root}/teleop.py"
     manus_hand="${manus_hand:-right}"
     manus_bridge="${MANUS_BRIDGE_PATH:-${pneumatic_root}/retargeting/manus/bridge/build/manus_bridge}"

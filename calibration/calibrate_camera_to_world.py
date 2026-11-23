@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Estimate camera-to-world from a captured tabletop AprilTag sequence."""
+"""Estimate camera-to-world from a captured tabletop AprilTag or board sequence."""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
@@ -116,7 +117,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True, help="Collector output directory")
     parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--tag-size-m", type=float, required=True)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--tag-size-m", type=float)
+    target.add_argument("--aprilgrid", type=Path, help="JSON with tag_size_m and tag_pitch_m for the 6×6 board")
     parser.add_argument("--tag-id", type=int, default=0)
     parser.add_argument("--tag-family", choices=("tag36h11", "tag25h9", "tag16h5"), default="tag36h11")
     parser.add_argument("--min-detections", type=int, default=10)
@@ -124,7 +127,7 @@ def main() -> int:
     parser.add_argument("--pose-cluster-rotation-deg", type=float, default=1.0)
     args = parser.parse_args()
     if (
-        args.tag_size_m <= 0
+        (args.tag_size_m is not None and (not np.isfinite(args.tag_size_m) or args.tag_size_m <= 0))
         or args.min_detections <= 0
         or args.pose_cluster_translation_m <= 0
         or args.pose_cluster_rotation_deg <= 0
@@ -140,23 +143,43 @@ def main() -> int:
     metadata_path = args.input / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     intrinsics = metadata["color_intrinsics"]
-    camera_matrix = np.array(
-        [[intrinsics["fx"], 0.0, intrinsics["cx"]], [0.0, intrinsics["fy"], intrinsics["cy"]], [0.0, 0.0, 1.0]],
-        dtype=np.float64,
-    )
-    distortion = np.asarray(intrinsics.get("coeffs", [0, 0, 0, 0, 0]), dtype=np.float64)
-    half = args.tag_size_m / 2.0
-    object_points = np.asarray(
-        [[-half, half, 0.0], [half, half, 0.0], [half, -half, 0.0], [-half, -half, 0.0]],
-        dtype=np.float64,
-    )
-    # Metadata describes the physical printed Tag frame, while solvePnP below
-    # returns the IPPE Tag frame dictated by object_points.
-    world_t_tag = world_t_tag_from_metadata(metadata)
-    world_t_pnp_tag = world_t_tag @ PHYSICAL_TAG_T_PNP_TAG
+    board = None
+    if args.aprilgrid:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from calibration.aprilgrid import AprilGrid, WORLD_DEFINITION
+
+        board = AprilGrid(args.aprilgrid)
+        cv2.setNumThreads(2)
+    else:
+        camera_matrix = np.array(
+            [[intrinsics["fx"], 0.0, intrinsics["cx"]], [0.0, intrinsics["fy"], intrinsics["cy"]], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        distortion = np.asarray(intrinsics.get("coeffs", [0, 0, 0, 0, 0]), dtype=np.float64)
+        half = args.tag_size_m / 2.0
+        object_points = np.asarray(
+            [[-half, half, 0.0], [half, half, 0.0], [half, -half, 0.0], [-half, -half, 0.0]],
+            dtype=np.float64,
+        )
+        # Metadata describes the physical printed Tag frame. PnP uses the
+        # IPPE square frame dictated by object_points.
+        world_t_tag = world_t_tag_from_metadata(metadata)
+        world_t_pnp_tag = world_t_tag @ PHYSICAL_TAG_T_PNP_TAG
     records: list[dict[str, Any]] = []
     for frame in metadata.get("frames", []):
         image = np.load(args.input / frame["rgb_file"])
+        if board is not None:
+            fit = board.estimate_pose(image, intrinsics)
+            if fit is not None:
+                pose, reprojection_px, ids = fit
+                records.append({
+                    "index": frame["index"],
+                    "rgb_file": frame["rgb_file"],
+                    "world_T_camera": matrix_to_list(pose),
+                    "reprojection_rmse_px": reprojection_px,
+                    "tag_ids": ids,
+                })
+            continue
         corners = detect_tag(cv2, image, args.tag_family, args.tag_id)
         if corners is None:
             continue
@@ -200,9 +223,6 @@ def main() -> int:
         "input": str(args.input),
         "device": metadata.get("device"),
         "color_intrinsics": intrinsics,
-        "tag": {"family": args.tag_family, "id": args.tag_id, "size_m": args.tag_size_m},
-        "world_T_tag": matrix_to_list(world_t_tag),
-        "physical_tag_T_pnp_tag": matrix_to_list(PHYSICAL_TAG_T_PNP_TAG),
         "world_T_camera": matrix_to_list(estimate),
         "valid_detections": len(records),
         "dominant_pose_cluster": {
@@ -222,6 +242,24 @@ def main() -> int:
         "frames": records,
     }
     output = args.output or (args.input / "camera_to_world.json")
+    if board is None:
+        result.update({
+            "tag": {"family": args.tag_family, "id": args.tag_id, "size_m": args.tag_size_m},
+            "world_T_tag": matrix_to_list(world_t_tag),
+            "physical_tag_T_pnp_tag": matrix_to_list(PHYSICAL_TAG_T_PNP_TAG),
+        })
+    else:
+        best = min((records[index] for index in cluster_indices),
+                   key=lambda record: (-len(record["tag_ids"]), record["reprojection_rmse_px"]))
+        reference = output.with_name(output.stem + "_board.png")
+        if not cv2.imwrite(str(reference), board.make_reference(np.load(args.input / best["rgb_file"]))):
+            raise ValueError(f"Could not write board reference to {reference}")
+        result.update({
+            "format": "real_exp_camera_to_world_aprilgrid_v1",
+            "aprilgrid": board.geometry,
+            "world_definition": WORLD_DEFINITION,
+            "aprilgrid_reference": reference.name,
+        })
     output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(
         f"saved {output} from {len(records)} detections "

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Solve W_T_B and E_T_D for a wrist camera observing a fixed tabletop tag."""
+"""Solve W_T_B and E_T_D for a wrist camera observing a fixed tabletop tag or board."""
 
 from __future__ import annotations
 
@@ -127,6 +127,7 @@ def main():
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--front-calibration', type=Path, help='Front camera_to_world.json for composing front_camera_T_base')
+    parser.add_argument('--aprilgrid', type=Path, help='Use the 6×6 board from the front calibration')
     parser.add_argument('--min-samples', type=int, default=10)
     parser.add_argument('--holdout-samples', type=int, default=3)
     args = parser.parse_args()
@@ -135,34 +136,53 @@ def main():
     manifest = json.loads((args.input / 'session.json').read_text())
     if manifest.get('format') != 'real_exp_wrist_samples_v1':
         raise ValueError('Expected a collect_wrist_camera_samples.py session')
-    world_T_tag = world_t_tag_from_metadata(manifest)
-    tag = manifest['tag']
-    if not np.isfinite(tag['size_m']) or tag['size_m'] <= 0:
-        raise ValueError('Tag size must be positive')
     output = args.output or args.input / 'wrist_calibration.json'
     if output.exists():
         raise ValueError(f'Refusing to overwrite {output}; choose --output')
-    front = None
-    if args.front_calibration:
-        front = json.loads(args.front_calibration.read_text())
-        if front['tag'] != tag or not np.allclose(world_t_tag_from_metadata(front), world_T_tag):
+    front = json.loads(args.front_calibration.read_text()) if args.front_calibration else None
+    board = None
+    if args.aprilgrid:
+        import cv2
+        from calibration.aprilgrid import AprilGrid, WORLD_DEFINITION
+
+        if not front or front.get('format') != 'real_exp_camera_to_world_aprilgrid_v1':
+            parser.error('--aprilgrid requires a matching --front-calibration')
+        board = AprilGrid(args.aprilgrid, args.front_calibration.parent / front['aprilgrid_reference'])
+        if front['aprilgrid'] != board.geometry or front['world_definition'] != WORLD_DEFINITION:
+            raise ValueError('Front calibration has different AprilGrid parameters or world axes')
+        target = {'aprilgrid': board.geometry, 'world_definition': WORLD_DEFINITION}
+        cv2.setNumThreads(2)
+    else:
+        world_T_tag = world_t_tag_from_metadata(manifest)
+        tag = manifest['tag']
+        if not np.isfinite(tag['size_m']) or tag['size_m'] <= 0:
+            raise ValueError('Tag size must be positive')
+        if front and (front['tag'] != tag or not np.allclose(world_t_tag_from_metadata(front), world_T_tag)):
             raise ValueError('Front calibration has different tag parameters or world axes')
+        target = {'tag': tag, 'world_T_tag': world_T_tag.tolist()}
+    if front:
         rigid(front['world_T_camera'], 'front world_T_camera')
     accepted, rejected = [], []
     for path in sorted(args.input.glob('sample_*/sample.json')):
         sample = json.loads(path.read_text())
         if sample['side'] != manifest['side'] or sample['camera_serial'] != manifest['camera_serial']:
             raise ValueError(f'Camera/arm mismatch in {path}')
-        poses, errors, robot_poses = [], [], []
+        poses, errors, robot_poses, tag_counts = [], [], [], []
         for frame in sample['frames']:
             if not np.isfinite(frame['state_image_gap_s']) or not 0 <= frame['state_image_gap_s'] <= .1:
                 raise ValueError(f'Unsynchronized robot state in {path}')
             if not np.allclose(rigid(frame['F_T_E'], 'F_T_E'), rigid(manifest['F_T_E'], 'session F_T_E'), atol=1e-6):
                 raise ValueError(f'Controller EE definition changed in {path}')
-            result = estimate_tag_pose(np.load(path.parent / frame['rgb_file']), manifest['color_intrinsics'], tag, world_T_tag)
+            image = np.load(path.parent / frame['rgb_file'])
+            if board is None:
+                result = estimate_tag_pose(image, manifest['color_intrinsics'], tag, world_T_tag)
+            else:
+                result = board.estimate_pose(image, manifest['color_intrinsics'])
             if result is None or result[1] > .75:
                 continue
             poses.append(result[0]); errors.append(result[1]); robot_poses.append(rigid(frame['B_T_E'], 'B_T_E'))
+            if board is not None:
+                tag_counts.append(len(result[2]))
         if len(poses) < 5:
             rejected.append({'sample': path.parent.name, 'reason': 'fewer than five clear tag observations'})
             continue
@@ -181,6 +201,8 @@ def main():
             T[:3, 3] = np.median(selected[:, :3, 3], axis=0)
             return T
         accepted.append({'sample_id': path.parent.name, 'world_T_camera': aggregate(poses), 'base_T_ee': aggregate(robot_poses), 'median_reprojection_rmse_px': float(np.median(np.asarray(errors)[indices])), 'cluster_frames': len(indices)})
+        if board is not None:
+            accepted[-1]['median_tag_count'] = float(np.median(np.asarray(tag_counts)[indices]))
     if len(accepted) < args.min_samples or len(accepted) - args.holdout_samples < 6:
         raise ValueError(f'Only {len(accepted)} valid settled poses; need >= {args.min_samples} and >=6 training poses after holdout; rejected={rejected}')
     train, holdout = accepted[:-args.holdout_samples], accepted[-args.holdout_samples:]
@@ -194,7 +216,7 @@ def main():
         group = [s for s in samples if s['split'] == split]
         quality[split] = {'count': len(group), 'median_translation_m': float(np.median([s['translation_residual_m'] for s in group])), 'max_translation_m': max(s['translation_residual_m'] for s in group), 'median_rotation_deg': float(np.median([s['rotation_residual_deg'] for s in group])), 'max_rotation_deg': max(s['rotation_residual_deg'] for s in group)}
     passed = all(q['median_translation_m'] <= .015 and q['max_translation_m'] <= .03 and q['median_rotation_deg'] <= 3 and q['max_rotation_deg'] <= 6 for q in quality.values())
-    result = {'format': 'real_exp_wrist_calibration_v1', 'status': 'validated_on_holdout' if passed else 'failed_residual_limits', 'input': str(args.input), 'side': manifest['side'], 'camera_serial': manifest['camera_serial'], 'tag': tag, 'world_T_tag': world_T_tag.tolist(), 'ee_frame': 'controller EE from Franka o_t_ee; fixed F_T_E required throughout collection', 'world_T_base': world_T_base.tolist(), 'ee_T_camera': ee_T_camera.tolist(), 'camera_T_ee': invert(ee_T_camera).tolist(), 'base_T_camera_definition': 'B_T_D(q) = B_T_E(q) @ E_T_D; depends on arm pose', 'quality': quality, 'diagnostics': diagnostics, 'samples': samples, 'rejected_samples': rejected}
+    result = {'format': 'real_exp_wrist_calibration_v1', 'status': 'validated_on_holdout' if passed else 'failed_residual_limits', 'input': str(args.input), 'side': manifest['side'], 'camera_serial': manifest['camera_serial'], **target, 'ee_frame': 'controller EE from Franka o_t_ee; fixed F_T_E required throughout collection', 'F_T_E': manifest['F_T_E'], 'world_T_base': world_T_base.tolist(), 'ee_T_camera': ee_T_camera.tolist(), 'camera_T_ee': invert(ee_T_camera).tolist(), 'base_T_camera_definition': 'B_T_D(q) = B_T_E(q) @ E_T_D; depends on arm pose', 'quality': quality, 'diagnostics': diagnostics, 'samples': samples, 'rejected_samples': rejected}
     if front:
         result['front_camera_T_base'] = (invert(np.asarray(front['world_T_camera'])) @ world_T_base).tolist()
         result['front_calibration'] = str(args.front_calibration)

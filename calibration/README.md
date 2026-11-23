@@ -1,12 +1,45 @@
 # Camera and robot calibration
 
-Calibrate the front D435i and both wrist D405 cameras against the **same fixed
-95 mm tag36h11 AprilTag, ID 0**. Run commands from the repository root.
+Calibrate the front D435i and both wrist D405 cameras against the same fixed
+target. The collection steps below use a 95 mm tag36h11 AprilTag, ID 0. For the
+tabletop board, use the solver options in [6×6 AprilTag board](#66-apriltag-board).
+Run commands from the repository root.
 
 `A_T_B` maps coordinates from B into A, with translation in metres. World W
 is centred on the tag with +X forward, +Y left, +Z up. The physical tag axes
 are different; the scripts save their relationship as `world_T_tag`.
 Camera coordinates are color optical frames (+X right, +Y down, +Z forward).
+
+## 6×6 AprilTag board
+
+Keep the board fixed for the front and wrist captures. The board has tag36h11
+IDs 0–35, numbered down each column. The specified tag edge is 35.2 mm and
+the estimated centre-to-centre pitch is 45.7 mm. World is centred on tag 0
+with +X toward decreasing rows, +Y toward
+decreasing columns, and +Z out of the board. This origin belongs to the board's
+placement during the run.
+
+Collect the front D435i at 1920×1080 with the whole board visible. Wrist
+recording and sample preparation use the same commands as for a single tag.
+Keep several tags in view at each wrist pose. Save the board geometry in the
+run folder and use it in both solvers.
+
+```bash
+printf '%s\n' '{"tag_size_m": 0.0352, "tag_pitch_m": 0.0457}' > "$calib_run/board.json"
+
+/usr/bin/python3 calibration/calibrate_camera_to_world.py \
+  --input "$calib_run/front" --aprilgrid "$calib_run/board.json"
+
+/usr/bin/python3 calibration/calibrate_wrist_camera.py \
+  --input "$calib_run/right/samples_right" \
+  --aprilgrid "$calib_run/board.json" \
+  --front-calibration "$calib_run/front/camera_to_world.json"
+```
+
+Keep the rectified board image beside the front calibration JSON. The wrist
+solver uses it to find the board, then fits the 3D pose to the measured corners
+of the visible tags. Check the held-out pose residuals before using the wrist
+matrices.
 
 ## 1. Prepare the camera computer
 
